@@ -147,7 +147,7 @@ pub(crate) enum PayloadError {
     WriteMorePermissiveThanRead,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProfileResponse {
     pub(crate) id: String,
@@ -159,7 +159,7 @@ pub(crate) struct ProfileResponse {
     pub(crate) teams: Vec<TeamResponse>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TeamResponse {
     pub(crate) id: String,

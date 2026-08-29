@@ -4,7 +4,11 @@ use serde_json::Value;
 use thiserror::Error;
 use url::Url;
 
-use crate::{config::Config, state::StateStore};
+use crate::{
+    config::Config,
+    dto::{ProfileResponse, TeamResponse},
+    state::StateStore,
+};
 
 /// HTTP client shared by all `HackMD` tool handlers.
 #[derive(Debug)]
@@ -32,6 +36,26 @@ impl HackmdClient {
 
     pub(crate) fn has_api_token(&self) -> bool {
         self.config.has_api_token()
+    }
+
+    pub(crate) async fn get_me(&self) -> Result<ProfileResponse, HackmdError> {
+        let path = self.url_for_segments(&["me"])?.path().to_owned();
+        self.request_json(Method::GET, &["me"], None)
+            .await?
+            .ok_or_else(|| HackmdError::EmptyResponse {
+                method: "GET".to_owned(),
+                path,
+            })
+    }
+
+    pub(crate) async fn list_teams(&self) -> Result<Vec<TeamResponse>, HackmdError> {
+        let path = self.url_for_segments(&["teams"])?.path().to_owned();
+        self.request_json(Method::GET, &["teams"], None)
+            .await?
+            .ok_or_else(|| HackmdError::EmptyResponse {
+                method: "GET".to_owned(),
+                path,
+            })
     }
 
     #[allow(dead_code, reason = "called by the API operation tasks")]
@@ -187,6 +211,8 @@ pub(crate) enum HackmdError {
         path: String,
         status: StatusCode,
     },
+    #[error("{method} {path}: HackMD returned an empty response where JSON was required")]
+    EmptyResponse { method: String, path: String },
 }
 
 impl From<HackmdError> for rmcp::model::CallToolResult {
@@ -488,6 +514,41 @@ mod tests {
                 .await,
             Err(HackmdError::MissingToken { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn typed_profile_and_team_operations_use_discovery_routes() {
+        let profile_server = FixtureServer::spawn(
+            200,
+            r#"{"id":"user-id","name":"Alice","email":"alice@example.test","userPath":"alice","photo":null,"teams":[]}"#,
+        );
+        let profile_client = fixture_client(&profile_server, "fixture-token");
+        let profile = profile_client
+            .get_me()
+            .await
+            .expect("profile should deserialize");
+        assert_eq!(profile.user_path, "alice");
+        assert!(
+            profile_server
+                .finish()
+                .starts_with("GET /v1/me HTTP/1.1\r\n")
+        );
+
+        let teams_server = FixtureServer::spawn(
+            200,
+            r#"[{"id":"team-id","name":"Engineering","path":"engineering","description":null,"hardLimit":100,"visibility":"private"}]"#,
+        );
+        let teams_client = fixture_client(&teams_server, "fixture-token");
+        let teams = teams_client
+            .list_teams()
+            .await
+            .expect("teams should deserialize");
+        assert_eq!(teams[0].path, "engineering");
+        assert!(
+            teams_server
+                .finish()
+                .starts_with("GET /v1/teams HTTP/1.1\r\n")
+        );
     }
 
     #[test]

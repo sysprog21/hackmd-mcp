@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::client::HackmdClient;
 use crate::config::Config;
-use crate::models::Workspace;
+use crate::dto::{ProfileResponse, TeamResponse};
 use crate::tool_result;
 
 /// MCP server whose handlers share one configured `HackMD` client.
@@ -35,50 +35,76 @@ pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Real API tools are introduced by their P1 tasks. This clearly named internal
-// probe validates the production router until the first real tool replaces it.
 #[tool_router(server_handler)]
 impl HackmdServer {
     #[tool(
-        name = "_hackmd_schema_probe",
-        description = "Internal probe for typed tool schemas"
-    )]
-    fn schema_probe(
-        &self,
-        Parameters(SchemaProbeInput {
-            workspace,
-            note_ref,
-        }): Parameters<SchemaProbeInput>,
-    ) -> rmcp::model::CallToolResult {
-        if !self.client.has_api_token() {
-            return tool_result::error(
-                "HACKMD_API_TOKEN is not configured; set it in the server environment and restart the MCP server",
-            );
-        }
-        tool_result::success(
-            "Schema probe succeeded",
-            serde_json::json!({"workspace": workspace, "note_ref": note_ref}),
+        name = "hackmd_get_me",
+        description = "Get the authenticated HackMD profile, including userPath for resolving personal note URLs.",
+        annotations(
+            title = "Get HackMD Profile",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
         )
+    )]
+    async fn get_me(
+        &self,
+        Parameters(EmptyInput {}): Parameters<EmptyInput>,
+    ) -> rmcp::model::CallToolResult {
+        match self.client.get_me().await {
+            Ok(profile) => profile_result(&profile),
+            Err(error) => error.into(),
+        }
     }
+
+    #[tool(
+        name = "hackmd_list_teams",
+        description = "List teams available to the authenticated HackMD account. Use each returned path as workspace.team_path.",
+        annotations(
+            title = "List HackMD Teams",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn list_teams(
+        &self,
+        Parameters(EmptyInput {}): Parameters<EmptyInput>,
+    ) -> rmcp::model::CallToolResult {
+        match self.client.list_teams().await {
+            Ok(teams) => teams_result(&teams),
+            Err(error) => error.into(),
+        }
+    }
+}
+
+fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
+    let summary = format!(
+        "Authenticated as {} (userPath: {})",
+        profile.name, profile.user_path
+    );
+    tool_result::success(summary, serde_json::json!({"profile": profile}))
+}
+
+fn teams_result(teams: &[TeamResponse]) -> rmcp::model::CallToolResult {
+    let summary = format!("Found {} HackMD team(s)", teams.len());
+    tool_result::success(summary, serde_json::json!({"teams": teams}))
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[allow(dead_code, reason = "constructed by RMCP's generated schema decoder")]
-struct SchemaProbeInput {
-    /// Personal account or team workspace; defaults to personal.
-    #[serde(default)]
-    workspace: Workspace,
-    /// Internal note ID or `HackMD` note URL.
-    note_ref: String,
-}
+#[serde(deny_unknown_fields)]
+struct EmptyInput {}
 
 #[cfg(test)]
 mod tests {
-    use super::{HackmdServer, SchemaProbeInput};
+    use super::{EmptyInput, HackmdServer, profile_result, teams_result};
     use crate::client::HackmdClient;
     use crate::config::Config;
-    use crate::models::Workspace;
     use rmcp::ServerHandler;
+    use serde_json::json;
     use std::sync::Arc;
 
     #[test]
@@ -94,46 +120,31 @@ mod tests {
     }
 
     #[test]
-    fn typed_tool_schema_includes_field_documentation() {
+    fn discovery_tools_have_generated_closed_empty_schemas_and_annotations() {
         let tools = HackmdServer::tool_router().list_all();
 
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "_hackmd_schema_probe");
-        assert_eq!(
-            tools[0].input_schema["properties"]["note_ref"]["description"],
-            "Internal note ID or `HackMD` note URL."
-        );
-        assert_eq!(
-            tools[0].input_schema["required"],
-            serde_json::json!(["note_ref"])
-        );
-        assert_eq!(
-            tools[0].input_schema["properties"]["workspace"]["default"]["kind"],
-            "personal"
-        );
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "hackmd_get_me");
+        assert_eq!(tools[1].name, "hackmd_list_teams");
+        for tool in tools {
+            assert_eq!(tool.input_schema["type"], "object");
+            assert_eq!(tool.input_schema["additionalProperties"], false);
+            let annotations = tool.annotations.expect("annotations should be generated");
+            assert_eq!(annotations.read_only_hint, Some(true));
+            assert_eq!(annotations.destructive_hint, Some(false));
+            assert_eq!(annotations.idempotent_hint, Some(true));
+            assert_eq!(annotations.open_world_hint, Some(true));
+        }
     }
 
-    #[test]
-    fn typed_input_defaults_an_omitted_workspace_to_personal() {
-        let input: SchemaProbeInput = serde_json::from_value(serde_json::json!({
-            "note_ref": "internal-id"
-        }))
-        .expect("workspace should be optional");
-
-        assert_eq!(input.workspace, Workspace::Personal);
-    }
-
-    #[test]
-    fn tool_call_reports_actionable_missing_token_error() {
+    #[tokio::test]
+    async fn tool_call_reports_actionable_missing_token_error() {
         let server = HackmdServer::new(Arc::new(
             HackmdClient::new(Config::for_tests()).expect("test client should be constructed"),
         ));
-        let result = server.schema_probe(rmcp::handler::server::wrapper::Parameters(
-            SchemaProbeInput {
-                workspace: Workspace::Personal,
-                note_ref: "internal-id".to_owned(),
-            },
-        ));
+        let result = server
+            .get_me(rmcp::handler::server::wrapper::Parameters(EmptyInput {}))
+            .await;
 
         assert_eq!(result.is_error, Some(true));
         assert_eq!(
@@ -141,39 +152,52 @@ mod tests {
                 .as_text()
                 .expect("error should be text")
                 .text,
-            "HACKMD_API_TOKEN is not configured; set it in the server environment and restart the MCP server"
+            "GET /v1/me: HACKMD_API_TOKEN is not configured; set it in the server environment and restart the MCP server"
         );
     }
 
     #[test]
-    fn tool_call_success_contains_text_and_structured_json() {
-        let config = Config::for_loopback_test("http://127.0.0.1:1/v1", Some("fixture-token"));
-        let server = HackmdServer::new(Arc::new(
-            HackmdClient::new(config).expect("test client should be constructed"),
-        ));
-        let result = server.schema_probe(rmcp::handler::server::wrapper::Parameters(
-            SchemaProbeInput {
-                workspace: Workspace::Team {
-                    team_path: "engineering".to_owned(),
-                },
-                note_ref: "note-id".to_owned(),
-            },
-        ));
-
-        assert_eq!(result.is_error, Some(false));
+    fn discovery_results_preserve_resolution_paths() {
+        let profile = serde_json::from_value(json!({
+            "id": "user-id",
+            "name": "Alice",
+            "email": "alice@example.test",
+            "userPath": "alice",
+            "photo": null,
+            "teams": []
+        }))
+        .expect("profile fixture should deserialize");
+        let profile_result = profile_result(&profile);
         assert_eq!(
-            result.content[0]
-                .as_text()
-                .expect("success should be text")
-                .text,
-            "Schema probe succeeded"
-        );
-        assert_eq!(
-            result.structured_content,
-            Some(serde_json::json!({
-                "workspace": {"kind": "team", "team_path": "engineering"},
-                "note_ref": "note-id"
+            profile_result.structured_content,
+            Some(json!({
+                "profile": {
+                    "id": "user-id",
+                    "name": "Alice",
+                    "email": "alice@example.test",
+                    "userPath": "alice",
+                    "photo": null,
+                    "teams": []
+                }
             }))
+        );
+
+        let teams: Vec<crate::dto::TeamResponse> = serde_json::from_value(json!([{
+            "id": "team-id",
+            "name": "Engineering",
+            "path": "engineering",
+            "description": null,
+            "hardLimit": 100,
+            "visibility": "private"
+        }]))
+        .expect("team fixture should deserialize");
+        let teams_result = teams_result(&teams);
+        assert_eq!(
+            teams_result
+                .structured_content
+                .as_ref()
+                .expect("structured teams")["teams"][0]["path"],
+            "engineering"
         );
     }
 

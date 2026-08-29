@@ -182,10 +182,6 @@ test (see P3) for each and record the answer here.
 
 ## P1 — essential RMCP tools
 
-- [ ] Add read-only `hackmd_get_me` (`GET /me`) and `hackmd_list_teams`
-  (`GET /teams`) discovery tools. Return each team's `path`, because it is the
-  required `workspace.team_path` for all team routes, and keep `/me`'s
-  `userPath` for note-reference resolution.
 - [ ] Define `note_ref: String` for note tools. Accept an internal API ID or a
   HackMD URL. Parse a bare `hackmd.io/<id>` URL directly. For `hackmd.io/@X/slug`,
   resolve `@X` against the caller's own `userPath` first and only then against
