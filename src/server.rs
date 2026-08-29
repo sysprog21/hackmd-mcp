@@ -5,6 +5,7 @@ use rmcp::{handler::server::wrapper::Parameters, schemars, tool};
 use serde::Deserialize;
 
 use crate::client::HackmdClient;
+use crate::config::Config;
 use crate::models::Workspace;
 
 /// MCP server whose handlers share one configured `HackMD` client.
@@ -20,7 +21,12 @@ impl HackmdServer {
 }
 
 pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
-    HackmdServer::new(Arc::new(HackmdClient))
+    let client = Arc::new(HackmdClient::new(Config::from_env()?));
+    if !client.has_api_token() {
+        tracing::warn!("HACKMD_API_TOKEN is not set; API tools will return a configuration error");
+    }
+
+    HackmdServer::new(client)
         .serve(rmcp::transport::stdio())
         .await?
         .waiting()
@@ -42,11 +48,14 @@ impl HackmdServer {
             workspace,
             note_ref,
         }): Parameters<SchemaProbeInput>,
-    ) -> String {
-        format!(
-            "{workspace:?}:{note_ref}:{}",
-            Arc::strong_count(&self.client)
-        )
+    ) -> Result<String, rmcp::ErrorData> {
+        if !self.client.has_api_token() {
+            return Err(rmcp::ErrorData::invalid_params(
+                "HACKMD_API_TOKEN is not configured; set it in the server environment and restart the MCP server",
+                None,
+            ));
+        }
+        Ok(format!("{workspace:?}:{note_ref}"))
     }
 }
 
@@ -64,13 +73,14 @@ struct SchemaProbeInput {
 mod tests {
     use super::{HackmdServer, SchemaProbeInput};
     use crate::client::HackmdClient;
+    use crate::config::Config;
     use crate::models::Workspace;
     use rmcp::ServerHandler;
     use std::sync::Arc;
 
     #[test]
     fn server_owns_the_shared_client() {
-        let client = Arc::new(HackmdClient);
+        let client = Arc::new(HackmdClient::new(Config::for_tests()));
         let server = HackmdServer::new(Arc::clone(&client));
 
         assert_eq!(Arc::strong_count(&client), 2);
@@ -109,8 +119,27 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_reports_actionable_missing_token_error() {
+        let server = HackmdServer::new(Arc::new(HackmdClient::new(Config::for_tests())));
+        let error = server
+            .schema_probe(rmcp::handler::server::wrapper::Parameters(
+                SchemaProbeInput {
+                    workspace: Workspace::Personal,
+                    note_ref: "internal-id".to_owned(),
+                },
+            ))
+            .expect_err("a tool call should require the deferred token");
+
+        assert_eq!(
+            error.message,
+            "HACKMD_API_TOKEN is not configured; set it in the server environment and restart the MCP server"
+        );
+    }
+
+    #[test]
     fn server_handler_enables_tools_only() {
-        let info = HackmdServer::new(Arc::new(HackmdClient)).get_info();
+        let client = HackmdClient::new(Config::for_tests());
+        let info = HackmdServer::new(Arc::new(client)).get_info();
 
         assert!(info.capabilities.tools.is_some());
         assert!(info.capabilities.prompts.is_none());

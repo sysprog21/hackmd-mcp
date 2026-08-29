@@ -26,3 +26,9 @@
 - [x] Run the local server with `HackmdServer::serve(rmcp::transport::stdio())`
   then `waiting().await`; reserve stdout for the transport and write logs only
   to stderr.
+- [x] Add `Config` for `HACKMD_API_TOKEN`, optional
+  `HACKMD_API_URL` (default `https://api.hackmd.io/v1`), a 30-second request
+  timeout, a shorter connect timeout, and retry configuration (at most three
+  retries; 500 ms initial, 5-second maximum backoff). Defer token validation
+  until a tool call so MCP startup stays usable and reports a helpful
+  missing-token error; warn once on stderr at startup when the token is absent.
