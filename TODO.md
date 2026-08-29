@@ -196,8 +196,6 @@ test (see P3) for each and record the answer here.
 
 ## P3 — efficiency and reliability
 
-- [ ] Keep all responses context-efficient: slim list/history/folder summaries,
-  explicit pagination metadata, and an opt-in full-content read only.
 - [ ] Add a short TTL cache only for list/discovery GETs if profiling or the
   100-requests-per-5-minutes limit justifies it; invalidate affected keys after
   writes. Do not cache note bodies by default.

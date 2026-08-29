@@ -207,3 +207,7 @@
   including attempts, total waited seconds, and whether a 429 occurred, on
   successful and final-error tool results. Emit no retry metadata or progress
   noise for single-attempt requests.
+- [x] Keep responses context-efficient: note lists and history return slim,
+  explicitly paginated projections; folder lists now do the same with a
+  default limit of 20 and maximum of 100. Only the explicitly invoked
+  `hackmd_get_note` read returns full note content.

@@ -304,7 +304,10 @@ impl HackmdServer {
     ) -> rmcp::model::CallToolResult {
         match crate::folders::list_folders(&self.client, input).await {
             Ok(output) => tool_result::success(
-                format!("Found {} HackMD folder(s)", output.count),
+                format!(
+                    "Found {} HackMD folder(s); returned {}",
+                    output.total, output.count
+                ),
                 serde_json::to_value(output).expect("folder-list output should serialize"),
             ),
             Err(error) => tool_result::error(error.to_string()),
@@ -1058,6 +1061,14 @@ mod tests {
             "safe"
         );
         assert_eq!(push.input_schema["properties"]["confirm"]["default"], false);
+        let folders = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_list_folders")
+            .expect("folder list should be listed");
+        assert_eq!(folders.input_schema["properties"]["limit"]["default"], 20);
+        assert_eq!(folders.input_schema["properties"]["limit"]["maximum"], 100);
+        assert_eq!(folders.input_schema["properties"]["offset"]["default"], 0);
         stop_protocol(client, server_task).await;
     }
 

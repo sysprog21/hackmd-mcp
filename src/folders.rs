@@ -16,6 +16,17 @@ pub(crate) struct FolderWorkspaceInput {
     /// Personal account or team workspace.
     #[serde(default)]
     pub(crate) workspace: Workspace,
+    /// Maximum folders returned (default 20, maximum 100).
+    #[serde(default = "default_limit")]
+    #[schemars(range(min = 1, max = 100))]
+    pub(crate) limit: usize,
+    /// Number of folders to skip in API order.
+    #[serde(default)]
+    pub(crate) offset: usize,
+}
+
+const fn default_limit() -> usize {
+    crate::list_notes::DEFAULT_LIMIT
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -112,8 +123,22 @@ pub(crate) struct SetFolderOrderInput {
 #[derive(Debug, Serialize)]
 pub(crate) struct FolderListOutput {
     pub(crate) workspace: Workspace,
+    pub(crate) total: usize,
     pub(crate) count: usize,
-    pub(crate) folders: Vec<FolderResponse>,
+    pub(crate) offset: usize,
+    pub(crate) has_more: bool,
+    pub(crate) next_offset: Option<usize>,
+    pub(crate) folders: Vec<FolderSummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct FolderSummary {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+    pub(crate) icon: Option<String>,
+    pub(crate) color: Option<String>,
+    pub(crate) parent_folder_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,6 +175,8 @@ pub(crate) enum FolderError {
     InvalidHierarchy { folder_id: String },
     #[error("folder_ids contains duplicate folder ID {folder_id:?}")]
     DuplicateOrderId { folder_id: String },
+    #[error("limit must be between 1 and 100")]
+    InvalidLimit,
     #[error(transparent)]
     Payload(#[from] PayloadError),
     #[error(transparent)]
@@ -184,10 +211,34 @@ pub(crate) async fn list_folders(
     client: &HackmdClient,
     input: FolderWorkspaceInput,
 ) -> Result<FolderListOutput, FolderError> {
+    if !(1..=crate::list_notes::MAX_LIMIT).contains(&input.limit) {
+        return Err(FolderError::InvalidLimit);
+    }
     let folders = client.list_folders(&input.workspace).await?;
+    let total = folders.len();
+    let folders = folders
+        .into_iter()
+        .skip(input.offset)
+        .take(input.limit)
+        .map(|folder| FolderSummary {
+            id: folder.id,
+            name: folder.name,
+            description: folder.description,
+            icon: folder.icon,
+            color: folder.color,
+            parent_folder_id: folder.parent_folder_id,
+        })
+        .collect::<Vec<_>>();
+    let count = folders.len();
+    let next = input.offset.saturating_add(count);
+    let has_more = next < total;
     Ok(FolderListOutput {
         workspace: input.workspace,
-        count: folders.len(),
+        total,
+        count,
+        offset: input.offset,
+        has_more,
+        next_offset: has_more.then_some(next),
         folders,
     })
 }
@@ -355,9 +406,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CreateFolderInput, DeleteFolderInput, FolderError, NullableString, SetFolderOrderInput,
-        UpdateFolderInput, create_folder, delete_folder, set_folder_order, update_folder,
-        validate_move,
+        CreateFolderInput, DeleteFolderInput, FolderError, FolderWorkspaceInput, NullableString,
+        SetFolderOrderInput, UpdateFolderInput, create_folder, delete_folder, list_folders,
+        set_folder_order, update_folder, validate_move,
     };
     use crate::{client::HackmdClient, config::Config, dto::FolderResponse, models::Workspace};
 
@@ -533,5 +584,52 @@ mod tests {
         assert!(requests[0].starts_with("GET /v1/folders/folder-order HTTP/1.1\r\n"));
         assert!(requests[1].starts_with("PUT /v1/folders/folder-order HTTP/1.1\r\n"));
         assert!(requests[1].ends_with(r#"{"order":{"other":["keep"],"root":["b","a"]}}"#));
+    }
+
+    #[tokio::test]
+    async fn folder_list_is_slim_and_explicitly_paginated() {
+        let fixture = crate::test_support::SequenceServer::spawn([(
+            200,
+            r#"[
+                {"id":"a","name":"A","createdAt":1,"updatedAt":2},
+                {"id":"b","name":"B","description":"second","createdAt":3,"updatedAt":4},
+                {"id":"c","name":"C"}
+            ]"#,
+        )]);
+        let output = list_folders(
+            &fixture_client(&fixture),
+            FolderWorkspaceInput {
+                workspace: Workspace::Personal,
+                limit: 1,
+                offset: 1,
+            },
+        )
+        .await
+        .expect("folder list should succeed");
+        assert_eq!(output.total, 3);
+        assert_eq!(output.count, 1);
+        assert_eq!(output.offset, 1);
+        assert!(output.has_more);
+        assert_eq!(output.next_offset, Some(2));
+        let value = serde_json::to_value(&output.folders[0]).expect("summary should serialize");
+        assert_eq!(value["id"], "b");
+        assert!(value.get("created_at").is_none());
+        assert!(value.get("updated_at").is_none());
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn folder_list_rejects_invalid_limit_before_requesting() {
+        let error = list_folders(
+            &HackmdClient::new(Config::for_tests()).expect("client should build"),
+            FolderWorkspaceInput {
+                workspace: Workspace::Personal,
+                limit: 0,
+                offset: 0,
+            },
+        )
+        .await
+        .expect_err("zero limit should be rejected");
+        assert!(matches!(error, FolderError::InvalidLimit));
     }
 }
