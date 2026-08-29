@@ -193,12 +193,6 @@ test (see P3) for each and record the answer here.
 
 ## P2.5 — local Markdown sync
 
-- [ ] Test clean pull, safe push, unchanged local/remote, remote-only update,
-  concurrent local+remote edit, overwrite confirmation, `202` read-back,
-  atomic state persistence, snapshot overwrite refusal, team-slug resolution,
-  personal `@userPath` resolution, ambiguous title handling, root-folder
-  creation, large-body guards, and path validation with temporary directories
-  and mocked API responses.
 
 ## P3 — efficiency and reliability
 

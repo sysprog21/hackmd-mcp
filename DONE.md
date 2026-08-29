@@ -190,3 +190,8 @@
 - [x] Require `confirm_large_file: true` before pulling or pushing bodies over
   5 MiB and refuse bodies over 50 MiB, with exact boundary tests matching the
   external `push-to-hackmd` policy pending a verified HackMD limit.
+- [x] Cover the P2.5 workflow matrix with temporary directories and mocked API
+  responses: clean pull, safe/no-op/remote-only/conflicting pushes, overwrite
+  confirmation, `202` readback, atomic state, snapshot refusal, team and
+  personal scoped URL resolution, ambiguous titles, root folders, size guards,
+  and path validation.

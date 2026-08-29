@@ -483,6 +483,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchanged_local_and_remote_is_a_no_op() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").expect("local fixture should write");
+        let fixture = crate::test_support::SequenceServer::spawn([(
+            200,
+            r#"{"id":"note-id","title":"Note","content":"baseline"}"#,
+        )]);
+        let client = tracked_client(&fixture, directory.path(), &local_path, "baseline");
+        let output = push_note(&client, input(&local_path, PushStrategy::Safe, false))
+            .await
+            .expect("comparison should succeed")
+            .expect("direct note should resolve");
+        assert_eq!(output.status, PushStatus::NothingToPush);
+        assert!(!output.pushed);
+        assert_eq!(fixture.finish().len(), 1);
+    }
+
+    #[tokio::test]
     async fn overwrite_requires_confirmation_before_network() {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");

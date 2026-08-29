@@ -232,6 +232,66 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn scoped_urls_resolve_personal_user_path_before_team_paths() {
+        let fixture = crate::test_support::SequenceServer::spawn([
+            (
+                200,
+                r#"{"id":"u","name":"User","email":"u@example.com","userPath":"alice"}"#,
+            ),
+            (
+                200,
+                r#"[{"id":"personal-id","title":"Personal","permalink":"slug"}]"#,
+            ),
+        ]);
+        let client = HackmdClient::new(Config::for_loopback_test(
+            &fixture.api_url,
+            Some("fixture-token"),
+        ))
+        .expect("fixture client should build");
+        let result = resolve_note_ref(
+            &client,
+            Workspace::Team {
+                team_path: "ignored".to_owned(),
+            },
+            "https://hackmd.io/@alice/slug",
+        )
+        .await
+        .expect("personal URL should resolve");
+        assert!(
+            matches!(result, NoteResolution::Resolved { note } if note.workspace == Workspace::Personal && note.note_id == "personal-id")
+        );
+        let requests = fixture.finish();
+        assert!(requests[0].starts_with("GET /v1/me HTTP/1.1\r\n"));
+        assert!(requests[1].starts_with("GET /v1/notes HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn scoped_team_slug_resolves_through_team_discovery() {
+        let fixture = crate::test_support::SequenceServer::spawn([
+            (
+                200,
+                r#"{"id":"u","name":"User","email":"u@example.com","userPath":"alice"}"#,
+            ),
+            (200, r#"[{"id":"t","name":"Core","path":"core"}]"#),
+            (200, r#"[{"id":"team-id","title":"Team","shortId":"slug"}]"#),
+        ]);
+        let client = HackmdClient::new(Config::for_loopback_test(
+            &fixture.api_url,
+            Some("fixture-token"),
+        ))
+        .expect("fixture client should build");
+        let result = resolve_note_ref(&client, Workspace::Personal, "https://hackmd.io/@core/slug")
+            .await
+            .expect("team URL should resolve");
+        assert!(
+            matches!(result, NoteResolution::Resolved { note } if note.workspace == Workspace::Team { team_path: "core".to_owned() } && note.note_id == "team-id")
+        );
+        let requests = fixture.finish();
+        assert!(requests[1].starts_with("GET /v1/teams HTTP/1.1\r\n"));
+        assert!(requests[2].starts_with("GET /v1/teams/core/notes HTTP/1.1\r\n"));
+    }
+
     #[test]
     fn short_id_permalink_and_title_matches_must_be_unique() {
         let notes = vec![
