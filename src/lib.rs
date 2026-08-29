@@ -17,6 +17,7 @@ mod patch;
 mod pull_note;
 mod push_note;
 mod server;
+mod snapshot;
 mod state;
 mod tool_result;
 

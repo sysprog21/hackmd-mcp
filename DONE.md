@@ -180,3 +180,6 @@
   private sidecar and return `in_sync`, `remote_changed`, `local_changed`, or
   `conflict` with remote timestamp and SHA-256 baseline/local/remote hashes,
   without filesystem writes.
+- [x] Add `hackmd_save_remote_snapshot` with optional explicit overwrite.
+  Atomically save the tracked remote body as sibling `*.remote.md`, refuse an
+  existing snapshot by default, and never overwrite the working Markdown file.

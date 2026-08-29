@@ -20,6 +20,7 @@ use crate::image_upload::UploadNoteImageInput;
 use crate::list_notes::ListNotesInput;
 use crate::pull_note::PullNoteInput;
 use crate::push_note::PushNoteInput;
+use crate::snapshot::SaveRemoteSnapshotInput;
 use crate::tool_result;
 
 /// MCP server whose handlers share one configured `HackMD` client.
@@ -547,6 +548,30 @@ impl HackmdServer {
             Err(error) => tool_result::error(error.to_string()),
         }
     }
+
+    #[tool(
+        name = "hackmd_save_remote_snapshot",
+        description = "Atomically save the tracked note's current remote body as sibling *.remote.md without changing the working Markdown file. Existing snapshots require explicit overwrite.",
+        annotations(
+            title = "Save HackMD Remote Snapshot",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn save_remote_snapshot(
+        &self,
+        Parameters(input): Parameters<SaveRemoteSnapshotInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::snapshot::save_remote_snapshot(&self.client, input).await {
+            Ok(output) => tool_result::success(
+                "Saved HackMD remote snapshot",
+                serde_json::to_value(output).expect("snapshot output should serialize"),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
 }
 
 fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
@@ -576,7 +601,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 19] = [
+    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 20] = [
         ("hackmd_get_me", true, false, true),
         ("hackmd_list_teams", true, false, true),
         ("hackmd_list_notes", true, false, true),
@@ -596,6 +621,7 @@ mod tests {
         ("hackmd_pull_note", false, true, false),
         ("hackmd_push_note", false, true, true),
         ("hackmd_check_note_sync", true, false, true),
+        ("hackmd_save_remote_snapshot", false, true, false),
     ];
 
     async fn protocol_client(
@@ -652,7 +678,7 @@ mod tests {
     fn tools_have_generated_schemas_and_exact_annotations() {
         let tools = HackmdServer::tool_router().list_all();
 
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 20);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = tools
                 .iter()
@@ -877,7 +903,7 @@ mod tests {
             .list_tools(None)
             .await
             .expect("tools/list should succeed");
-        assert_eq!(listed.tools.len(), 19);
+        assert_eq!(listed.tools.len(), 20);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = listed
                 .tools

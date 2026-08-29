@@ -193,11 +193,6 @@ test (see P3) for each and record the answer here.
 
 ## P2.5 — local Markdown sync
 
-- [ ] Add `hackmd_save_remote_snapshot` taking `local_path` and optional
-  `overwrite_snapshot: false`. Fetch the tracked remote body and atomically
-  create sibling `*.remote.md`; refuse an existing snapshot unless overwrite is
-  explicitly requested. Never overwrite the working Markdown file. Keep it
-  separate from the check tool so the check tool stays annotated read-only.
 - [ ] Make conflict results agent-actionable: include a bounded unified-diff
   summary, local/baseline absolute paths, a clear `merge_required` status, and
   instructions to call `hackmd_save_remote_snapshot`. When a snapshot exists,
