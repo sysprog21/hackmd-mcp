@@ -6,7 +6,7 @@ use url::Url;
 
 use crate::{
     config::Config,
-    dto::{NoteResponse, ProfileResponse, TeamResponse},
+    dto::{CreateNoteRequest, NoteResponse, ProfileResponse, TeamResponse, UpdateNoteRequest},
     models::Workspace,
     state::StateStore,
 };
@@ -93,6 +93,52 @@ impl HackmdClient {
                 method: "GET".to_owned(),
                 path,
             })
+    }
+
+    pub(crate) async fn create_note(
+        &self,
+        workspace: &Workspace,
+        payload: &CreateNoteRequest,
+    ) -> Result<NoteResponse, HackmdError> {
+        let segments: Vec<&str> = match workspace {
+            Workspace::Personal => vec!["notes"],
+            Workspace::Team { team_path } => vec!["teams", team_path, "notes"],
+        };
+        let path = self.url_for_segments(&segments)?.path().to_owned();
+        let body = serde_json::to_value(payload).map_err(|_| HackmdError::InvalidPayload)?;
+        self.request_json(Method::POST, &segments, Some(&body))
+            .await?
+            .ok_or_else(|| HackmdError::EmptyResponse {
+                method: "POST".to_owned(),
+                path,
+            })
+    }
+
+    pub(crate) async fn update_note(
+        &self,
+        workspace: &Workspace,
+        note_id: &str,
+        payload: &UpdateNoteRequest,
+    ) -> Result<Option<NoteResponse>, HackmdError> {
+        let segments: Vec<&str> = match workspace {
+            Workspace::Personal => vec!["notes", note_id],
+            Workspace::Team { team_path } => vec!["teams", team_path, "notes", note_id],
+        };
+        let body = serde_json::to_value(payload).map_err(|_| HackmdError::InvalidPayload)?;
+        self.request_json(Method::PATCH, &segments, Some(&body))
+            .await
+    }
+
+    pub(crate) async fn delete_note(
+        &self,
+        workspace: &Workspace,
+        note_id: &str,
+    ) -> Result<Option<Value>, HackmdError> {
+        let segments: Vec<&str> = match workspace {
+            Workspace::Personal => vec!["notes", note_id],
+            Workspace::Team { team_path } => vec!["teams", team_path, "notes", note_id],
+        };
+        self.request_json(Method::DELETE, &segments, None).await
     }
 
     #[allow(dead_code, reason = "called by the API operation tasks")]
@@ -211,6 +257,8 @@ pub(crate) enum HackmdError {
     ClientBuild,
     #[error("configured HACKMD_API_URL cannot be used as an API base URL")]
     InvalidBaseUrl,
+    #[error("failed to serialize a validated HackMD request payload")]
+    InvalidPayload,
     #[error("{method} {path}: request timed out; check network connectivity and retry")]
     Timeout { method: String, path: String },
     #[error("{method} {path}: network request failed; check connectivity and HACKMD_API_URL")]
@@ -273,7 +321,10 @@ mod tests {
 
     use super::{HackmdClient, HackmdError};
     use crate::config::Config;
-    use crate::dto::CreateNoteRequest;
+    use crate::{
+        dto::{CreateNoteRequest, UpdateNoteRequest},
+        models::Workspace,
+    };
 
     struct FixtureServer {
         api_url: String,
@@ -442,6 +493,65 @@ mod tests {
             assert_eq!(response, None);
             server.finish();
         }
+    }
+
+    #[tokio::test]
+    async fn typed_crud_operations_use_workspace_routes_and_payloads() {
+        let created = r#"{"id":"new-id","title":"New"}"#;
+        let create_server = FixtureServer::spawn(201, created);
+        let create_client = fixture_client(&create_server, "fixture-token");
+        let note = create_client
+            .create_note(
+                &Workspace::Team {
+                    team_path: "team/path".to_owned(),
+                },
+                &CreateNoteRequest {
+                    title: Some("New".to_owned()),
+                    ..CreateNoteRequest::default()
+                },
+            )
+            .await
+            .expect("team note should be created");
+        assert_eq!(note.id, "new-id");
+        let request = create_server.finish();
+        assert!(request.starts_with("POST /v1/teams/team%2Fpath/notes HTTP/1.1\r\n"));
+        assert!(request.ends_with(r#"{"title":"New"}"#));
+
+        let update_server = FixtureServer::spawn(202, "");
+        let update_client = fixture_client(&update_server, "fixture-token");
+        let response = update_client
+            .update_note(
+                &Workspace::Personal,
+                "note/id",
+                &UpdateNoteRequest {
+                    parent_folder_id: Some(None),
+                    ..UpdateNoteRequest::default()
+                },
+            )
+            .await
+            .expect("personal note update should be accepted");
+        assert_eq!(response, None);
+        let request = update_server.finish();
+        assert!(request.starts_with("PATCH /v1/notes/note%2Fid HTTP/1.1\r\n"));
+        assert!(request.ends_with(r#"{"parentFolderId":null}"#));
+
+        let delete_server = FixtureServer::spawn(204, "");
+        let delete_client = fixture_client(&delete_server, "fixture-token");
+        let response = delete_client
+            .delete_note(
+                &Workspace::Team {
+                    team_path: "team".to_owned(),
+                },
+                "note-id",
+            )
+            .await
+            .expect("team note should be deleted");
+        assert_eq!(response, None);
+        assert!(
+            delete_server
+                .finish()
+                .starts_with("DELETE /v1/teams/team/notes/note-id HTTP/1.1\r\n")
+        );
     }
 
     #[tokio::test]

@@ -5,12 +5,13 @@
 
 use std::collections::BTreeMap;
 
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 /// Who may read or directly edit a note, from least to most permissive.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NotePermission {
     Owner,
@@ -28,7 +29,7 @@ impl NotePermission {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CommentPermission {
     Disabled,
@@ -38,7 +39,7 @@ pub(crate) enum CommentPermission {
     Everyone,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SuggestEditPermission {
     Disabled,
@@ -49,7 +50,7 @@ pub(crate) enum SuggestEditPermission {
 
 /// Fields accepted when creating a note. Every optional field is omitted when
 /// absent so account and team defaults remain untouched.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CreateNoteRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,7 +87,7 @@ impl CreateNoteRequest {
 
 /// Patchable note fields. Create-only permission fields are intentionally not
 /// represented, preventing callers from silently sending unsupported data.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UpdateNoteRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,7 +105,11 @@ pub(crate) struct UpdateNoteRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) permalink: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) parent_folder_id: Option<String>,
+    #[allow(
+        clippy::option_option,
+        reason = "outer None omits PATCH field; inner None serializes explicit null"
+    )]
+    pub(crate) parent_folder_id: Option<Option<String>>,
 }
 
 impl UpdateNoteRequest {
@@ -170,7 +175,7 @@ pub(crate) struct TeamResponse {
     pub(crate) visibility: Option<String>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NoteResponse {
     pub(crate) id: String,
@@ -193,7 +198,7 @@ pub(crate) struct NoteResponse {
     pub(crate) folder_paths: Vec<FolderPathResponse>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FolderPathResponse {
     pub(crate) id: String,
@@ -277,6 +282,15 @@ mod tests {
         assert_eq!(
             serde_json::to_value(payload).expect("patch should serialize"),
             json!({"content": ""})
+        );
+
+        let clear_folder = UpdateNoteRequest {
+            parent_folder_id: Some(None),
+            ..UpdateNoteRequest::default()
+        };
+        assert_eq!(
+            serde_json::to_value(clear_folder).expect("null folder patch should serialize"),
+            json!({"parentFolderId": null})
         );
     }
 

@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 use crate::client::HackmdClient;
 use crate::config::Config;
+use crate::crud::{CreateNoteInput, DeleteNoteInput, UpdateNoteInput};
 use crate::dto::{ProfileResponse, TeamResponse};
 use crate::get_note::GetNoteInput;
 use crate::list_notes::ListNotesInput;
@@ -135,6 +136,86 @@ impl HackmdServer {
             Err(error) => tool_result::error(error.to_string()),
         }
     }
+
+    #[tool(
+        name = "hackmd_create_note",
+        description = "Create a HackMD note in a personal or team workspace. Folder placement is completed with a follow-up PATCH because HackMD ignores parentFolderId during creation.",
+        annotations(
+            title = "Create HackMD Note",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn create_note(
+        &self,
+        Parameters(input): Parameters<CreateNoteInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::crud::create_note(&self.client, input).await {
+            Ok(output) => tool_result::success(
+                format!("Created HackMD note {}", output.note.id),
+                serde_json::json!({"result": output}),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        name = "hackmd_update_note",
+        description = "Fallback note update for metadata or an explicit full content replacement. Prefer hackmd_edit_note for normal body edits because content here overwrites the complete unversioned body.",
+        annotations(
+            title = "Update HackMD Note",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn update_note(
+        &self,
+        Parameters(input): Parameters<UpdateNoteInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::crud::update_note(&self.client, input).await {
+            Ok(Ok(output)) => tool_result::success(
+                format!("HackMD accepted the update for note {}", output.note_id),
+                serde_json::json!({"result": output}),
+            ),
+            Ok(Err(resolution)) => tool_result::success(
+                "The note reference did not resolve uniquely",
+                serde_json::json!({"resolution": resolution}),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        name = "hackmd_delete_note",
+        description = "Delete a HackMD note from a personal or team workspace. This is destructive and may move the note to trash depending on HackMD workspace behavior.",
+        annotations(
+            title = "Delete HackMD Note",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn delete_note(
+        &self,
+        Parameters(input): Parameters<DeleteNoteInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::crud::delete_note(&self.client, input).await {
+            Ok(Ok(output)) => tool_result::success(
+                format!("Deleted HackMD note {}", output.note_id),
+                serde_json::json!({"result": output}),
+            ),
+            Ok(Err(resolution)) => tool_result::success(
+                "The note reference did not resolve uniquely",
+                serde_json::json!({"resolution": resolution}),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
 }
 
 fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
@@ -177,18 +258,31 @@ mod tests {
     }
 
     #[test]
-    fn read_tools_have_generated_schemas_and_annotations() {
+    fn tools_have_generated_schemas_and_exact_annotations() {
         let tools = HackmdServer::tool_router().list_all();
 
-        assert_eq!(tools.len(), 4);
-        for tool in &tools {
+        assert_eq!(tools.len(), 7);
+        let expected = [
+            ("hackmd_get_me", true, false, true),
+            ("hackmd_list_teams", true, false, true),
+            ("hackmd_list_notes", true, false, true),
+            ("hackmd_get_note", true, false, true),
+            ("hackmd_create_note", false, false, false),
+            ("hackmd_update_note", false, true, true),
+            ("hackmd_delete_note", false, true, true),
+        ];
+        for (name, read_only, destructive, idempotent) in expected {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("tool {name} should exist"));
             let annotations = tool
                 .annotations
                 .as_ref()
                 .expect("annotations should be generated");
-            assert_eq!(annotations.read_only_hint, Some(true));
-            assert_eq!(annotations.destructive_hint, Some(false));
-            assert_eq!(annotations.idempotent_hint, Some(true));
+            assert_eq!(annotations.read_only_hint, Some(read_only), "{name}");
+            assert_eq!(annotations.destructive_hint, Some(destructive), "{name}");
+            assert_eq!(annotations.idempotent_hint, Some(idempotent), "{name}");
             assert_eq!(annotations.open_world_hint, Some(true));
         }
         for name in ["hackmd_get_me", "hackmd_list_teams"] {
@@ -224,6 +318,37 @@ mod tests {
                 .is_some()
         );
         assert_eq!(get_note.input_schema["required"], json!(["note_ref"]));
+
+        for name in [
+            "hackmd_create_note",
+            "hackmd_update_note",
+            "hackmd_delete_note",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("tool {name} should exist"));
+            assert_eq!(tool.input_schema["additionalProperties"], false, "{name}");
+        }
+        let create = tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_create_note")
+            .expect("create tool should exist");
+        for field in [
+            "comment_permission",
+            "suggest_edit_permission",
+            "parent_folder_id",
+        ] {
+            assert!(create.input_schema["properties"].get(field).is_some());
+        }
+        let update = tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_update_note")
+            .expect("update tool should exist");
+        assert_eq!(update.input_schema["required"], json!(["note_ref"]));
+        for field in ["comment_permission", "suggest_edit_permission"] {
+            assert!(update.input_schema["properties"].get(field).is_some());
+        }
     }
 
     #[tokio::test]
@@ -242,6 +367,29 @@ mod tests {
                 .expect("error should be text")
                 .text,
             "GET /v1/me: HACKMD_API_TOKEN is not configured; set it in the server environment and restart the MCP server"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_tool_explains_create_only_permissions() {
+        let server = HackmdServer::new(Arc::new(
+            HackmdClient::new(Config::for_tests()).expect("test client should be constructed"),
+        ));
+        let input = serde_json::from_value(json!({
+            "note_ref": "id",
+            "suggest_edit_permission": "owners"
+        }))
+        .expect("input should deserialize");
+        let result = server
+            .update_note(rmcp::handler::server::wrapper::Parameters(input))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.content[0]
+                .as_text()
+                .expect("error should be text")
+                .text,
+            "comment_permission and suggest_edit_permission are create-only; HackMD PATCH does not support changing them"
         );
     }
 

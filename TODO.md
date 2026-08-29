@@ -182,18 +182,6 @@ test (see P3) for each and record the answer here.
 
 ## P1 — essential RMCP tools
 
-- [ ] Add `hackmd_create_note`, `hackmd_update_note`, and `hackmd_delete_note`.
-  Use `workspace` for both `/notes` and `/teams/{team_path}/notes`. Create
-  accepts title, content, tags, description, permalink, read/write/comment/
-  suggest-edit permissions, and folder placement; update accepts the PATCH
-  subset only and must reject `comment_permission` and `suggest_edit_permission`
-  with an explanation rather than silently dropping them.
-- [ ] Set tool annotations accurately: read tools are read-only/idempotent;
-  create is non-idempotent; delete and explicit overwrite are destructive; full
-  content replacement is destructive because it overwrites unversioned text.
-  Assert the generated `readOnlyHint`, `destructiveHint`, and `idempotentHint`
-  for every tool in protocol tests, the way the Rust proxy asserts them in its
-  tool-list test.
 - [ ] Add `hackmd_edit_note` as the default body-edit tool: GET current body,
   accept a Codex-style patch envelope with exactly one `*** Update File:` target
   matching `patch_path`, and apply it only when every hunk context matches

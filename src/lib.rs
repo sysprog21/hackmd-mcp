@@ -2,6 +2,7 @@
 
 mod client;
 mod config;
+mod crud;
 mod dto;
 mod get_note;
 mod list_notes;

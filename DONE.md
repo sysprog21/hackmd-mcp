@@ -93,3 +93,15 @@
   `teams/{team_path}/notes/{id}.md` for team notes, unencoded, for safe content
   edits. Normalize `folderPaths` into a `folder_ids` array here, since this is
   the only response that carries folder ancestry.
+- [x] Add `hackmd_create_note`, `hackmd_update_note`, and `hackmd_delete_note`.
+  Use `workspace` for both `/notes` and `/teams/{team_path}/notes`. Create
+  accepts title, content, tags, description, permalink, read/write/comment/
+  suggest-edit permissions, and folder placement; update accepts the PATCH
+  subset only and must reject `comment_permission` and `suggest_edit_permission`
+  with an explanation rather than silently dropping them.
+- [x] Set tool annotations accurately: read tools are read-only/idempotent;
+  create is non-idempotent; delete and explicit overwrite are destructive; full
+  content replacement is destructive because it overwrites unversioned text.
+  Assert the generated `readOnlyHint`, `destructiveHint`, and `idempotentHint`
+  for every tool in protocol tests, the way the Rust proxy asserts them in its
+  tool-list test.
