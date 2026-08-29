@@ -147,3 +147,7 @@
 - [x] Create a note in a folder as POST followed by PATCH and read-back. Keep
   the read-back regardless of whether a future live test permits dropping the
   compatibility PATCH.
+- [x] Add `hackmd_upload_note_image` with `workspace`, `note_ref`, and an
+  absolute `image_path`; stream multipart field `image`, require confirmation
+  above 5 MiB, refuse above 10 MiB, map 413 to a resize hint, and return only
+  `data.link`. Reject team uploads until a live test proves a supported route.

@@ -190,13 +190,6 @@ test (see P3) for each and record the answer here.
   pagination as note lists. Mark restore non-destructive/idempotent; keep delete
   destructive. Describe delete according to whichever behavior the live test in
   "Contradictions" confirms. Mock both routes and their empty/accepted responses.
-- [ ] Add `hackmd_upload_note_image` taking `workspace`, `note_ref`, and an
-  absolute `image_path`; stream multipart data under field name `image`, warn
-  through a tool error above 5 MB unless `confirm_large_file: true`, refuse above
-  10 MB, map upstream 413 to a resize hint, and return only `data.link`. Keep
-  `workspace` even though only `/notes/{id}/images` is documented: `note_ref`
-  cannot resolve a bare team note ID without it. Until a team route is confirmed,
-  a team workspace returns an explicit unsupported error rather than a 404.
 - [ ] Add tests for all known quirks: `202` updates, POST folder assignment,
   folder-path normalization, order-map merge preserving unrelated keys,
   move-cycle rejection, root-folder creation omitting `parentFolderId`, and

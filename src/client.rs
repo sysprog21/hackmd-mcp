@@ -2,14 +2,16 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::path::Path;
 use thiserror::Error;
 use url::Url;
 
 use crate::{
     config::Config,
     dto::{
-        CreateFolderRequest, CreateNoteRequest, FolderResponse, HistoryResponse, NoteResponse,
-        ProfileResponse, TeamResponse, UpdateFolderRequest, UpdateNoteRequest,
+        CreateFolderRequest, CreateNoteRequest, FolderResponse, HistoryResponse,
+        ImageUploadResponse, NoteResponse, ProfileResponse, TeamResponse, UpdateFolderRequest,
+        UpdateNoteRequest,
     },
     models::Workspace,
     state::StateStore,
@@ -292,6 +294,57 @@ impl HackmdClient {
             .await
     }
 
+    pub(crate) async fn upload_note_image(
+        &self,
+        note_id: &str,
+        image_path: &Path,
+    ) -> Result<ImageUploadResponse, HackmdError> {
+        let segments = ["notes", note_id, "images"];
+        let url = self.url_for_segments(&segments)?;
+        let path = url.path().to_owned();
+        let token = self
+            .config
+            .api_token()
+            .ok_or_else(|| HackmdError::MissingToken {
+                method: "POST".to_owned(),
+                path: path.clone(),
+            })?;
+        let form = reqwest::multipart::Form::new()
+            .file("image", image_path)
+            .await
+            .map_err(|_| HackmdError::ImageRead)?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| request_error(&error, "POST".to_owned(), path.clone()))?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| request_error(&error, "POST".to_owned(), path.clone()))?;
+        if status == StatusCode::PAYLOAD_TOO_LARGE {
+            return Err(HackmdError::ImageTooLarge { path });
+        }
+        if !status.is_success() {
+            return Err(map_status_error(
+                status,
+                "POST".to_owned(),
+                path,
+                &bytes,
+                token,
+            ));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| HackmdError::InvalidJson {
+            method: "POST".to_owned(),
+            path,
+            status,
+        })
+    }
+
     #[allow(dead_code, reason = "called by the API operation tasks")]
     pub(crate) async fn request_json<T: DeserializeOwned>(
         &self,
@@ -410,6 +463,12 @@ pub(crate) enum HackmdError {
     InvalidBaseUrl,
     #[error("failed to serialize a validated HackMD request payload")]
     InvalidPayload,
+    #[error("image file could not be opened for upload")]
+    ImageRead,
+    #[error(
+        "POST {path}: HackMD rejected the image as too large (413); resize it below 5 MB and retry"
+    )]
+    ImageTooLarge { path: String },
     #[error("team workspace {team_path:?} is not available to this HackMD account")]
     UnknownTeam { team_path: String },
     #[error("{method} {path}: request timed out; check network connectivity and retry")]

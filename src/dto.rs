@@ -239,6 +239,16 @@ pub(crate) struct FolderResponse {
     pub(crate) updated_at: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct ImageUploadResponse {
+    pub(crate) data: ImageUploadData,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ImageUploadData {
+    pub(crate) link: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CreateFolderRequest {

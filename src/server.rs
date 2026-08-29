@@ -15,6 +15,7 @@ use crate::folders::{
 };
 use crate::get_note::GetNoteInput;
 use crate::history::HistoryInput;
+use crate::image_upload::UploadNoteImageInput;
 use crate::list_notes::ListNotesInput;
 use crate::tool_result;
 
@@ -435,6 +436,34 @@ impl HackmdServer {
             Err(error) => tool_result::error(error.to_string()),
         }
     }
+
+    #[tool(
+        name = "hackmd_upload_note_image",
+        description = "Upload a local image to a personal-workspace note and return only its HackMD CDN link. Files above 5 MiB require confirmation; files above 10 MiB are refused.",
+        annotations(
+            title = "Upload HackMD Note Image",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn upload_note_image(
+        &self,
+        Parameters(input): Parameters<UploadNoteImageInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::image_upload::upload_note_image(&self.client, input).await {
+            Ok(Ok(output)) => tool_result::success(
+                "Uploaded HackMD note image",
+                serde_json::to_value(output).expect("image-upload output should serialize"),
+            ),
+            Ok(Err(resolution)) => tool_result::success(
+                "The note reference did not resolve uniquely",
+                serde_json::json!({"resolution": resolution}),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
 }
 
 fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
@@ -464,7 +493,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 15] = [
+    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 16] = [
         ("hackmd_get_me", true, false, true),
         ("hackmd_list_teams", true, false, true),
         ("hackmd_list_notes", true, false, true),
@@ -480,6 +509,7 @@ mod tests {
         ("hackmd_update_folder", false, false, true),
         ("hackmd_delete_folder", false, true, true),
         ("hackmd_set_folder_order", false, false, true),
+        ("hackmd_upload_note_image", false, false, false),
     ];
 
     async fn protocol_client(
@@ -536,7 +566,7 @@ mod tests {
     fn tools_have_generated_schemas_and_exact_annotations() {
         let tools = HackmdServer::tool_router().list_all();
 
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 16);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = tools
                 .iter()
@@ -761,7 +791,7 @@ mod tests {
             .list_tools(None)
             .await
             .expect("tools/list should succeed");
-        assert_eq!(listed.tools.len(), 15);
+        assert_eq!(listed.tools.len(), 16);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = listed
                 .tools

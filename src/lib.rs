@@ -8,6 +8,7 @@ mod edit_note;
 mod folders;
 mod get_note;
 mod history;
+mod image_upload;
 mod list_notes;
 mod models;
 mod note_ref;
