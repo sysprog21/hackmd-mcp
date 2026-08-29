@@ -344,6 +344,7 @@ impl HackmdClient {
             .await
             .map_err(|error| request_error(&error, "POST".to_owned(), path.clone()))?;
         let status = response.status();
+        let rate_limit = RateLimitHeaders::from_headers(response.headers());
         let bytes = response
             .bytes()
             .await
@@ -358,6 +359,7 @@ impl HackmdClient {
                 path,
                 &bytes,
                 token,
+                rate_limit,
             ));
         }
         serde_json::from_slice(&bytes).map_err(|_| HackmdError::InvalidJson {
@@ -409,7 +411,7 @@ impl HackmdClient {
         let retry = self.config.retry();
         let mut retries = 0_u8;
         tracing::debug!(method = %method_text, path = %path, "HackMD request started");
-        let (status, bytes) = loop {
+        let (status, bytes, rate_limit) = loop {
             let mut request = self
                 .http
                 .request(method.clone(), url.clone())
@@ -430,6 +432,7 @@ impl HackmdClient {
             };
             let status = response.status();
             let retry_after = retry_after(response.headers());
+            let rate_limit = RateLimitHeaders::from_headers(response.headers());
             let bytes = match response.bytes().await {
                 Ok(bytes) => bytes,
                 Err(_) if retryable && retries < retry.max_retries => {
@@ -455,7 +458,7 @@ impl HackmdClient {
                 retries += 1;
                 continue;
             }
-            break (status, bytes);
+            break (status, bytes, rate_limit);
         };
 
         tracing::debug!(
@@ -467,7 +470,14 @@ impl HackmdClient {
         );
 
         if !status.is_success() {
-            return Err(map_status_error(status, method_text, path, &bytes, token));
+            return Err(map_status_error(
+                status,
+                method_text,
+                path,
+                &bytes,
+                token,
+                rate_limit,
+            ));
         }
         if bytes.is_empty() {
             return Ok(None);
@@ -483,6 +493,12 @@ impl HackmdClient {
     }
 
     fn url_for_segments(&self, path_segments: &[&str]) -> Result<Url, HackmdError> {
+        if path_segments
+            .iter()
+            .any(|segment| segment.trim().is_empty())
+        {
+            return Err(HackmdError::EmptyPathSegment);
+        }
         let mut url = self.config.api_url().clone();
         let mut segments = url
             .path_segments_mut()
@@ -542,30 +558,96 @@ fn request_error(error: &reqwest::Error, method: String, path: String) -> Hackmd
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RateLimitHeaders {
+    user_limit: Option<u32>,
+    user_remaining: Option<u32>,
+    reset_after: Option<u64>,
+}
+
+impl RateLimitHeaders {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        Self {
+            user_limit: parse_header(headers, "x-ratelimit-userlimit"),
+            user_remaining: parse_header(headers, "x-ratelimit-userremaining"),
+            reset_after: parse_header(headers, "x-ratelimit-userreset"),
+        }
+    }
+
+    fn detail(self) -> String {
+        match (self.user_remaining, self.user_limit, self.reset_after) {
+            (None, None, None) => "quota headers unavailable".to_owned(),
+            (remaining, limit, reset) => format!(
+                "remaining {}/{}, reset after {} seconds",
+                optional_number(remaining),
+                optional_number(limit),
+                optional_number(reset)
+            ),
+        }
+    }
+}
+
+fn parse_header<T>(headers: &reqwest::header::HeaderMap, name: &str) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+}
+
+fn optional_number<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+}
+
 fn map_status_error(
     status: StatusCode,
     method: String,
     path: String,
     body: &[u8],
     token: &str,
+    rate_limit: RateLimitHeaders,
 ) -> HackmdError {
+    let body_detail = bounded_body(body, token);
     match status {
         StatusCode::UNAUTHORIZED => HackmdError::Unauthorized { method, path },
         StatusCode::FORBIDDEN => HackmdError::Forbidden { method, path },
         StatusCode::NOT_FOUND => HackmdError::NotFound { method, path },
         StatusCode::CONFLICT => HackmdError::Conflict { method, path },
-        StatusCode::TOO_MANY_REQUESTS => HackmdError::RateLimited { method, path },
+        StatusCode::TOO_MANY_REQUESTS => HackmdError::RateLimited {
+            method,
+            path,
+            detail: combine_details(rate_limit.detail(), &body_detail),
+        },
         status if status.is_server_error() => HackmdError::Upstream {
             method,
             path,
             status,
+            detail: nonempty_detail(body_detail),
         },
         status => HackmdError::Api {
             method,
             path,
             status,
-            detail: bounded_body(body, token),
+            detail: nonempty_detail(body_detail),
         },
+    }
+}
+
+fn combine_details(mut primary: String, secondary: &str) -> String {
+    if !secondary.is_empty() {
+        primary.push_str(": ");
+        primary.push_str(secondary);
+    }
+    primary
+}
+
+fn nonempty_detail(detail: String) -> String {
+    if detail.is_empty() {
+        "no response detail".to_owned()
+    } else {
+        detail
     }
 }
 
@@ -590,6 +672,8 @@ pub(crate) enum HackmdError {
     ClientBuild,
     #[error("configured HACKMD_API_URL cannot be used as an API base URL")]
     InvalidBaseUrl,
+    #[error("HackMD API path segments such as note IDs and team paths must not be empty")]
+    EmptyPathSegment,
     #[error("failed to serialize a validated HackMD request payload")]
     InvalidPayload,
     #[error("image file could not be opened for upload")]
@@ -614,15 +698,18 @@ pub(crate) enum HackmdError {
     NotFound { method: String, path: String },
     #[error("{method} {path}: 409 conflict; the requested permalink may already be in use")]
     Conflict { method: String, path: String },
-    #[error(
-        "{method} {path}: 429 rate limited (100 requests per 5 minutes; monthly quota 2,000 free / 20,000 Prime); wait before retrying"
-    )]
-    RateLimited { method: String, path: String },
-    #[error("{method} {path}: upstream HackMD error ({status}); retry later")]
+    #[error("{method} {path}: 429 rate limited ({detail}); wait before retrying")]
+    RateLimited {
+        method: String,
+        path: String,
+        detail: String,
+    },
+    #[error("{method} {path}: upstream HackMD error ({status}): {detail}; retry later")]
     Upstream {
         method: String,
         path: String,
         status: StatusCode,
+        detail: String,
     },
     #[error("{method} {path}: HackMD API error ({status}): {detail}")]
     Api {
@@ -941,6 +1028,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limit_error_reports_hackmd_quota_headers() {
+        const HEADERS: &[(&str, &str)] = &[
+            ("x-ratelimit-userlimit", "100"),
+            ("x-ratelimit-userremaining", "0"),
+            ("x-ratelimit-userreset", "42"),
+        ];
+        let server = crate::test_support::SequenceServer::spawn_with_headers([(
+            429,
+            r#"{"error":"slow down"}"#,
+            HEADERS,
+        )]);
+        let client = HackmdClient::new(Config::for_loopback_test_no_retry(
+            &server.api_url,
+            "fixture-token",
+        ))
+        .expect("fixture client should build");
+
+        let message = client
+            .request_json::<Value>(Method::GET, &["notes"], None)
+            .await
+            .expect_err("429 should map to rate-limit detail")
+            .to_string();
+        assert!(message.contains("remaining 0/100, reset after 42 seconds"));
+        assert!(message.contains(r#"{"error":"slow down"}"#));
+        server.finish();
+    }
+
+    #[tokio::test]
+    async fn upstream_errors_keep_bounded_redacted_body_detail() {
+        const TOKEN: &str = "upstream-sensitive-token";
+        let body = format!(r#"{{"error":"failure for {TOKEN}"}}"#);
+        let server = FixtureServer::spawn(503, &body);
+        let client = fixture_client_no_retry(&server, TOKEN);
+
+        let message = client
+            .request_json::<Value>(Method::GET, &["notes"], None)
+            .await
+            .expect_err("503 should retain safe error detail")
+            .to_string();
+        assert!(message.contains(r#"{"error":"failure for [REDACTED]"}"#));
+        assert!(!message.contains(TOKEN));
+        server.finish();
+    }
+
+    #[tokio::test]
     async fn bounds_generic_errors_and_redacts_the_token() {
         const TOKEN: &str = "fixture-sensitive-token";
         let body = format!("{} {TOKEN} {}", "x".repeat(280), "x".repeat(400));
@@ -1022,6 +1154,17 @@ mod tests {
                 .request_json::<Value>(Method::GET, &["me"], None)
                 .await,
             Err(HackmdError::MissingToken { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn blank_resource_identifier_fails_before_token_or_network() {
+        let client = HackmdClient::new(Config::for_tests()).expect("test client should build");
+        assert!(matches!(
+            client
+                .request_json::<Value>(Method::GET, &["notes", "  "], None)
+                .await,
+            Err(HackmdError::EmptyPathSegment)
         ));
     }
 

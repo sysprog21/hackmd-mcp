@@ -4,7 +4,9 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
-    dto::{CommentPermission, NotePermission, NoteResponse},
+    dto::{
+        CommentPermission, NotePermission, NotePublishType, NoteResponse, SimpleUserProfileResponse,
+    },
     models::Workspace,
     note_ref::{NoteRefError, NoteResolution, ResolvedNoteRef},
 };
@@ -33,6 +35,16 @@ pub(crate) struct NoteDetail {
     pub(crate) folder_ids: Vec<String>,
     pub(crate) created_at: Option<i64>,
     pub(crate) last_changed_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) title_updated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tags_updated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_change_user: Option<SimpleUserProfileResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) publish_type: Option<NotePublishType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) published_at: Option<i64>,
     pub(crate) publish_link: Option<String>,
     pub(crate) permalink: Option<String>,
     pub(crate) user_path: Option<String>,
@@ -81,6 +93,11 @@ fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> NoteDetail 
             .collect(),
         created_at: note.created_at,
         last_changed_at: note.last_changed_at,
+        title_updated_at: note.title_updated_at,
+        tags_updated_at: note.tags_updated_at,
+        last_change_user: note.last_change_user,
+        publish_type: note.publish_type,
+        published_at: note.published_at,
         publish_link: note.publish_link,
         permalink: note.permalink,
         user_path: note.user_path,
@@ -114,6 +131,10 @@ mod tests {
             "shortId": "short",
             "title": "Title",
             "content": "# Body",
+            "titleUpdatedAt": 10.4,
+            "tagsUpdatedAt": 11,
+            "publishType": "view",
+            "publishedAt": 12.6,
             "folderPaths": [
                 {"id": "parent", "name": "Parent", "parentId": null, "icon": null},
                 {"id": "child", "name": "Child", "parentId": "parent", "icon": null}
@@ -135,6 +156,10 @@ mod tests {
         assert_eq!(detail.folder_ids, ["parent", "child"]);
         let value = serde_json::to_value(detail).expect("detail should serialize");
         assert_eq!(value["content"], "# Body");
+        assert_eq!(value["titleUpdatedAt"], 10);
+        assert_eq!(value["tagsUpdatedAt"], 11);
+        assert_eq!(value["publishType"], "view");
+        assert_eq!(value["publishedAt"], 13);
         assert!(value.get("folderPaths").is_none());
     }
 

@@ -48,6 +48,22 @@ pub(crate) enum SuggestEditPermission {
     SignedInUsers,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TeamVisibility {
+    Public,
+    Private,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum NotePublishType {
+    Edit,
+    View,
+    Slide,
+    Book,
+}
+
 /// Fields accepted when creating a note. Every optional field is omitted when
 /// absent so account and team defaults remain untouched.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -164,17 +180,41 @@ pub(crate) struct ProfileResponse {
     pub(crate) photo: Option<String>,
     #[serde(default)]
     pub(crate) teams: Vec<TeamResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) upgraded: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TeamResponse {
     pub(crate) id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) owner_id: Option<String>,
     pub(crate) name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) logo: Option<String>,
     pub(crate) path: String,
     pub(crate) description: Option<String>,
     pub(crate) hard_limit: Option<u64>,
-    pub(crate) visibility: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) visibility: Option<TeamVisibility>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) created_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) upgraded: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SimpleUserProfileResponse {
+    pub(crate) name: String,
+    pub(crate) user_path: String,
+    pub(crate) photo: String,
+    pub(crate) biography: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -188,6 +228,28 @@ pub(crate) struct NoteResponse {
     pub(crate) created_at: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_optional_millis")]
     pub(crate) last_changed_at: Option<i64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) title_updated_at: Option<i64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) tags_updated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_change_user: Option<SimpleUserProfileResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) publish_type: Option<NotePublishType>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) published_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default, deserialize_with = "deserialize_optional_millis")]
     pub(crate) last_visit: Option<i64>,
@@ -250,6 +312,10 @@ pub(crate) struct FolderPathResponse {
     pub(crate) name: String,
     pub(crate) parent_id: Option<String>,
     pub(crate) icon: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) client_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -261,8 +327,10 @@ pub(crate) struct FolderResponse {
     pub(crate) icon: Option<String>,
     pub(crate) color: Option<String>,
     pub(crate) parent_folder_id: Option<String>,
-    pub(crate) created_at: Option<Value>,
-    pub(crate) updated_at: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_optional_millis")]
+    pub(crate) created_at: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_optional_millis")]
+    pub(crate) updated_at: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -491,18 +559,24 @@ mod tests {
             "email": "alice@example.test",
             "userPath": "alice",
             "photo": null,
+            "upgraded": true,
             "teams": [{
                 "id": "team-id",
+                "ownerId": "user-id",
                 "name": "Engineering",
+                "logo": "https://example.test/logo.png",
                 "path": "engineering",
                 "description": "Team",
                 "hardLimit": 100,
-                "visibility": "private"
+                "visibility": "private",
+                "createdAt": 1.25,
+                "upgraded": true
             }]
         }))
         .expect("profile fixture should deserialize");
         assert_eq!(profile.user_path, "alice");
         assert_eq!(profile.teams[0].path, "engineering");
+        assert_eq!(profile.teams[0].created_at, Some(1));
 
         let teams: Vec<TeamResponse> = serde_json::from_value(json!([{
             "id": "team-id",
@@ -522,6 +596,16 @@ mod tests {
             "publishLink": "https://hackmd.io/short",
             "createdAt": 1,
             "lastChangedAt": 2,
+            "titleUpdatedAt": 2.4,
+            "tagsUpdatedAt": null,
+            "lastChangeUser": {
+                "name": "Alice",
+                "userPath": "alice",
+                "photo": "https://example.test/alice.png",
+                "biography": null
+            },
+            "publishType": "edit",
+            "publishedAt": 3.6,
             "readPermission": "guest",
             "writePermission": "owner",
             "commentPermission": "everyone",
@@ -535,12 +619,16 @@ mod tests {
                 "id": "folder-id",
                 "name": "Folder",
                 "parentId": null,
-                "icon": null
+                "icon": null,
+                "color": "#ffffff",
+                "clientId": "client-folder-id"
             }]
         }))
         .expect("note fixture should deserialize");
         assert_eq!(note.read_permission, Some(NotePermission::Guest));
         assert_eq!(note.folder_paths[0].id, "folder-id");
+        assert_eq!(note.title_updated_at, Some(2));
+        assert_eq!(note.published_at, Some(4));
     }
 
     #[test]
