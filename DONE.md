@@ -6,7 +6,9 @@
   version supported by `rmcp` 3.x. Pin `rmcp = { version = "3",
   default-features = false, features = ["macros", "server", "transport-io"]
   }`; use its transitive `schemars` rather than a second MCP framework or
-  hand-written JSON-RPC dispatcher.
+  hand-written JSON-RPC dispatcher. The Rust prior art hand-rolled JSON-RPC
+  dispatch, `initialize`, and every `inputSchema` literal (about 400 lines in
+  `protocol.rs` plus `schema.rs`); RMCP's derive macros delete all of it.
 - [x] Add only the required application dependencies: `tokio` (macros,
   multi-thread runtime, time), `reqwest` with rustls + JSON, `serde`,
   `serde_json`, `thiserror`, `url`, `directories`, `tracing`,

@@ -37,8 +37,8 @@ implementation, and names its evidence so a future change can re-check the same
 source. Two grades appear: measured, meaning a live run against the real API
 recorded the behavior, and documented, meaning a source states it. The one
 inference in this section is labeled as such. These notes were taken from an
-`externals/` checkout that is no longer in the tree; re-clone the sources before
-relying on any single line. Sources:
+`externals/` checkout in this workspace; refresh the sources before relying on
+any single line. Sources:
 `hackmd-cli` (official CLI), `hackmd-skills` (official skills + a live eval
 run), `hackMD-skill`, `hackmd-mcp` (yuna0x0), `hackmd-mcp-server` (hbarcelos),
 `py-hackmd-mcp`, `hackmd-agent-python`, `hackmd-mcp-proxy` (Rust, closest prior
@@ -180,19 +180,6 @@ test (see P3) for each and record the answer here.
 
 ## P0 — RMCP 3.x foundation
 
-- [ ] Create the `hackmd-mcp` Cargo crate with `license = "MIT"` on a Rust
-  version supported by `rmcp` 3.x. Pin `rmcp = { version = "3",
-  default-features = false, features = ["macros", "server", "transport-io"]
-  }`; use its transitive `schemars` rather than a second MCP framework or
-  hand-written JSON-RPC dispatcher. The Rust prior art hand-rolled JSON-RPC
-  dispatch, `initialize`, and every `inputSchema` literal (about 400 lines in
-  `protocol.rs` plus `schema.rs`); RMCP's derive macros delete all of it.
-- [ ] Add only the required application dependencies: `tokio` (macros,
-  multi-thread runtime, time), `reqwest` with rustls + JSON, `serde`,
-  `serde_json`, `thiserror`, `url`, `directories`, `tracing`,
-  `tracing-subscriber`, and `tempfile` (tests/atomic writes). Add `clap` only
-  with the later `--help`/`--version` task. Keep modules private behind a small
-  `lib.rs` test surface.
 - [ ] Define `HackmdServer { client: Arc<HackmdClient> }` and implement its
   tool router with RMCP `#[tool_router(server_handler)]`, `#[tool]`, typed
   `Parameters<T>`, and `Deserialize + JsonSchema` input structs. Field docs
