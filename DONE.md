@@ -203,3 +203,7 @@
   transient network/5xx/429 failures, at most three retries with capped
   500 ms–5 s exponential full jitter and `Retry-After`; never retry
   create/delete automatically.
+- [x] Attach concurrency-safe `_meta.retry` data only after an actual retry,
+  including attempts, total waited seconds, and whether a 429 occurred, on
+  successful and final-error tool results. Emit no retry metadata or progress
+  noise for single-attempt requests.

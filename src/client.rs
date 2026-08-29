@@ -404,7 +404,7 @@ impl HackmdClient {
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(_) if retryable && retries < retry.max_retries => {
-                    sleep_before_retry(retries, None, retry).await;
+                    sleep_before_retry(retries, None, retry, false).await;
                     retries += 1;
                     continue;
                 }
@@ -417,7 +417,7 @@ impl HackmdClient {
             let bytes = match response.bytes().await {
                 Ok(bytes) => bytes,
                 Err(_) if retryable && retries < retry.max_retries => {
-                    sleep_before_retry(retries, None, retry).await;
+                    sleep_before_retry(retries, None, retry, false).await;
                     retries += 1;
                     continue;
                 }
@@ -429,7 +429,13 @@ impl HackmdClient {
                 && retries < retry.max_retries
                 && (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
             {
-                sleep_before_retry(retries, retry_after, retry).await;
+                sleep_before_retry(
+                    retries,
+                    retry_after,
+                    retry,
+                    status == StatusCode::TOO_MANY_REQUESTS,
+                )
+                .await;
                 retries += 1;
                 continue;
             }
@@ -477,6 +483,7 @@ async fn sleep_before_retry(
     retry_index: u8,
     retry_after: Option<Duration>,
     config: crate::config::RetryConfig,
+    was_rate_limited: bool,
 ) {
     let exponential = config
         .initial_backoff
@@ -489,6 +496,7 @@ async fn sleep_before_retry(
         },
         |duration| duration.min(config.max_backoff),
     );
+    crate::retry_metadata::record_retry(delay, was_rate_limited);
     tokio::time::sleep(delay).await;
 }
 

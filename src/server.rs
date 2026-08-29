@@ -49,7 +49,7 @@ pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl HackmdServer {
     #[tool(
         name = "hackmd_get_me",
@@ -574,6 +574,19 @@ impl HackmdServer {
     }
 }
 
+#[rmcp::tool_handler(router = Self::tool_router())]
+impl rmcp::ServerHandler for HackmdServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let tool_context =
+            rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        crate::retry_metadata::scope_call(Self::tool_router().call(tool_context)).await
+    }
+}
+
 fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
     let summary = format!(
         "Authenticated as {} (userPath: {})",
@@ -782,6 +795,68 @@ mod tests {
                 .text,
             "GET /v1/me: HACKMD_API_TOKEN is not configured; set it in the server environment and restart the MCP server"
         );
+    }
+
+    #[tokio::test]
+    async fn retried_success_and_final_tool_error_include_bounded_metadata() {
+        const RETRY_AFTER: &[(&str, &str)] = &[("Retry-After", "0")];
+        let retry = crate::config::RetryConfig {
+            max_retries: 1,
+            initial_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(2),
+        };
+        let success_fixture = crate::test_support::SequenceServer::spawn_with_headers([
+            (429, r#"{"error":"rate limited"}"#, RETRY_AFTER),
+            (
+                200,
+                r#"{"id":"u","name":"User","email":"u@example.com","userPath":"user"}"#,
+                &[],
+            ),
+        ]);
+        let (client, server_task) = protocol_client(Config::for_loopback_test_with_retry(
+            &success_fixture.api_url,
+            "fixture-token",
+            retry,
+        ))
+        .await;
+        let result = client
+            .call_tool(call("hackmd_get_me", json!({})))
+            .await
+            .expect("retried tool should succeed");
+        assert_eq!(result.is_error, Some(false));
+        let retry_meta = &result.meta.expect("retried result should have metadata").0["retry"];
+        assert_eq!(retry_meta["attempts"], 2);
+        assert_eq!(retry_meta["was_rate_limited"], true);
+        assert!(
+            retry_meta["total_waited_seconds"]
+                .as_f64()
+                .expect("wait should be numeric")
+                <= 0.002
+        );
+        stop_protocol(client, server_task).await;
+        success_fixture.finish();
+
+        let error_fixture = crate::test_support::SequenceServer::spawn([
+            (500, r#"{"error":"transient"}"#),
+            (500, r#"{"error":"still failing"}"#),
+        ]);
+        let (client, server_task) = protocol_client(Config::for_loopback_test_with_retry(
+            &error_fixture.api_url,
+            "fixture-token",
+            retry,
+        ))
+        .await;
+        let result = client
+            .call_tool(call("hackmd_get_me", json!({})))
+            .await
+            .expect("tool error should remain a protocol success");
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.meta.expect("final error should have metadata").0["retry"]["attempts"],
+            2
+        );
+        stop_protocol(client, server_task).await;
+        error_fixture.finish();
     }
 
     #[tokio::test]

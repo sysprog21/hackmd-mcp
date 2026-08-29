@@ -196,10 +196,6 @@ test (see P3) for each and record the answer here.
 
 ## P3 — efficiency and reliability
 
-- [ ] When a request is retried, include bounded structured retry metadata in
-  the successful or final-error tool result (`attempts`, total waited seconds,
-  and whether `429` occurred). Do not emit progress noise for an unretried
-  request.
 - [ ] Keep all responses context-efficient: slim list/history/folder summaries,
   explicit pagination metadata, and an opt-in full-content read only.
 - [ ] Add a short TTL cache only for list/discovery GETs if profiling or the
