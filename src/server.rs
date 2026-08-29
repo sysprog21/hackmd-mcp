@@ -274,9 +274,58 @@ mod tests {
     use super::{EmptyInput, HackmdServer, profile_result, teams_result};
     use crate::client::HackmdClient;
     use crate::config::Config;
-    use rmcp::ServerHandler;
+    use rmcp::{ServerHandler, ServiceExt, model::CallToolRequestParams};
     use serde_json::json;
     use std::sync::Arc;
+
+    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 8] = [
+        ("hackmd_get_me", true, false, true),
+        ("hackmd_list_teams", true, false, true),
+        ("hackmd_list_notes", true, false, true),
+        ("hackmd_get_note", true, false, true),
+        ("hackmd_create_note", false, false, false),
+        ("hackmd_update_note", false, true, true),
+        ("hackmd_delete_note", false, true, true),
+        ("hackmd_edit_note", false, false, false),
+    ];
+
+    async fn protocol_client(
+        config: Config,
+    ) -> (
+        rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let server = HackmdServer::new(Arc::new(
+            HackmdClient::new(config).expect("protocol-test client should build"),
+        ));
+        let server_task = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .expect("protocol-test server should start")
+                .waiting()
+                .await
+                .expect("protocol-test server task should join");
+        });
+        let client = ().serve(client_transport).await.expect("RMCP client should connect");
+        (client, server_task)
+    }
+
+    fn call(name: &'static str, arguments: serde_json::Value) -> CallToolRequestParams {
+        let serde_json::Value::Object(arguments) = arguments else {
+            panic!("tool arguments should be an object");
+        };
+        CallToolRequestParams::new(name).with_arguments(arguments)
+    }
+
+    async fn stop_protocol(
+        client: rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        server_task: tokio::task::JoinHandle<()>,
+    ) {
+        client.cancel().await.expect("RMCP client should cancel");
+        server_task.await.expect("protocol-test server should stop");
+    }
 
     #[test]
     fn server_owns_the_shared_client() {
@@ -295,17 +344,7 @@ mod tests {
         let tools = HackmdServer::tool_router().list_all();
 
         assert_eq!(tools.len(), 8);
-        let expected = [
-            ("hackmd_get_me", true, false, true),
-            ("hackmd_list_teams", true, false, true),
-            ("hackmd_list_notes", true, false, true),
-            ("hackmd_get_note", true, false, true),
-            ("hackmd_create_note", false, false, false),
-            ("hackmd_update_note", false, true, true),
-            ("hackmd_delete_note", false, true, true),
-            ("hackmd_edit_note", false, false, false),
-        ];
-        for (name, read_only, destructive, idempotent) in expected {
+        for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = tools
                 .iter()
                 .find(|tool| tool.name == name)
@@ -520,5 +559,153 @@ mod tests {
         assert!(info.capabilities.tools.is_some());
         assert!(info.capabilities.prompts.is_none());
         assert!(info.capabilities.resources.is_none());
+    }
+
+    #[tokio::test]
+    async fn in_process_tools_list_exposes_generated_contract() {
+        let (client, server_task) = protocol_client(Config::for_tests()).await;
+        let listed = client
+            .list_tools(None)
+            .await
+            .expect("tools/list should succeed");
+        assert_eq!(listed.tools.len(), 8);
+        for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
+            let tool = listed
+                .tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("tools/list omitted {name}"));
+            let annotations = tool.annotations.as_ref().expect("annotations should exist");
+            assert_eq!(annotations.read_only_hint, Some(read_only), "{name}");
+            assert_eq!(annotations.destructive_hint, Some(destructive), "{name}");
+            assert_eq!(annotations.idempotent_hint, Some(idempotent), "{name}");
+        }
+        let edit = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_edit_note")
+            .expect("edit tool should be listed");
+        assert_eq!(edit.input_schema["required"], json!(["note_ref", "patch"]));
+        let annotations = edit.annotations.as_ref().expect("annotations should exist");
+        assert_eq!(annotations.read_only_hint, Some(false));
+        assert_eq!(annotations.destructive_hint, Some(false));
+        assert_eq!(annotations.idempotent_hint, Some(false));
+        let list = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_list_notes")
+            .expect("list tool should be listed");
+        assert_eq!(list.input_schema["properties"]["limit"]["default"], 20);
+        assert_eq!(list.input_schema["properties"]["limit"]["maximum"], 100);
+        let update = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_update_note")
+            .expect("update tool should be listed");
+        assert_eq!(update.input_schema["required"], json!(["note_ref"]));
+        assert!(
+            update.input_schema["properties"]
+                .get("comment_permission")
+                .is_some()
+        );
+        stop_protocol(client, server_task).await;
+    }
+
+    #[tokio::test]
+    async fn in_process_list_call_covers_team_route_search_and_pagination() {
+        let fixture = crate::test_support::SequenceServer::spawn([(
+            200,
+            r#"[
+                {"id":"a","title":"Roadmap A","description":"Rust work","tags":["rust"],"lastChangedAt":3},
+                {"id":"b","title":"Roadmap B","description":"Rust work","tags":["RUST"],"lastChangedAt":2},
+                {"id":"c","title":"Other","description":"Rust work","tags":["rust"],"lastChangedAt":1}
+            ]"#,
+        )]);
+        let (client, server_task) = protocol_client(Config::for_loopback_test(
+            &fixture.api_url,
+            Some("fixture-token"),
+        ))
+        .await;
+        let result = client
+            .call_tool(call(
+                "hackmd_list_notes",
+                json!({
+                    "workspace": {"kind": "team", "team_path": "core/team"},
+                    "query": "ROADMAP",
+                    "tags": ["rust"],
+                    "limit": 1,
+                    "offset": 1
+                }),
+            ))
+            .await
+            .expect("tools/call should succeed");
+        assert_eq!(result.is_error, Some(false));
+        let structured = result
+            .structured_content
+            .expect("structured result should exist");
+        assert_eq!(structured["total"], 2);
+        assert_eq!(structured["count"], 1);
+        assert_eq!(structured["offset"], 1);
+        assert_eq!(structured["has_more"], false);
+        assert_eq!(structured["notes"][0]["id"], "b");
+        stop_protocol(client, server_task).await;
+        let requests = fixture.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /v1/teams/core%2Fteam/notes HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn in_process_edit_calls_cover_no_op_and_conflict_without_patch() {
+        let fixture = crate::test_support::SequenceServer::spawn([
+            (200, r#"{"id":"same","title":"Same","content":"same"}"#),
+            (
+                200,
+                r#"{"id":"conflict","title":"Conflict","content":"actual"}"#,
+            ),
+        ]);
+        let (client, server_task) = protocol_client(Config::for_loopback_test(
+            &fixture.api_url,
+            Some("fixture-token"),
+        ))
+        .await;
+        let no_op = client
+            .call_tool(call(
+                "hackmd_edit_note",
+                json!({
+                    "note_ref": "same",
+                    "patch": "*** Begin Patch\n*** Update File: notes/same.md\n@@\n same\n*** End Patch"
+                }),
+            ))
+            .await
+            .expect("no-op tool call should succeed");
+        assert_eq!(no_op.is_error, Some(false));
+        assert_eq!(
+            no_op.structured_content.expect("no-op result")["result"]["changed"],
+            false
+        );
+
+        let conflict = client
+            .call_tool(call(
+                "hackmd_edit_note",
+                json!({
+                    "note_ref": "conflict",
+                    "patch": "*** Begin Patch\n*** Update File: notes/conflict.md\n@@\n-missing\n+new\n*** End Patch"
+                }),
+            ))
+            .await
+            .expect("conflict tool call should return a tool result");
+        assert_eq!(conflict.is_error, Some(true));
+        assert_eq!(
+            conflict.content[0]
+                .as_text()
+                .expect("conflict should be text")
+                .text,
+            "patch hunk context was not found"
+        );
+        stop_protocol(client, server_task).await;
+        let requests = fixture.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /v1/notes/same HTTP/1.1\r\n"));
+        assert!(requests[1].starts_with("GET /v1/notes/conflict HTTP/1.1\r\n"));
     }
 }

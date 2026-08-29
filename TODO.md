@@ -182,10 +182,6 @@ test (see P3) for each and record the answer here.
 
 ## P1 — essential RMCP tools
 
-- [ ] Add `rmcp` dev features `client` and `transport-worker` for in-process
-  protocol tests. Assert generated schemas, tool annotations, `tools/list`,
-  tool calls, workspace routes, pagination/search, no-op edits, and patch
-  conflicts without parsing stdio by hand.
 
 ## P2 — complete daily HackMD workflow
 

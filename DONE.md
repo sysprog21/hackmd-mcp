@@ -115,3 +115,7 @@
   `changed: false` for a no-op. Keep `hackmd_update_note` for metadata and
   explicit full replacement, and say so in both tool descriptions so agents pick
   the patch tool by default.
+- [x] Add `rmcp` dev features `client` and `transport-worker` for in-process
+  protocol tests. Assert generated schemas, tool annotations, `tools/list`,
+  tool calls, workspace routes, pagination/search, no-op edits, and patch
+  conflicts without parsing stdio by hand.
