@@ -159,6 +159,7 @@ pub(crate) async fn create_note(
         origin: input.origin,
     };
     payload.validate()?;
+    client.ensure_team_exists(&input.workspace).await?;
     let note = client.create_note(&input.workspace, &payload).await?;
     if let Some(folder_id) = folder.as_ref() {
         let placement = UpdateNoteRequest {

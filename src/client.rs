@@ -1,14 +1,15 @@
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use thiserror::Error;
 use url::Url;
 
 use crate::{
     config::Config,
     dto::{
-        CreateNoteRequest, HistoryResponse, NoteResponse, ProfileResponse, TeamResponse,
-        UpdateNoteRequest,
+        CreateFolderRequest, CreateNoteRequest, FolderResponse, HistoryResponse, NoteResponse,
+        ProfileResponse, TeamResponse, UpdateFolderRequest, UpdateNoteRequest,
     },
     models::Workspace,
     state::StateStore,
@@ -60,6 +61,27 @@ impl HackmdClient {
                 method: "GET".to_owned(),
                 path,
             })
+    }
+
+    pub(crate) async fn ensure_team_exists(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<(), HackmdError> {
+        let Workspace::Team { team_path } = workspace else {
+            return Ok(());
+        };
+        if self
+            .list_teams()
+            .await?
+            .iter()
+            .any(|team| team.path == *team_path)
+        {
+            Ok(())
+        } else {
+            Err(HackmdError::UnknownTeam {
+                team_path: team_path.clone(),
+            })
+        }
     }
 
     pub(crate) async fn get_history(&self) -> Result<Vec<NoteResponse>, HackmdError> {
@@ -153,6 +175,121 @@ impl HackmdClient {
             Workspace::Team { team_path } => vec!["teams", team_path, "notes", note_id],
         };
         self.request_json(Method::DELETE, &segments, None).await
+    }
+
+    pub(crate) async fn list_folders(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Vec<FolderResponse>, HackmdError> {
+        let segments: Vec<&str> = match workspace {
+            Workspace::Personal => vec!["folders"],
+            Workspace::Team { team_path } => vec!["teams", team_path, "folders"],
+        };
+        let path = self.url_for_segments(&segments)?.path().to_owned();
+        self.request_json(Method::GET, &segments, None)
+            .await?
+            .ok_or_else(|| HackmdError::EmptyResponse {
+                method: "GET".to_owned(),
+                path,
+            })
+    }
+
+    pub(crate) async fn get_folder(
+        &self,
+        workspace: &Workspace,
+        folder_id: &str,
+    ) -> Result<FolderResponse, HackmdError> {
+        let segments: Vec<&str> = match workspace {
+            Workspace::Personal => vec!["folders", folder_id],
+            Workspace::Team { team_path } => vec!["teams", team_path, "folders", folder_id],
+        };
+        let path = self.url_for_segments(&segments)?.path().to_owned();
+        self.request_json(Method::GET, &segments, None)
+            .await?
+            .ok_or_else(|| HackmdError::EmptyResponse {
+                method: "GET".to_owned(),
+                path,
+            })
+    }
+
+    pub(crate) async fn create_folder(
+        &self,
+        workspace: &Workspace,
+        payload: &CreateFolderRequest,
+    ) -> Result<FolderResponse, HackmdError> {
+        let segments: Vec<&str> = match workspace {
+            Workspace::Personal => vec!["folders"],
+            Workspace::Team { team_path } => vec!["teams", team_path, "folders"],
+        };
+        let path = self.url_for_segments(&segments)?.path().to_owned();
+        let body = serde_json::to_value(payload).map_err(|_| HackmdError::InvalidPayload)?;
+        self.request_json(Method::POST, &segments, Some(&body))
+            .await?
+            .ok_or_else(|| HackmdError::EmptyResponse {
+                method: "POST".to_owned(),
+                path,
+            })
+    }
+
+    pub(crate) async fn update_folder(
+        &self,
+        workspace: &Workspace,
+        folder_id: &str,
+        payload: &UpdateFolderRequest,
+    ) -> Result<Option<FolderResponse>, HackmdError> {
+        let segments: Vec<&str> = match workspace {
+            Workspace::Personal => vec!["folders", folder_id],
+            Workspace::Team { team_path } => vec!["teams", team_path, "folders", folder_id],
+        };
+        let body = serde_json::to_value(payload).map_err(|_| HackmdError::InvalidPayload)?;
+        self.request_json(Method::PATCH, &segments, Some(&body))
+            .await
+    }
+
+    pub(crate) async fn delete_folder(
+        &self,
+        workspace: &Workspace,
+        folder_id: &str,
+    ) -> Result<Option<Value>, HackmdError> {
+        let segments: Vec<&str> = match workspace {
+            Workspace::Personal => vec!["folders", folder_id],
+            Workspace::Team { team_path } => vec!["teams", team_path, "folders", folder_id],
+        };
+        self.request_json(Method::DELETE, &segments, None).await
+    }
+
+    pub(crate) async fn get_folder_order(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<BTreeMap<String, Vec<String>>, HackmdError> {
+        let segments: Vec<&str> = match workspace {
+            Workspace::Personal => vec!["folders", "folder-order"],
+            Workspace::Team { team_path } => {
+                vec!["teams", team_path, "folders", "folder-order"]
+            }
+        };
+        let path = self.url_for_segments(&segments)?.path().to_owned();
+        self.request_json(Method::GET, &segments, None)
+            .await?
+            .ok_or_else(|| HackmdError::EmptyResponse {
+                method: "GET".to_owned(),
+                path,
+            })
+    }
+
+    pub(crate) async fn set_folder_order(
+        &self,
+        workspace: &Workspace,
+        order: &BTreeMap<String, Vec<String>>,
+    ) -> Result<Option<Value>, HackmdError> {
+        let segments: Vec<&str> = match workspace {
+            Workspace::Personal => vec!["folders", "folder-order"],
+            Workspace::Team { team_path } => {
+                vec!["teams", team_path, "folders", "folder-order"]
+            }
+        };
+        self.request_json(Method::PUT, &segments, Some(&json!({"order": order})))
+            .await
     }
 
     #[allow(dead_code, reason = "called by the API operation tasks")]
@@ -273,6 +410,8 @@ pub(crate) enum HackmdError {
     InvalidBaseUrl,
     #[error("failed to serialize a validated HackMD request payload")]
     InvalidPayload,
+    #[error("team workspace {team_path:?} is not available to this HackMD account")]
+    UnknownTeam { team_path: String },
     #[error("{method} {path}: request timed out; check network connectivity and retry")]
     Timeout { method: String, path: String },
     #[error("{method} {path}: network request failed; check connectivity and HACKMD_API_URL")]

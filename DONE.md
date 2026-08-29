@@ -125,3 +125,19 @@
 - [x] Add `hackmd_get_history` (`GET /history`) with the same slim, client-side
   pagination as note lists. Tolerate both a bare array and a wrapped
   `{"history": [...]}` response, as `py-hackmd-mcp` does.
+- [x] Add folder tools: `hackmd_list_folders`, `hackmd_get_folder`,
+  `hackmd_create_folder`, `hackmd_update_folder`, `hackmd_delete_folder`, and
+  `hackmd_set_folder_order`, all workspace-aware. Folder create/update carry
+  `name`, `description`, `icon`, `color`, and `parent_folder_id`.
+- [x] Omit `parentFolderId` when creating a root folder; do not send `null`,
+  which POST rejects. On folder update, `null` clears `parentFolderId`,
+  `description`, `icon`, and `color`, represented with absent/null/value input
+  states. Confirm a requested team path exists before creating content or
+  folders in it.
+- [x] Before moving a folder, reject self/descendant moves by walking the
+  folder parent chain. Before deleting a non-empty folder, return its child
+  count without changing state; delete only when the same request supplies
+  `confirm: true`.
+- [x] Implement `hackmd_set_folder_order` as GET `folder-order`, replace only
+  the requested parent entry (`root` for top level), and PUT the whole map back
+  while preserving every unrelated key.

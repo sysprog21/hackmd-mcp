@@ -5,6 +5,7 @@ mod config;
 mod crud;
 mod dto;
 mod edit_note;
+mod folders;
 mod get_note;
 mod history;
 mod list_notes;

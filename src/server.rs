@@ -9,6 +9,10 @@ use crate::config::Config;
 use crate::crud::{CreateNoteInput, DeleteNoteInput, UpdateNoteInput};
 use crate::dto::{ProfileResponse, TeamResponse};
 use crate::edit_note::EditNoteInput;
+use crate::folders::{
+    CreateFolderInput, DeleteFolderInput, FolderRefInput, FolderWorkspaceInput,
+    SetFolderOrderInput, UpdateFolderInput,
+};
 use crate::get_note::GetNoteInput;
 use crate::history::HistoryInput;
 use crate::list_notes::ListNotesInput;
@@ -277,6 +281,160 @@ impl HackmdServer {
             Err(error) => tool_result::error(error.to_string()),
         }
     }
+
+    #[tool(
+        name = "hackmd_list_folders",
+        description = "List folders in a personal or team HackMD workspace.",
+        annotations(
+            title = "List HackMD Folders",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn list_folders(
+        &self,
+        Parameters(input): Parameters<FolderWorkspaceInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::folders::list_folders(&self.client, input).await {
+            Ok(output) => tool_result::success(
+                format!("Found {} HackMD folder(s)", output.count),
+                serde_json::to_value(output).expect("folder-list output should serialize"),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        name = "hackmd_get_folder",
+        description = "Get one folder by internal ID in a personal or team HackMD workspace.",
+        annotations(
+            title = "Get HackMD Folder",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn get_folder(
+        &self,
+        Parameters(input): Parameters<FolderRefInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::folders::get_folder(&self.client, input).await {
+            Ok(output) => tool_result::success(
+                format!("Fetched HackMD folder {}", output.folder.id),
+                serde_json::to_value(output).expect("folder output should serialize"),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        name = "hackmd_create_folder",
+        description = "Create a root or nested folder in a personal or verified team HackMD workspace.",
+        annotations(
+            title = "Create HackMD Folder",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn create_folder(
+        &self,
+        Parameters(input): Parameters<CreateFolderInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::folders::create_folder(&self.client, input).await {
+            Ok(output) => tool_result::success(
+                format!("Created HackMD folder {}", output.folder.id),
+                serde_json::to_value(output).expect("folder output should serialize"),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        name = "hackmd_update_folder",
+        description = "Update folder metadata or move a folder after rejecting self and descendant cycles; reads the folder back after PATCH.",
+        annotations(
+            title = "Update HackMD Folder",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn update_folder(
+        &self,
+        Parameters(input): Parameters<UpdateFolderInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::folders::update_folder(&self.client, input).await {
+            Ok(output) => tool_result::success(
+                format!("Updated HackMD folder {}", output.folder.id),
+                serde_json::to_value(output).expect("folder output should serialize"),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        name = "hackmd_delete_folder",
+        description = "Delete a folder. A non-empty folder is unchanged unless the same request supplies confirm: true.",
+        annotations(
+            title = "Delete HackMD Folder",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn delete_folder(
+        &self,
+        Parameters(input): Parameters<DeleteFolderInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::folders::delete_folder(&self.client, input).await {
+            Ok(output) => {
+                let summary = if output.deleted {
+                    format!("Deleted HackMD folder {}", output.folder_id)
+                } else {
+                    format!(
+                        "Folder {} has {} child folder(s); confirm deletion",
+                        output.folder_id, output.child_count
+                    )
+                };
+                tool_result::success(
+                    summary,
+                    serde_json::to_value(output).expect("folder-delete output should serialize"),
+                )
+            }
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        name = "hackmd_set_folder_order",
+        description = "Set the direct-child order for one parent while preserving every unrelated entry in HackMD's whole folder-order map. Omit parent_folder_id for root.",
+        annotations(
+            title = "Set HackMD Folder Order",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn set_folder_order(
+        &self,
+        Parameters(input): Parameters<SetFolderOrderInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::folders::set_folder_order(&self.client, input).await {
+            Ok(output) => tool_result::success(
+                format!("Set HackMD folder order for {}", output.parent),
+                serde_json::to_value(output).expect("folder-order output should serialize"),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
 }
 
 fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
@@ -306,7 +464,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 9] = [
+    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 15] = [
         ("hackmd_get_me", true, false, true),
         ("hackmd_list_teams", true, false, true),
         ("hackmd_list_notes", true, false, true),
@@ -316,6 +474,12 @@ mod tests {
         ("hackmd_delete_note", false, true, true),
         ("hackmd_edit_note", false, false, false),
         ("hackmd_get_history", true, false, true),
+        ("hackmd_list_folders", true, false, true),
+        ("hackmd_get_folder", true, false, true),
+        ("hackmd_create_folder", false, false, false),
+        ("hackmd_update_folder", false, false, true),
+        ("hackmd_delete_folder", false, true, true),
+        ("hackmd_set_folder_order", false, false, true),
     ];
 
     async fn protocol_client(
@@ -372,7 +536,7 @@ mod tests {
     fn tools_have_generated_schemas_and_exact_annotations() {
         let tools = HackmdServer::tool_router().list_all();
 
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 15);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = tools
                 .iter()
@@ -597,7 +761,7 @@ mod tests {
             .list_tools(None)
             .await
             .expect("tools/list should succeed");
-        assert_eq!(listed.tools.len(), 9);
+        assert_eq!(listed.tools.len(), 15);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = listed
                 .tools

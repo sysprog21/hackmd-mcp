@@ -190,23 +190,6 @@ test (see P3) for each and record the answer here.
   pagination as note lists. Mark restore non-destructive/idempotent; keep delete
   destructive. Describe delete according to whichever behavior the live test in
   "Contradictions" confirms. Mock both routes and their empty/accepted responses.
-- [ ] Add folder tools: `hackmd_list_folders`, `hackmd_get_folder`,
-  `hackmd_create_folder`, `hackmd_update_folder`, `hackmd_delete_folder`, and
-  `hackmd_set_folder_order`, all workspace-aware. Folder create/update carry
-  `name`, `description`, `icon`, `color`, and `parent_folder_id`.
-- [ ] Omit `parentFolderId` when creating a root folder; do not send `null`,
-  which POST rejects. On folder update, `null` is the correct way to clear
-  `parentFolderId`, `description`, `icon`, and `color`, so the update input
-  needs a tri-state (absent, null, value) rather than `Option<String>`. Confirm
-  a requested team path exists before creating content or folders in it.
-- [ ] Before moving a folder, reject self/descendant moves by walking the
-  folder parent chain. Before deleting a non-empty folder, return its child
-  count without changing state; delete only when the same request supplies
-  `confirm: true`.
-- [ ] Implement `hackmd_set_folder_order` as GET `folder-order`, replace only
-  the requested parent entry (`root` for top level), PUT the whole map back.
-  The endpoint replaces the entire map, so preserving every unrelated key is a
-  correctness requirement, not a nicety.
 - [ ] Treat HackMD folder operations as asynchronous where applicable: after a
   note move or other `202` PATCH, read back to verify.
 - [ ] Create a note in a folder as POST followed by PATCH and read-back. Keep

@@ -150,6 +150,8 @@ pub(crate) enum PayloadError {
     EmptyPatch,
     #[error("writePermission cannot be more permissive than readPermission")]
     WriteMorePermissiveThanRead,
+    #[error("folder PATCH body must contain at least one explicitly supplied field")]
+    EmptyFolderPatch,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -222,6 +224,67 @@ pub(crate) struct FolderPathResponse {
     pub(crate) name: String,
     pub(crate) parent_id: Option<String>,
     pub(crate) icon: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FolderResponse {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+    pub(crate) icon: Option<String>,
+    pub(crate) color: Option<String>,
+    pub(crate) parent_folder_id: Option<String>,
+    pub(crate) created_at: Option<Value>,
+    pub(crate) updated_at: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreateFolderRequest {
+    pub(crate) name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) icon: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_folder_id: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateFolderRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(clippy::option_option, reason = "outer None omits; inner None clears")]
+    pub(crate) description: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(clippy::option_option, reason = "outer None omits; inner None clears")]
+    pub(crate) icon: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(clippy::option_option, reason = "outer None omits; inner None clears")]
+    pub(crate) color: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[allow(clippy::option_option, reason = "outer None omits; inner None clears")]
+    pub(crate) parent_folder_id: Option<Option<String>>,
+}
+
+impl UpdateFolderRequest {
+    pub(crate) fn validate(&self) -> Result<(), PayloadError> {
+        if self.name.is_none()
+            && self.description.is_none()
+            && self.icon.is_none()
+            && self.color.is_none()
+            && self.parent_folder_id.is_none()
+        {
+            Err(PayloadError::EmptyFolderPatch)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
