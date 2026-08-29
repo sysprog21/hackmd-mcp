@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod dto;
 mod models;
+mod note_ref;
 mod server;
 mod state;
 mod tool_result;

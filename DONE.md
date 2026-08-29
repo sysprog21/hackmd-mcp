@@ -74,3 +74,10 @@
   (`GET /teams`) discovery tools. Return each team's `path`, because it is the
   required `workspace.team_path` for all team routes, and keep `/me`'s
   `userPath` for note-reference resolution.
+- [x] Define `note_ref: String` for note tools. Accept an internal API ID or a
+  HackMD URL. Parse a bare `hackmd.io/<id>` URL directly. For `hackmd.io/@X/slug`,
+  resolve `@X` against the caller's own `userPath` first and only then against
+  the team list, matching `shortId` or `permalink`; cache the resulting internal
+  ID for the call. Direct internal IDs never list notes. Provide a separate
+  `title` search only where requested and accept exactly one exact match;
+  otherwise return a disambiguation result.

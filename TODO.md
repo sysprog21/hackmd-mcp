@@ -182,13 +182,6 @@ test (see P3) for each and record the answer here.
 
 ## P1 — essential RMCP tools
 
-- [ ] Define `note_ref: String` for note tools. Accept an internal API ID or a
-  HackMD URL. Parse a bare `hackmd.io/<id>` URL directly. For `hackmd.io/@X/slug`,
-  resolve `@X` against the caller's own `userPath` first and only then against
-  the team list, matching `shortId` or `permalink`; cache the resulting internal
-  ID for the call. Direct internal IDs never list notes. Provide a separate
-  `title` search only where requested and accept exactly one exact match;
-  otherwise return a disambiguation result.
 - [ ] Add `hackmd_list_notes` with `workspace`, `limit` (default 20, max 100),
   `offset`, optional case-insensitive metadata `query` over title, description,
   tags, id, and shortId, tag-all filtering, and deterministic `sort` (default

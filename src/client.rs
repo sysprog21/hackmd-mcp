@@ -6,7 +6,8 @@ use url::Url;
 
 use crate::{
     config::Config,
-    dto::{ProfileResponse, TeamResponse},
+    dto::{NoteResponse, ProfileResponse, TeamResponse},
+    models::Workspace,
     state::StateStore,
 };
 
@@ -51,6 +52,24 @@ impl HackmdClient {
     pub(crate) async fn list_teams(&self) -> Result<Vec<TeamResponse>, HackmdError> {
         let path = self.url_for_segments(&["teams"])?.path().to_owned();
         self.request_json(Method::GET, &["teams"], None)
+            .await?
+            .ok_or_else(|| HackmdError::EmptyResponse {
+                method: "GET".to_owned(),
+                path,
+            })
+    }
+
+    #[allow(dead_code, reason = "used by note resolution and list-note tool tasks")]
+    pub(crate) async fn list_notes(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Vec<NoteResponse>, HackmdError> {
+        let segments: Vec<&str> = match workspace {
+            Workspace::Personal => vec!["notes"],
+            Workspace::Team { team_path } => vec!["teams", team_path, "notes"],
+        };
+        let path = self.url_for_segments(&segments)?.path().to_owned();
+        self.request_json(Method::GET, &segments, None)
             .await?
             .ok_or_else(|| HackmdError::EmptyResponse {
                 method: "GET".to_owned(),
