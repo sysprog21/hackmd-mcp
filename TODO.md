@@ -182,13 +182,6 @@ test (see P3) for each and record the answer here.
 
 ## P1 — essential RMCP tools
 
-- [ ] Add `hackmd_list_notes` with `workspace`, `limit` (default 20, max 100),
-  `offset`, optional case-insensitive metadata `query` over title, description,
-  tags, id, and shortId, tag-all filtering, and deterministic `sort` (default
-  `lastChangedAt` descending). The API list is unpaged, so fetch once,
-  filter/sort locally, then slice. Return `total`, `count`, `offset`,
-  `has_more`, `next_offset`, and a slim note summary. Do not offer folder
-  filtering here: list responses carry no `folderPaths`.
 - [ ] Add `hackmd_get_note` with full content and normalized metadata. Include
   `patch_path` exactly `notes/{id}.md` for personal notes or
   `teams/{team_path}/notes/{id}.md` for team notes, unencoded, for safe content

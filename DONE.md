@@ -81,3 +81,10 @@
   ID for the call. Direct internal IDs never list notes. Provide a separate
   `title` search only where requested and accept exactly one exact match;
   otherwise return a disambiguation result.
+- [x] Add `hackmd_list_notes` with `workspace`, `limit` (default 20, max 100),
+  `offset`, optional case-insensitive metadata `query` over title, description,
+  tags, id, and shortId, tag-all filtering, and deterministic `sort` (default
+  `lastChangedAt` descending). The API list is unpaged, so fetch once,
+  filter/sort locally, then slice. Return `total`, `count`, `offset`,
+  `has_more`, `next_offset`, and a slim note summary. Do not offer folder
+  filtering here: list responses carry no `folderPaths`.

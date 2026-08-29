@@ -7,6 +7,7 @@ use serde::Deserialize;
 use crate::client::HackmdClient;
 use crate::config::Config;
 use crate::dto::{ProfileResponse, TeamResponse};
+use crate::list_notes::ListNotesInput;
 use crate::tool_result;
 
 /// MCP server whose handlers share one configured `HackMD` client.
@@ -78,6 +79,33 @@ impl HackmdServer {
             Err(error) => error.into(),
         }
     }
+
+    #[tool(
+        name = "hackmd_list_notes",
+        description = "List personal or team HackMD notes with local metadata filtering, deterministic sorting, and pagination. This does not search note content.",
+        annotations(
+            title = "List HackMD Notes",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn list_notes(
+        &self,
+        Parameters(input): Parameters<ListNotesInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::list_notes::list_notes(&self.client, input).await {
+            Ok(output) => tool_result::success(
+                format!(
+                    "Found {} matching HackMD note(s); returned {}",
+                    output.total, output.count
+                ),
+                serde_json::to_value(output).expect("list-notes output should serialize"),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
 }
 
 fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
@@ -120,21 +148,41 @@ mod tests {
     }
 
     #[test]
-    fn discovery_tools_have_generated_closed_empty_schemas_and_annotations() {
+    fn read_tools_have_generated_schemas_and_annotations() {
         let tools = HackmdServer::tool_router().list_all();
 
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].name, "hackmd_get_me");
-        assert_eq!(tools[1].name, "hackmd_list_teams");
-        for tool in tools {
-            assert_eq!(tool.input_schema["type"], "object");
-            assert_eq!(tool.input_schema["additionalProperties"], false);
-            let annotations = tool.annotations.expect("annotations should be generated");
+        assert_eq!(tools.len(), 3);
+        for tool in &tools {
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .expect("annotations should be generated");
             assert_eq!(annotations.read_only_hint, Some(true));
             assert_eq!(annotations.destructive_hint, Some(false));
             assert_eq!(annotations.idempotent_hint, Some(true));
             assert_eq!(annotations.open_world_hint, Some(true));
         }
+        for name in ["hackmd_get_me", "hackmd_list_teams"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("discovery tool should exist");
+            assert_eq!(tool.input_schema["type"], "object");
+            assert_eq!(tool.input_schema["additionalProperties"], false);
+        }
+
+        let list = tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_list_notes")
+            .expect("list-notes tool should exist");
+        let properties = &list.input_schema["properties"];
+        assert_eq!(list.input_schema["additionalProperties"], false);
+        assert_eq!(properties["limit"]["default"], 20);
+        assert_eq!(properties["limit"]["minimum"], 1);
+        assert_eq!(properties["limit"]["maximum"], 100);
+        assert_eq!(properties["offset"]["default"], 0);
+        assert_eq!(properties["sort"]["default"], "last_changed_desc");
+        assert!(properties.get("folder_id").is_none());
     }
 
     #[tokio::test]
