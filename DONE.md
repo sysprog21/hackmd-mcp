@@ -15,3 +15,7 @@
   `tracing-subscriber`, and `tempfile` (tests/atomic writes). Add `clap` only
   with the later `--help`/`--version` task. Keep modules private behind a small
   `lib.rs` test surface.
+- [x] Define `HackmdServer { client: Arc<HackmdClient> }` and implement its
+  tool router with RMCP `#[tool_router(server_handler)]`, `#[tool]`, typed
+  `Parameters<T>`, and `Deserialize + JsonSchema` input structs. Field docs
+  must carry parameter descriptions because RMCP derives schemas from fields.

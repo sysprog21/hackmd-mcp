@@ -180,10 +180,6 @@ test (see P3) for each and record the answer here.
 
 ## P0 — RMCP 3.x foundation
 
-- [ ] Define `HackmdServer { client: Arc<HackmdClient> }` and implement its
-  tool router with RMCP `#[tool_router(server_handler)]`, `#[tool]`, typed
-  `Parameters<T>`, and `Deserialize + JsonSchema` input structs. Field docs
-  must carry parameter descriptions because RMCP derives schemas from fields.
 - [ ] Model `workspace` as an internally tagged enum
   (`{"kind":"personal"}` / `{"kind":"team","team_path":"x"}`) defaulting to
   personal, as the Rust proxy does. It keeps one tool family for both

@@ -1,5 +1,8 @@
 //! A local-first MCP server for the `HackMD` API.
 
+mod client;
+mod server;
+
 /// The package version exposed by the server binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
