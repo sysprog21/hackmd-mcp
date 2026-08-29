@@ -1,7 +1,8 @@
 use reqwest::{Method, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::{
     path::Path,
     time::{Duration, SystemTime},
@@ -86,11 +87,8 @@ impl HackmdClient {
     }
 
     pub(crate) async fn restore_note(&self, note_id: &str) -> Result<Option<Value>, HackmdError> {
-        let restored = self
-            .request_json_idempotent(Method::PUT, &["trash", note_id, "restore"], None::<&Value>)
-            .await;
-        self.notes.invalidate();
-        restored
+        self.request_json_idempotent(Method::PUT, &["trash", note_id, "restore"], NO_BODY)
+            .await
     }
 
     /// Lists a workspace's notes, from cache when one is still fresh.
@@ -102,13 +100,14 @@ impl HackmdClient {
     pub(crate) async fn list_notes(
         &self,
         workspace: &Workspace,
-    ) -> Result<Vec<NoteResponse>, HackmdError> {
+    ) -> Result<Arc<[NoteResponse]>, HackmdError> {
         if let Some(cached) = self.notes.get(workspace) {
             return Ok(cached);
         }
-        let notes: Vec<NoteResponse> = self
-            .get_required(&workspace_route(workspace, &["notes"]))
-            .await?;
+        let notes: Arc<[NoteResponse]> = self
+            .get_required::<Vec<NoteResponse>>(&workspace_route(workspace, &["notes"]))
+            .await?
+            .into();
         self.notes.store(workspace, &notes);
         Ok(notes)
     }
@@ -128,11 +127,8 @@ impl HackmdClient {
         payload: &CreateNoteRequest,
     ) -> Result<NoteResponse, HackmdError> {
         let segments = workspace_route(workspace, &["notes"]);
-        let created = self
-            .request_required(Method::POST, &segments, Some(payload))
-            .await;
-        self.notes.invalidate();
-        created
+        self.request_required(Method::POST, &segments, Some(payload))
+            .await
     }
 
     pub(crate) async fn update_note(
@@ -142,11 +138,8 @@ impl HackmdClient {
         payload: &UpdateNoteRequest,
     ) -> Result<Option<NoteResponse>, HackmdError> {
         let segments = workspace_route(workspace, &["notes", note_id]);
-        let updated = self
-            .request_json_idempotent(Method::PATCH, &segments, Some(payload))
-            .await;
-        self.notes.invalidate();
-        updated
+        self.request_json_idempotent(Method::PATCH, &segments, Some(payload))
+            .await
     }
 
     pub(crate) async fn delete_note(
@@ -155,11 +148,7 @@ impl HackmdClient {
         note_id: &str,
     ) -> Result<Option<Value>, HackmdError> {
         let segments = workspace_route(workspace, &["notes", note_id]);
-        let deleted = self
-            .request_json(Method::DELETE, &segments, None::<&Value>)
-            .await;
-        self.notes.invalidate();
-        deleted
+        self.request_json(Method::DELETE, &segments, NO_BODY).await
     }
 
     pub(crate) async fn list_folders(
@@ -206,8 +195,7 @@ impl HackmdClient {
         folder_id: &str,
     ) -> Result<Option<Value>, HackmdError> {
         let segments = workspace_route(workspace, &["folders", folder_id]);
-        self.request_json(Method::DELETE, &segments, None::<&Value>)
-            .await
+        self.request_json(Method::DELETE, &segments, NO_BODY).await
     }
 
     pub(crate) async fn get_folder_order(
@@ -283,8 +271,7 @@ impl HackmdClient {
 
     /// Issues a GET whose response body is mandatory.
     async fn get_required<T: DeserializeOwned>(&self, segments: &[&str]) -> Result<T, HackmdError> {
-        self.request_required(Method::GET, segments, None::<&Value>)
-            .await
+        self.request_required(Method::GET, segments, NO_BODY).await
     }
 
     /// Issues a request that must answer with a JSON body, turning `HackMD`'s
@@ -333,6 +320,19 @@ impl HackmdClient {
             .await
     }
 
+    /// Drops every cached note list once a request that is not a read has been
+    /// issued. Called before the request as well as after it: a write that
+    /// fails with a timeout may still have landed on `HackMD`, and the error
+    /// paths return without reaching the second call. The second call covers
+    /// the opposite order, where a concurrent list refilled the cache while the
+    /// write was in flight. Both live here rather than at each write site,
+    /// where the next endpoint added would be free to forget.
+    fn invalidate_list_cache_on_write(&self, method: &Method) {
+        if method != Method::GET {
+            self.notes.invalidate();
+        }
+    }
+
     async fn request_json_with_retry<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -352,14 +352,25 @@ impl HackmdClient {
             })?;
         let retry = self.config.retry();
         let mut retries = 0_u8;
+
+        // Encoded once, not once per attempt: a retried PATCH carries the whole
+        // note body, and re-encoding it costs more than copying the bytes.
+        let body = body
+            .map(|body| serde_json::to_vec(body))
+            .transpose()
+            .map_err(|_| HackmdError::InvalidPayload)?;
+
+        self.invalidate_list_cache_on_write(&method);
         tracing::debug!(method = %method_text, path = %path, "HackMD request started");
         let (status, bytes, rate_limit) = loop {
             let mut request = self
                 .http
                 .request(method.clone(), url.clone())
                 .bearer_auth(token);
-            if let Some(body) = body {
-                request = request.json(body);
+            if let Some(body) = body.as_ref() {
+                request = request
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body.clone());
             }
             let response = match request.send().await {
                 Ok(response) => response,
@@ -410,6 +421,8 @@ impl HackmdClient {
             retries,
             "HackMD request completed"
         );
+
+        self.invalidate_list_cache_on_write(&method);
 
         if !status.is_success() {
             return Err(map_status_error(
@@ -496,6 +509,13 @@ async fn sleep_before_retry(
     tokio::time::sleep(delay).await;
 }
 
+/// Names the absent body at the many call sites that have none: `None` alone
+/// cannot infer the payload type once the parameter is generic.
+const NO_BODY: Option<&Value> = None;
+
+/// One workspace's list, and when it was fetched.
+type CachedNotes = (tokio::time::Instant, Arc<[NoteResponse]>);
+
 /// A short-lived copy of a workspace's note list.
 ///
 /// `HackMD` has no note-list pagination and no conditional GET, so listing is
@@ -505,52 +525,49 @@ async fn sleep_before_retry(
 #[derive(Debug)]
 struct NotesCache {
     ttl: Duration,
-    entries: std::sync::Mutex<BTreeMap<String, (tokio::time::Instant, Vec<NoteResponse>)>>,
+    entries: std::sync::Mutex<HashMap<Workspace, CachedNotes>>,
 }
 
 impl NotesCache {
     fn new(ttl: Duration) -> Self {
         Self {
             ttl,
-            entries: std::sync::Mutex::new(BTreeMap::new()),
+            entries: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    fn get(&self, workspace: &Workspace) -> Option<Vec<NoteResponse>> {
-        if self.ttl.is_zero() {
-            return None;
+    fn get(&self, workspace: &Workspace) -> Option<Arc<[NoteResponse]>> {
+        let mut entries = self.entries.lock().ok()?;
+        let (stored, notes) = entries.get(workspace)?;
+        if stored.elapsed() < self.ttl {
+            return Some(Arc::clone(notes));
         }
-        let entries = self.entries.lock().ok()?;
-        let (stored, notes) = entries.get(&cache_key(workspace))?;
-        (stored.elapsed() < self.ttl).then(|| notes.clone())
+
+        // Drop it here rather than waiting for the next write: an expired list
+        // for a workspace nobody touches again would sit in memory forever.
+        entries.remove(workspace);
+        None
     }
 
-    fn store(&self, workspace: &Workspace, notes: &[NoteResponse]) {
+    fn store(&self, workspace: &Workspace, notes: &Arc<[NoteResponse]>) {
         if self.ttl.is_zero() {
             return;
         }
         if let Ok(mut entries) = self.entries.lock() {
             entries.insert(
-                cache_key(workspace),
-                (tokio::time::Instant::now(), notes.to_vec()),
+                workspace.clone(),
+                (tokio::time::Instant::now(), Arc::clone(notes)),
             );
         }
     }
 
-    /// Called after any note write. Clearing every workspace rather than one is
+    /// Called after any write. Clearing every workspace rather than one is
     /// deliberate: a note can move between workspaces, and the map holds at
     /// most a handful of entries.
     fn invalidate(&self) {
         if let Ok(mut entries) = self.entries.lock() {
             entries.clear();
         }
-    }
-}
-
-fn cache_key(workspace: &Workspace) -> String {
-    match workspace {
-        Workspace::Personal => "personal".to_owned(),
-        Workspace::Team { team_path } => format!("team:{team_path}"),
     }
 }
 
@@ -739,6 +756,8 @@ pub(crate) enum HackmdError {
     MissingToken { method: String, path: String },
     #[error("failed to build the HackMD HTTP client")]
     ClientBuild,
+    #[error("failed to serialize a validated HackMD request payload")]
+    InvalidPayload,
     #[error("configured HACKMD_API_URL cannot be used as an API base URL")]
     InvalidBaseUrl,
     #[error("HackMD API path segments such as note IDs and team paths must not be empty")]
@@ -805,10 +824,12 @@ impl From<HackmdError> for rmcp::model::CallToolResult {
 mod tests {
     use std::{net::TcpListener, time::Duration};
 
+    const NOTES: &str = r#"[{"id":"note-id","title":"Note"}]"#;
+
     use reqwest::Method;
     use serde_json::{Value, json};
 
-    use super::{HackmdClient, HackmdError, retry_after};
+    use super::{HackmdClient, HackmdError, NO_BODY, retry_after};
     use crate::config::Config;
 
     #[test]
@@ -834,13 +855,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_fresh_note_list_is_reused_until_a_write_invalidates_it() {
-        const NOTES: &str = r#"[{"id":"note-id","title":"Note"}]"#;
-
         // Two list responses for three list calls: the second call is served
         // from cache, and only the write in between forces another fetch.
         let server = SequenceServer::spawn([(200, NOTES), (202, ""), (200, NOTES)]);
-        let client = HackmdClient::new(Config::for_loopback_test_with_cache(&server.api_url))
-            .expect("cache-enabled client should build");
+        let client = server.client_with_cache();
 
         let first = client
             .list_notes(&Workspace::Personal)
@@ -876,11 +894,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_write_that_fails_still_drops_the_cached_list() {
+        // HackMD applies writes asynchronously, so a PATCH that answers with an
+        // error may still have landed. The cache has to go either way.
+        let server =
+            SequenceServer::spawn([(200, NOTES), (400, r#"{"error":"nope"}"#), (200, NOTES)]);
+        let client = server.client_with_cache();
+
+        client
+            .list_notes(&Workspace::Personal)
+            .await
+            .expect("first list should fetch");
+        client
+            .update_note(
+                &Workspace::Personal,
+                "note-id",
+                &UpdateNoteRequest {
+                    title: Some("Renamed".to_owned()),
+                    ..UpdateNoteRequest::default()
+                },
+            )
+            .await
+            .expect_err("the fixture rejects this write");
+        client
+            .list_notes(&Workspace::Personal)
+            .await
+            .expect("list after a failed write should fetch again");
+
+        assert_eq!(server.finish().len(), 3);
+    }
+
+    #[tokio::test]
     async fn team_and_personal_lists_do_not_share_a_cache_entry() {
-        const NOTES: &str = r#"[{"id":"note-id","title":"Note"}]"#;
         let server = SequenceServer::spawn([(200, NOTES), (200, NOTES)]);
-        let client = HackmdClient::new(Config::for_loopback_test_with_cache(&server.api_url))
-            .expect("cache-enabled client should build");
+        let client = server.client_with_cache();
 
         client
             .list_notes(&Workspace::Personal)
@@ -909,7 +956,7 @@ mod tests {
             .request_json::<Value>(
                 Method::GET,
                 &["teams", "team/path", "notes", "note ?#"],
-                None::<&Value>,
+                NO_BODY,
             )
             .await
             .expect("fixture request should succeed")
@@ -966,7 +1013,7 @@ mod tests {
             let server = SequenceServer::spawn([(status, "")]);
             let client = server.client_without_retry(FIXTURE_TOKEN);
             let response = client
-                .request_json::<Value>(Method::PATCH, &["notes", "id"], None::<&Value>)
+                .request_json::<Value>(Method::PATCH, &["notes", "id"], NO_BODY)
                 .await
                 .expect("empty success should be accepted");
             assert_eq!(response, None);
@@ -1047,7 +1094,7 @@ mod tests {
             let server = SequenceServer::spawn([(status, r#"{"error":"fixture"}"#)]);
             let client = server.client_without_retry(FIXTURE_TOKEN);
             let error = client
-                .request_json::<Value>(Method::GET, &["notes", "id"], None::<&Value>)
+                .request_json::<Value>(Method::GET, &["notes", "id"], NO_BODY)
                 .await
                 .expect_err("failure status should map to an error");
             let message = error.to_string();
@@ -1076,7 +1123,7 @@ mod tests {
         .expect("fixture client should build");
 
         let message = client
-            .request_json::<Value>(Method::GET, &["notes"], None::<&Value>)
+            .request_json::<Value>(Method::GET, &["notes"], NO_BODY)
             .await
             .expect_err("429 should map to rate-limit detail")
             .to_string();
@@ -1093,7 +1140,7 @@ mod tests {
         let client = server.client_without_retry(TOKEN);
 
         let message = client
-            .request_json::<Value>(Method::GET, &["notes"], None::<&Value>)
+            .request_json::<Value>(Method::GET, &["notes"], NO_BODY)
             .await
             .expect_err("503 should retain safe error detail")
             .to_string();
@@ -1110,7 +1157,7 @@ mod tests {
         let client = server.client_with_token(TOKEN);
 
         let message = client
-            .request_json::<Value>(Method::GET, &["notes"], None::<&Value>)
+            .request_json::<Value>(Method::GET, &["notes"], NO_BODY)
             .await
             .expect_err("400 should map to a generic API error")
             .to_string();
@@ -1127,7 +1174,7 @@ mod tests {
         let client = server.client();
 
         let message = client
-            .request_json::<Value>(Method::GET, &["me"], None::<&Value>)
+            .request_json::<Value>(Method::GET, &["me"], NO_BODY)
             .await
             .expect_err("invalid JSON should fail")
             .to_string();
@@ -1153,7 +1200,7 @@ mod tests {
         .expect("network fixture client should build");
         assert!(matches!(
             network_client
-                .request_json::<Value>(Method::GET, &["me"], None::<&Value>)
+                .request_json::<Value>(Method::GET, &["me"], NO_BODY)
                 .await,
             Err(HackmdError::Network { .. })
         ));
@@ -1169,7 +1216,7 @@ mod tests {
             HackmdClient::new(timeout_config).expect("timeout fixture client should build");
         assert!(matches!(
             timeout_client
-                .request_json::<Value>(Method::GET, &["me"], None::<&Value>)
+                .request_json::<Value>(Method::GET, &["me"], NO_BODY)
                 .await,
             Err(HackmdError::Timeout { .. })
         ));
@@ -1181,7 +1228,7 @@ mod tests {
         let client = HackmdClient::new(Config::for_tests()).expect("test client should build");
         assert!(matches!(
             client
-                .request_json::<Value>(Method::GET, &["me"], None::<&Value>)
+                .request_json::<Value>(Method::GET, &["me"], NO_BODY)
                 .await,
             Err(HackmdError::MissingToken { .. })
         ));
@@ -1192,7 +1239,7 @@ mod tests {
         let client = HackmdClient::new(Config::for_tests()).expect("test client should build");
         assert!(matches!(
             client
-                .request_json::<Value>(Method::GET, &["notes", "  "], None::<&Value>)
+                .request_json::<Value>(Method::GET, &["notes", "  "], NO_BODY)
                 .await,
             Err(HackmdError::EmptyPathSegment)
         ));
@@ -1253,7 +1300,7 @@ mod tests {
         ))
         .expect("retry client should build");
         let response = get_client
-            .request_json::<Value>(Method::GET, &["retry"], None::<&Value>)
+            .request_json::<Value>(Method::GET, &["retry"], NO_BODY)
             .await
             .expect("GET should recover")
             .expect("GET should return JSON");

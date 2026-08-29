@@ -52,7 +52,11 @@ pub(crate) async fn save_remote_snapshot(
     }
     files.allow(&input.local_path)?;
     let tracked = files.state().load_for_local_path(&input.local_path)?;
+
+    // The write target is derived from the tracked state, not from the checked
+    // input, so it goes through the same policy before anything is created.
     let snapshot_path = tracked.state.local_path.with_extension("remote.md");
+    files.allow(&snapshot_path)?;
     if snapshot_path.exists() && !input.overwrite_snapshot {
         return Err(SaveRemoteSnapshotError::SnapshotExists);
     }
@@ -87,12 +91,7 @@ mod tests {
             (200, r#"{"id":"id","title":"Note","content":"remote two"}"#),
         ]);
         let client = fixture.client();
-        let files = crate::fixture::SequenceServer::tracked_files(
-            directory.path(),
-            "id",
-            &local_path,
-            "baseline",
-        );
+        let files = crate::fixture::tracked_files(directory.path(), "id", &local_path, "baseline");
 
         let output = save_remote_snapshot(
             &client,

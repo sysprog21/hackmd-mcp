@@ -112,16 +112,8 @@ mod tests {
     #[tokio::test]
     async fn a_write_that_never_becomes_visible_is_an_error() {
         const OLD: &str = r#"{"id":"note-id","title":"Title","content":"old"}"#;
-        // Fetch, PATCH, then every read-back the window has time for.
-        let fixture = SequenceServer::spawn([
-            (200, OLD),
-            (202, ""),
-            (200, OLD),
-            (200, OLD),
-            (200, OLD),
-            (200, OLD),
-            (200, OLD),
-        ]);
+        // Fetch, PATCH, then a read-back that keeps showing the old body.
+        let fixture = SequenceServer::spawn_repeating([(200, OLD), (202, ""), (200, OLD)]);
         let client = fixture.client();
         let input = EditNoteInput {
             workspace: Workspace::Personal,

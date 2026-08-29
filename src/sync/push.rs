@@ -109,6 +109,9 @@ pub(crate) async fn push_note(
     files: &LocalFiles,
     input: PushNoteInput,
 ) -> Result<Result<PushNoteOutput, NoteResolution>, PushNoteError> {
+    if !input.local_path.is_absolute() {
+        return Err(PushNoteError::RelativePath);
+    }
     files.allow(&input.local_path)?;
     let local = validate_and_read_local(&input)?;
     let tracked = files.state().load_for_local_path(&input.local_path)?;
@@ -135,9 +138,6 @@ pub(crate) async fn push_note(
 }
 
 fn validate_and_read_local(input: &PushNoteInput) -> Result<String, PushNoteError> {
-    if !input.local_path.is_absolute() {
-        return Err(PushNoteError::RelativePath);
-    }
     if matches!(input.strategy, PushStrategy::Overwrite) && !input.confirm {
         return Err(PushNoteError::OverwriteConfirmationRequired);
     }
@@ -346,23 +346,15 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "local edit").expect("local fixture should write");
-        // Read, PATCH, then read-backs that keep showing the old body.
-        let fixture = crate::fixture::SequenceServer::spawn([
+        // Read, PATCH, then a read-back that keeps showing the old body.
+        let fixture = crate::fixture::SequenceServer::spawn_repeating([
             (200, BASELINE),
             (202, ""),
             (200, BASELINE),
-            (200, BASELINE),
-            (200, BASELINE),
-            (200, BASELINE),
-            (200, BASELINE),
         ]);
         let client = fixture.client();
-        let files = crate::fixture::SequenceServer::tracked_files(
-            directory.path(),
-            "note-id",
-            &local_path,
-            "baseline",
-        );
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
 
         assert!(matches!(
             push_note(
@@ -401,12 +393,8 @@ mod tests {
             ),
         ]);
         let client = fixture.client();
-        let files = crate::fixture::SequenceServer::tracked_files(
-            directory.path(),
-            "note-id",
-            &local_path,
-            "baseline",
-        );
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
         let output = push_note(
             &client,
             &files,
@@ -441,12 +429,8 @@ mod tests {
             r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
         )]);
         let client = fixture.client();
-        let files = crate::fixture::SequenceServer::tracked_files(
-            directory.path(),
-            "note-id",
-            &local_path,
-            "baseline",
-        );
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
         let output = push_note(
             &client,
             &files,
@@ -498,12 +482,8 @@ mod tests {
             r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
         )]);
         let client = fixture.client();
-        let files = crate::fixture::SequenceServer::tracked_files(
-            directory.path(),
-            "note-id",
-            &local_path,
-            "baseline",
-        );
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
         let output = push_note(
             &client,
             &files,
@@ -526,12 +506,8 @@ mod tests {
             r#"{"id":"note-id","title":"Note","content":"baseline"}"#,
         )]);
         let client = fixture.client();
-        let files = crate::fixture::SequenceServer::tracked_files(
-            directory.path(),
-            "note-id",
-            &local_path,
-            "baseline",
-        );
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
         let output = push_note(
             &client,
             &files,
@@ -551,7 +527,7 @@ mod tests {
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "local").expect("local fixture should write");
         let client = HackmdClient::new(Config::for_tests()).expect("client should build");
-        let files = crate::local::LocalFiles::new(directory.path().join("state"), None);
+        let files = crate::fixture::unconfined_files(directory.path().join("state"));
         assert!(matches!(
             push_note(
                 &client,
@@ -580,12 +556,8 @@ mod tests {
             ),
         ]);
         let client = fixture.client();
-        let files = crate::fixture::SequenceServer::tracked_files(
-            directory.path(),
-            "note-id",
-            &local_path,
-            "baseline",
-        );
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
         let output = push_note(
             &client,
             &files,

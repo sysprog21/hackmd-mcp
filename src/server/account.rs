@@ -1,8 +1,13 @@
 //! Account and workspace discovery tools.
 
-use rmcp::{handler::server::wrapper::Parameters, tool, tool_router};
+use rmcp::{handler::server::wrapper::Parameters, schemars, tool, tool_router};
+use serde::Deserialize;
 
-use super::{EmptyInput, HackmdServer, profile_result, teams_result};
+use super::HackmdServer;
+use crate::{
+    dto::{ProfileResponse, TeamResponse},
+    reply,
+};
 
 #[tool_router(router = account_router, vis = "pub(crate)")]
 impl HackmdServer {
@@ -48,3 +53,20 @@ impl HackmdServer {
         }
     }
 }
+
+pub(crate) fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
+    let summary = format!(
+        "Authenticated as {} (userPath: {})",
+        profile.name, profile.user_path
+    );
+    reply::success(summary, serde_json::json!({"profile": profile}))
+}
+
+pub(crate) fn teams_result(teams: &[TeamResponse]) -> rmcp::model::CallToolResult {
+    let summary = format!("Found {} HackMD team(s)", teams.len());
+    reply::success(summary, serde_json::json!({"teams": teams}))
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EmptyInput {}

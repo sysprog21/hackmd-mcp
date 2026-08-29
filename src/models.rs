@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 
 /// Selects the personal account or one team while preserving a single tool
 /// family for both route shapes.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq, Hash,
+)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Workspace {
     /// Operate on the authenticated user's personal workspace.

@@ -81,6 +81,9 @@ pub(crate) async fn pull_note(
     files: &LocalFiles,
     input: PullNoteInput,
 ) -> Result<Result<PullNoteOutput, NoteResolution>, PullNoteError> {
+    if !input.local_path.is_absolute() {
+        return Err(PullNoteError::RelativePath);
+    }
     files.allow(&input.local_path)?;
     let destination = validate_destination(&input)?;
     let allow_existing_destination = destination.exists() && input.overwrite_local;
@@ -131,9 +134,6 @@ fn validate_body_size(size_bytes: usize, confirmed: bool) -> Result<(), PullNote
 }
 
 fn validate_destination(input: &PullNoteInput) -> Result<PathBuf, PullNoteError> {
-    if !input.local_path.is_absolute() {
-        return Err(PullNoteError::RelativePath);
-    }
     if input.local_path.exists() {
         let metadata = fs::metadata(&input.local_path).map_err(PullNoteError::PathIo)?;
         if metadata.is_dir() {
@@ -247,7 +247,7 @@ mod tests {
             r##"{"id":"note/id","title":"Remote","content":"# Exact\n\nBody\n","lastChangedAt":123}"##,
         )]);
         let client = fixture.client();
-        let files = LocalFiles::new(state_dir.clone(), None);
+        let files = crate::fixture::unconfined_files(state_dir.clone());
         let output = pull_note(
             &client,
             &files,
@@ -315,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn path_guards_fail_before_network_or_filesystem_mutation() {
         let client = HackmdClient::new(Config::for_tests()).expect("client should build");
-        let files = LocalFiles::new(std::env::temp_dir().join("hackmd-mcp-test"), None);
+        let files = crate::fixture::scratch_files();
         let relative = serde_json::from_value(json!({
             "note_ref": "id",
             "local_path": "note.md"

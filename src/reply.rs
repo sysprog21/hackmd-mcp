@@ -7,6 +7,17 @@ pub(crate) fn success(summary: impl Into<String>, structured: Value) -> CallTool
     result
 }
 
+/// A successful reply whose structured half is the tool's own output type.
+pub(crate) fn structured<T: serde::Serialize>(
+    summary: impl Into<String>,
+    output: &T,
+) -> CallToolResult {
+    success(
+        summary,
+        serde_json::to_value(output).expect("tool output should serialize"),
+    )
+}
+
 /// The reply for a `note_ref` that named no note, or more than one. It is a
 /// successful result carrying candidates, not an error, so the caller can pick
 /// one and retry.

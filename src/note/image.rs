@@ -64,33 +64,27 @@ pub(crate) enum UploadNoteImageError {
     Api(#[from] HackmdError),
 }
 
-/// Reads the file's magic bytes.
+/// Checks the file's magic bytes.
 ///
 /// The tool hands a local file to a remote CDN that answers with a public link,
 /// so the file has to be what the caller says it is. Without this, one confused
 /// or coerced tool call publishes a private key as readily as a screenshot.
-fn is_image(path: &Path) -> Result<bool, UploadNoteImageError> {
-    let mut header = [0_u8; 12];
-    let mut file = File::open(path).map_err(|_| UploadNoteImageError::InvalidFile)?;
-    let read = read_header(&mut file, &mut header)?;
-    let header = &header[..read];
-    Ok(header.starts_with(b"\x89PNG\r\n\x1a\n")
+fn ensure_supported_image(path: &Path) -> Result<(), UploadNoteImageError> {
+    let mut header = Vec::with_capacity(12);
+    File::open(path)
+        .map_err(|_| UploadNoteImageError::InvalidFile)?
+        .take(12)
+        .read_to_end(&mut header)
+        .map_err(|_| UploadNoteImageError::InvalidFile)?;
+
+    let supported = header.starts_with(b"\x89PNG\r\n\x1a\n")
         || header.starts_with(b"\xff\xd8\xff")
         || header.starts_with(b"GIF87a")
         || header.starts_with(b"GIF89a")
-        || (header.len() == 12 && header.starts_with(b"RIFF") && &header[8..12] == b"WEBP"))
-}
-
-fn read_header(file: &mut File, header: &mut [u8]) -> Result<usize, UploadNoteImageError> {
-    let mut filled = 0;
-    while filled < header.len() {
-        match file.read(&mut header[filled..]) {
-            Ok(0) => break,
-            Ok(count) => filled += count,
-            Err(_) => return Err(UploadNoteImageError::InvalidFile),
-        }
-    }
-    Ok(filled)
+        || (header.len() == 12 && header.starts_with(b"RIFF") && &header[8..12] == b"WEBP");
+    supported
+        .then_some(())
+        .ok_or(UploadNoteImageError::UnsupportedFormat)
 }
 
 pub(crate) async fn upload_note_image(
@@ -114,9 +108,7 @@ pub(crate) async fn upload_note_image(
     if size_bytes > IMAGE_WARNING_BYTES && !input.confirm_large_file {
         return Err(UploadNoteImageError::ConfirmationRequired { size_bytes });
     }
-    if !is_image(&input.image_path)? {
-        return Err(UploadNoteImageError::UnsupportedFormat);
-    }
+    ensure_supported_image(&input.image_path)?;
     let resolution =
         crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
     let NoteResolution::Resolved { note } = resolution else {
@@ -146,7 +138,7 @@ mod tests {
 
     /// Local access with no configured root, matching the default deployment.
     fn files() -> crate::local::LocalFiles {
-        crate::local::LocalFiles::new(std::env::temp_dir().join("hackmd-mcp-test"), None)
+        crate::fixture::scratch_files()
     }
 
     /// A PNG signature followed by a marker the multipart assertions can find.

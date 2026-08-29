@@ -93,10 +93,10 @@ pub(crate) async fn list_notes(
 ) -> Result<ListNotesOutput, ListNotesError> {
     validate_limit(input.limit)?;
     let notes = client.list_notes(&input.workspace).await?;
-    Ok(filter_sort_page(notes, &input))
+    Ok(filter_sort_page(&notes, &input))
 }
 
-fn filter_sort_page(notes: Vec<NoteResponse>, input: &ListNotesInput) -> ListNotesOutput {
+fn filter_sort_page(notes: &[NoteResponse], input: &ListNotesInput) -> ListNotesOutput {
     let normalized_query = input
         .query
         .as_deref()
@@ -108,7 +108,7 @@ fn filter_sort_page(notes: Vec<NoteResponse>, input: &ListNotesInput) -> ListNot
         .map(|tag| normalize(tag))
         .collect::<Vec<_>>();
     let mut notes = notes
-        .into_iter()
+        .iter()
         .filter(|note| {
             normalized_query
                 .as_deref()
@@ -119,7 +119,7 @@ fn filter_sort_page(notes: Vec<NoteResponse>, input: &ListNotesInput) -> ListNot
                         .any(|candidate| normalize(candidate) == *required)
                 })
         })
-        .map(|note| note_summary(note, input.workspace.clone()))
+        .map(|note| note_summary(note.clone(), input.workspace.clone()))
         .collect::<Vec<_>>();
     notes.sort_by(|left, right| compare_notes(left, right, input.sort));
 
@@ -226,7 +226,7 @@ mod tests {
         input.query = Some("ROAD".to_owned());
         input.tags = vec!["RUST".to_owned(), "mcp".to_owned()];
         let output = filter_sort_page(
-            vec![
+            &[
                 note("a", "Roadmap", 2, &["rust", "MCP"]),
                 note("b", "Roadmap", 3, &["rust"]),
                 note("c", "Other", 4, &["rust", "mcp"]),
@@ -243,7 +243,7 @@ mod tests {
         input.limit = 2;
         input.offset = 1;
         let output = filter_sort_page(
-            vec![
+            &[
                 note("c", "C", 1, &[]),
                 note("b", "B", 3, &[]),
                 note("a", "A", 3, &[]),
@@ -270,7 +270,7 @@ mod tests {
     fn page_beyond_end_preserves_requested_offset() {
         let mut input = input();
         input.offset = 10;
-        let output = filter_sort_page(vec![note("a", "A", 1, &[])], &input);
+        let output = filter_sort_page(&[note("a", "A", 1, &[])], &input);
         assert_eq!(output.meta.offset, 10);
         assert_eq!(output.meta.count, 0);
         assert!(!output.meta.has_more);
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn slim_summary_omits_content_and_folder_paths() {
-        let output = filter_sort_page(vec![note("a", "A", 1, &[])], &input());
+        let output = filter_sort_page(&[note("a", "A", 1, &[])], &input());
         let value = serde_json::to_value(&output).expect("output should serialize");
         let summary = &value["notes"][0];
         assert!(summary.get("content").is_none());

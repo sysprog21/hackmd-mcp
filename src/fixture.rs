@@ -2,7 +2,7 @@ use std::{
     fmt::Write as _,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread::{self, JoinHandle},
     time::Duration,
@@ -52,12 +52,35 @@ impl SequenceServer {
         )
     }
 
+    /// Replays the sequence, then keeps answering with its last response.
+    ///
+    /// For tests about a condition that never becomes true, where pinning the
+    /// exact number of requests would pin `poll_readback`'s schedule instead of
+    /// the behavior under test. Such a fixture is never finished; it is dropped
+    /// with its thread still waiting.
+    pub(crate) fn spawn_repeating<const N: usize>(responses: [(u16, &str); N]) -> Self {
+        Self::spawn_with_mode(
+            responses.map(|(status, body)| (status, body.to_owned(), EMPTY_HEADERS)),
+            Duration::ZERO,
+            true,
+        )
+    }
+
     fn spawn_inner<const N: usize>(responses: [FixtureResponse; N], delay: Duration) -> Self {
+        Self::spawn_with_mode(responses, delay, false)
+    }
+
+    fn spawn_with_mode<const N: usize>(
+        responses: [FixtureResponse; N],
+        delay: Duration,
+        repeating: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("fixture should bind");
         let address = listener.local_addr().expect("fixture address should exist");
         let (sender, requests) = mpsc::channel();
         let thread = thread::spawn(move || {
             let mut captured = Vec::with_capacity(N);
+            let last = responses.last().cloned();
             for (status, body, headers) in responses {
                 let (mut stream, _) = listener.accept().expect("request should connect");
                 captured.push(read_request(&mut stream));
@@ -79,6 +102,20 @@ impl SequenceServer {
                     .expect("response should write");
             }
             sender.send(captured).expect("requests should send");
+
+            let Some((status, body, _)) = last.filter(|_| repeating) else {
+                return;
+            };
+            let response = format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            while let Ok((mut stream, _)) = listener.accept() {
+                read_request(&mut stream);
+                if stream.write_all(response.as_bytes()).is_err() {
+                    return;
+                }
+            }
         });
         Self {
             api_url: format!("http://{address}/v1"),
@@ -96,6 +133,12 @@ impl SequenceServer {
         .expect("fixture client should build")
     }
 
+    /// A client whose note-list cache is on, for tests about caching.
+    pub(crate) fn client_with_cache(&self) -> HackmdClient {
+        HackmdClient::new(Config::for_loopback_test_with_cache(&self.api_url))
+            .expect("cache-enabled client should build")
+    }
+
     /// A client that presents `token`, for tests that assert on the header or
     /// on redaction.
     pub(crate) fn client_with_token(&self, token: &str) -> HackmdClient {
@@ -108,32 +151,6 @@ impl SequenceServer {
     pub(crate) fn client_without_retry(&self, token: &str) -> HackmdClient {
         HackmdClient::new(Config::for_loopback_test_no_retry(&self.api_url, token))
             .expect("fixture client should build")
-    }
-
-    /// Local storage whose state directory already tracks `local_path` at
-    /// `baseline`, which is the starting point every sync tool test needs.
-    pub(crate) fn tracked_files(
-        state_root: &Path,
-        note_id: &str,
-        local_path: &Path,
-        baseline: &str,
-    ) -> LocalFiles {
-        let files = LocalFiles::new(state_root.join("state"), None);
-        files
-            .state()
-            .persist_from_sync(
-                &TrackedNoteState::capture(
-                    note_id.to_owned(),
-                    Workspace::Personal,
-                    local_path.to_path_buf(),
-                    baseline,
-                    Some(1),
-                )
-                .expect("fixture state should capture"),
-                baseline,
-            )
-            .expect("tracked state should persist");
-        files
     }
 
     /// The single request this fixture was expected to serve.
@@ -186,4 +203,41 @@ fn read_request(stream: &mut TcpStream) -> String {
             return String::from_utf8_lossy(&request).into_owned();
         }
     }
+}
+
+/// Local storage whose state directory already tracks `local_path` at
+/// `baseline`, which is the starting point every sync tool test needs.
+pub(crate) fn tracked_files(
+    state_root: &Path,
+    note_id: &str,
+    local_path: &Path,
+    baseline: &str,
+) -> LocalFiles {
+    let files = unconfined_files(state_root.join("state"));
+    files
+        .state()
+        .persist_from_sync(
+            &TrackedNoteState::capture(
+                note_id.to_owned(),
+                Workspace::Personal,
+                local_path.to_path_buf(),
+                baseline,
+                Some(1),
+            )
+            .expect("fixture state should capture"),
+            baseline,
+        )
+        .expect("tracked state should persist");
+    files
+}
+
+/// Local storage with no configured root, matching the default deployment.
+/// Tool tests exercise tools; the path policy has its own tests in `local`.
+pub(crate) fn unconfined_files(state_dir: PathBuf) -> LocalFiles {
+    LocalFiles::new(state_dir, None)
+}
+
+/// A state directory for a test that never inspects it.
+pub(crate) fn scratch_files() -> LocalFiles {
+    unconfined_files(std::env::temp_dir().join("hackmd-mcp-test"))
 }

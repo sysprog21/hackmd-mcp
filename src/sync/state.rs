@@ -66,7 +66,7 @@ pub(crate) fn timestamp_text(value: Option<i64>) -> String {
     value.map_or_else(String::new, |timestamp| timestamp.to_string())
 }
 
-/// The single hash format written to sidecars and reported by the sync tools.
+/// The sidecar filename stem for a note, and the body of its by-path pointer.
 fn state_key(workspace: &Workspace, internal_id: &str) -> String {
     match workspace {
         Workspace::Personal => format!("personal--{}", encode_component(internal_id)),
@@ -78,6 +78,7 @@ fn state_key(workspace: &Workspace, internal_id: &str) -> String {
     }
 }
 
+/// The single hash format written to sidecars and reported by the sync tools.
 pub(crate) fn body_hash(body: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
 }
@@ -143,22 +144,19 @@ impl StateStore {
         state: &TrackedNoteState,
         baseline_body: &str,
     ) -> Result<(), StateError> {
-        let paths = self.paths_for(&state.workspace, &state.internal_id);
-        let parent = paths.sidecar.parent().ok_or(StateError::InvalidStatePath)?;
-        create_private_dir_all(parent)?;
+        let key = state_key(&state.workspace, &state.internal_id);
+        let paths = self.paths_for_key(&key);
         write_private_atomic(&paths.baseline, baseline_body.as_bytes())?;
         let sidecar = serde_json::to_vec_pretty(state)?;
         write_private_atomic(&paths.sidecar, &sidecar)?;
 
-        // A hint, not a source of truth: the loader verifies whatever it finds
-        // and falls back to a scan, so a stale or missing pointer costs speed
-        // and never correctness.
-        let index = self.index_path(&state.local_file_identity.canonical_path);
-        let index_parent = index.parent().ok_or(StateError::InvalidStatePath)?;
-        create_private_dir_all(index_parent)?;
-        write_private_atomic(
-            &index,
-            state_key(&state.workspace, &state.internal_id).as_bytes(),
+        // A hint, not a source of truth: the loader verifies what it finds and
+        // falls back to a scan, so a stale or missing pointer costs speed and
+        // never correctness. That is also why it is written without the fsync
+        // the sidecar pair gets.
+        write_private_hint(
+            &self.index_path(&state.local_file_identity.canonical_path),
+            key.as_bytes(),
         )?;
         Ok(())
     }
@@ -183,9 +181,10 @@ impl StateStore {
 
     /// Finds the tracked note whose recorded file is `local_path`.
     ///
-    /// The lookup scans the sidecars and compares canonical paths rather than
-    /// deriving a filename from the path, so a note stays tracked when the
-    /// caller reaches it through a symlink or a differently spelled path.
+    /// The by-path pointer answers this in one read; failing that, the sidecars
+    /// are scanned and their canonical paths compared. Neither derives a
+    /// filename from the path, so a note stays tracked when the caller reaches
+    /// it through a symlink or a differently spelled path.
     pub(crate) fn load_for_local_path(
         &self,
         local_path: &Path,
@@ -299,6 +298,7 @@ fn encode_component(value: &str) -> String {
 
 fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<(), StateError> {
     let parent = path.parent().ok_or(StateError::InvalidStatePath)?;
+    create_private_dir_all(parent)?;
     let mut temporary = NamedTempFile::new_in(parent)?;
     set_private_permissions(temporary.as_file())?;
     temporary.write_all(contents)?;
@@ -306,6 +306,17 @@ fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<(), StateError> 
     temporary
         .persist(path)
         .map_err(|error| StateError::Io(error.error))?;
+    Ok(())
+}
+
+/// Writes a file the server can rebuild, so it skips the durability the sidecar
+/// pair needs: losing it after a crash costs one directory scan.
+fn write_private_hint(path: &Path, contents: &[u8]) -> Result<(), StateError> {
+    let parent = path.parent().ok_or(StateError::InvalidStatePath)?;
+    create_private_dir_all(parent)?;
+    let file = fs::File::create(path)?;
+    set_private_permissions(&file)?;
+    (&file).write_all(contents)?;
     Ok(())
 }
 

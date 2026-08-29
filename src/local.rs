@@ -81,17 +81,12 @@ impl LocalFiles {
 /// destination that has not been created yet is still judged by where it would
 /// land, symlinked ancestors included.
 fn resolve_existing_prefix(path: &Path) -> PathBuf {
-    let mut existing = path;
-    loop {
-        if let Ok(canonical) = std::fs::canonicalize(existing) {
-            let remainder = path.strip_prefix(existing).unwrap_or(Path::new(""));
-            return canonical.join(remainder);
-        }
-        match existing.parent() {
-            Some(parent) => existing = parent,
-            None => return path.to_path_buf(),
+    for ancestor in path.ancestors() {
+        if let Ok(canonical) = std::fs::canonicalize(ancestor) {
+            return canonical.join(path.strip_prefix(ancestor).unwrap_or(Path::new("")));
         }
     }
+    path.to_path_buf()
 }
 
 #[cfg(test)]

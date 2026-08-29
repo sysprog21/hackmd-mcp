@@ -357,15 +357,13 @@ mod tests {
     #[tokio::test]
     async fn unplaced_note_is_reported_not_failed() {
         const UNPLACED: &str = r#"{"id":"new-id","title":"New"}"#;
-        // Create, first read, PATCH, then every read the window has time for.
-        let server = SequenceServer::spawn([
+
+        // Create, first read, PATCH, then a read-back that never shows the
+        // folder however many times it is retried.
+        let server = SequenceServer::spawn_repeating([
             (201, UNPLACED),
             (200, UNPLACED),
             (202, ""),
-            (200, UNPLACED),
-            (200, UNPLACED),
-            (200, UNPLACED),
-            (200, UNPLACED),
             (200, UNPLACED),
         ]);
         let client = server.client();

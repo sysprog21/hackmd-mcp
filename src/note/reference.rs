@@ -78,7 +78,7 @@ pub(crate) async fn resolve_note_ref(
                 }
             };
             let notes = client.list_notes(&workspace).await?;
-            Ok(unique_matches(&workspace, &slug, notes, |note, query| {
+            Ok(unique_matches(&workspace, &slug, &notes, |note, query| {
                 note.short_id.as_deref() == Some(query) || note.permalink.as_deref() == Some(query)
             }))
         }
@@ -122,21 +122,21 @@ fn parse_note_ref(note_ref: &str) -> Result<ParsedNoteRef, NoteRefError> {
 fn unique_matches<F>(
     workspace: &Workspace,
     query: &str,
-    notes: Vec<NoteResponse>,
+    notes: &[NoteResponse],
     matches: F,
 ) -> NoteResolution
 where
     F: Fn(&NoteResponse, &str) -> bool,
 {
     let candidates = notes
-        .into_iter()
+        .iter()
         .filter(|note| matches(note, query))
         .map(|note| NoteCandidate {
             workspace: workspace.clone(),
-            note_id: note.id,
-            title: note.title,
-            short_id: note.short_id,
-            permalink: note.permalink,
+            note_id: note.id.clone(),
+            title: note.title.clone(),
+            short_id: note.short_id.clone(),
+            permalink: note.permalink.clone(),
         })
         .collect::<Vec<_>>();
     match candidates.as_slice() {
@@ -274,7 +274,7 @@ mod tests {
             note("one", "Same", Some("slug"), None),
             note("two", "Same", None, Some("slug")),
         ];
-        let by_slug = unique_matches(&Workspace::Personal, "slug", notes, |note, query| {
+        let by_slug = unique_matches(&Workspace::Personal, "slug", &notes, |note, query| {
             note.short_id.as_deref() == Some(query) || note.permalink.as_deref() == Some(query)
         });
         assert!(
@@ -284,7 +284,7 @@ mod tests {
         let by_title = unique_matches(
             &Workspace::Personal,
             "Unique",
-            vec![note("three", "Unique", None, None)],
+            &[note("three", "Unique", None, None)],
             |note, query| note.title == query,
         );
         assert!(matches!(by_title, NoteResolution::Resolved { note } if note.note_id == "three"));

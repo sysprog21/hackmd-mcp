@@ -29,10 +29,9 @@ impl HackmdServer {
         Parameters(input): Parameters<PullNoteInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::sync::pull::pull_note(&self.client, &self.files, input).await {
-            Ok(Ok(output)) => reply::success(
-                format!("Pulled HackMD note {}", output.note_id),
-                serde_json::to_value(output).expect("pull output should serialize"),
-            ),
+            Ok(Ok(output)) => {
+                reply::structured(format!("Pulled HackMD note {}", output.note_id), &output)
+            }
             Ok(Err(resolution)) => reply::unresolved(&resolution),
             Err(error) => reply::error(error.to_string()),
         }
@@ -54,10 +53,7 @@ impl HackmdServer {
         Parameters(input): Parameters<PushNoteInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::sync::push::push_note(&self.client, &self.files, input).await {
-            Ok(Ok(output)) => reply::success(
-                "Evaluated tracked HackMD note push",
-                serde_json::to_value(output).expect("push output should serialize"),
-            ),
+            Ok(Ok(output)) => reply::structured("Evaluated tracked HackMD note push", &output),
             Ok(Err(resolution)) => reply::unresolved(&resolution),
             Err(error) => reply::error(error.to_string()),
         }
@@ -79,10 +75,7 @@ impl HackmdServer {
         Parameters(input): Parameters<CheckNoteSyncInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::sync::check::check_note_sync(&self.client, &self.files, input).await {
-            Ok(output) => reply::success(
-                "Checked tracked HackMD note sync state",
-                serde_json::to_value(output).expect("sync-check output should serialize"),
-            ),
+            Ok(output) => reply::structured("Checked tracked HackMD note sync state", &output),
             Err(error) => reply::error(error.to_string()),
         }
     }
@@ -103,10 +96,7 @@ impl HackmdServer {
         Parameters(input): Parameters<SaveRemoteSnapshotInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::sync::snapshot::save_remote_snapshot(&self.client, &self.files, input).await {
-            Ok(output) => reply::success(
-                "Saved HackMD remote snapshot",
-                serde_json::to_value(output).expect("snapshot output should serialize"),
-            ),
+            Ok(output) => reply::structured("Saved HackMD remote snapshot", &output),
             Err(error) => reply::error(error.to_string()),
         }
     }

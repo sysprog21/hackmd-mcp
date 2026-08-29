@@ -122,12 +122,7 @@ mod tests {
             ),
         ]);
         let client = fixture.client();
-        let files = crate::fixture::SequenceServer::tracked_files(
-            directory.path(),
-            "id",
-            &local_path,
-            "baseline",
-        );
+        let files = crate::fixture::tracked_files(directory.path(), "id", &local_path, "baseline");
 
         let mut statuses = Vec::new();
         for (local, expected) in [

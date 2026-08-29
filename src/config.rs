@@ -165,9 +165,10 @@ impl Config {
 
     #[cfg(test)]
     pub(crate) fn for_loopback_test_with_cache(api_url: &str) -> Self {
-        let mut config = Self::for_loopback_test(api_url, Some("fixture-token"));
-        config.list_cache_ttl = LIST_CACHE_TTL;
-        config
+        Self {
+            list_cache_ttl: LIST_CACHE_TTL,
+            ..Self::for_loopback_test(api_url, Some(crate::fixture::FIXTURE_TOKEN))
+        }
     }
 
     #[cfg(test)]

@@ -29,12 +29,12 @@ impl HackmdServer {
         Parameters(input): Parameters<FolderWorkspaceInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::folders::list_folders(&self.client, input).await {
-            Ok(output) => reply::success(
+            Ok(output) => reply::structured(
                 format!(
                     "Found {} HackMD folder(s); returned {}",
                     output.meta.total, output.meta.count
                 ),
-                serde_json::to_value(output).expect("folder-list output should serialize"),
+                &output,
             ),
             Err(error) => reply::error(error.to_string()),
         }
@@ -56,9 +56,9 @@ impl HackmdServer {
         Parameters(input): Parameters<FolderRefInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::folders::get_folder(&self.client, input).await {
-            Ok(output) => reply::success(
+            Ok(output) => reply::structured(
                 format!("Fetched HackMD folder {}", output.folder.id),
-                serde_json::to_value(output).expect("folder output should serialize"),
+                &output,
             ),
             Err(error) => reply::error(error.to_string()),
         }
@@ -80,9 +80,9 @@ impl HackmdServer {
         Parameters(input): Parameters<CreateFolderInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::folders::create_folder(&self.client, input).await {
-            Ok(output) => reply::success(
+            Ok(output) => reply::structured(
                 format!("Created HackMD folder {}", output.folder.id),
-                serde_json::to_value(output).expect("folder output should serialize"),
+                &output,
             ),
             Err(error) => reply::error(error.to_string()),
         }
@@ -104,9 +104,9 @@ impl HackmdServer {
         Parameters(input): Parameters<UpdateFolderInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::folders::update_folder(&self.client, input).await {
-            Ok(output) => reply::success(
+            Ok(output) => reply::structured(
                 format!("Updated HackMD folder {}", output.folder.id),
-                serde_json::to_value(output).expect("folder output should serialize"),
+                &output,
             ),
             Err(error) => reply::error(error.to_string()),
         }
@@ -137,10 +137,7 @@ impl HackmdServer {
                         output.folder_id, output.child_count
                     )
                 };
-                reply::success(
-                    summary,
-                    serde_json::to_value(output).expect("folder-delete output should serialize"),
-                )
+                reply::structured(summary, &output)
             }
             Err(error) => reply::error(error.to_string()),
         }
@@ -162,9 +159,9 @@ impl HackmdServer {
         Parameters(input): Parameters<SetFolderOrderInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::folders::set_folder_order(&self.client, input).await {
-            Ok(output) => reply::success(
+            Ok(output) => reply::structured(
                 format!("Set HackMD folder order for {}", output.parent),
-                serde_json::to_value(output).expect("folder-order output should serialize"),
+                &output,
             ),
             Err(error) => reply::error(error.to_string()),
         }

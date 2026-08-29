@@ -35,12 +35,12 @@ impl HackmdServer {
         Parameters(input): Parameters<ListNotesInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::note::list::list_notes(&self.client, input).await {
-            Ok(output) => reply::success(
+            Ok(output) => reply::structured(
                 format!(
                     "Found {} matching HackMD note(s); returned {}",
                     output.meta.total, output.meta.count
                 ),
-                serde_json::to_value(output).expect("list-notes output should serialize"),
+                &output,
             ),
             Err(error) => reply::error(error.to_string()),
         }
@@ -161,12 +161,12 @@ impl HackmdServer {
         Parameters(input): Parameters<ListTrashInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::note::trash::list_trash(&self.client, input).await {
-            Ok(output) => reply::success(
+            Ok(output) => reply::structured(
                 format!(
                     "Found {} trashed HackMD note(s); returned {}",
                     output.meta.total, output.meta.count
                 ),
-                serde_json::to_value(output).expect("trash-list output should serialize"),
+                &output,
             ),
             Err(error) => reply::error(error.to_string()),
         }
@@ -241,12 +241,12 @@ impl HackmdServer {
         Parameters(input): Parameters<HistoryInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::note::history::get_history(&self.client, input).await {
-            Ok(output) => reply::success(
+            Ok(output) => reply::structured(
                 format!(
                     "Found {} HackMD history item(s); returned {}",
                     output.meta.total, output.meta.count
                 ),
-                serde_json::to_value(output).expect("history output should serialize"),
+                &output,
             ),
             Err(error) => reply::error(error.to_string()),
         }
@@ -268,10 +268,7 @@ impl HackmdServer {
         Parameters(input): Parameters<UploadNoteImageInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::note::image::upload_note_image(&self.client, &self.files, input).await {
-            Ok(Ok(output)) => reply::success(
-                "Uploaded HackMD note image",
-                serde_json::to_value(output).expect("image-upload output should serialize"),
-            ),
+            Ok(Ok(output)) => reply::structured("Uploaded HackMD note image", &output),
             Ok(Err(resolution)) => reply::unresolved(&resolution),
             Err(error) => reply::error(error.to_string()),
         }
