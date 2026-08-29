@@ -7,6 +7,7 @@ use serde::Deserialize;
 use crate::client::HackmdClient;
 use crate::config::Config;
 use crate::dto::{ProfileResponse, TeamResponse};
+use crate::get_note::GetNoteInput;
 use crate::list_notes::ListNotesInput;
 use crate::tool_result;
 
@@ -106,6 +107,34 @@ impl HackmdServer {
             Err(error) => tool_result::error(error.to_string()),
         }
     }
+
+    #[tool(
+        name = "hackmd_get_note",
+        description = "Get one HackMD note with full content, normalized metadata, folder_ids, and the exact patch_path for safe edits.",
+        annotations(
+            title = "Get HackMD Note",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn get_note(
+        &self,
+        Parameters(input): Parameters<GetNoteInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::get_note::get_note(&self.client, input).await {
+            Ok(Ok(note)) => tool_result::success(
+                format!("Fetched HackMD note {}", note.id),
+                serde_json::json!({"note": note}),
+            ),
+            Ok(Err(resolution)) => tool_result::success(
+                "The note reference did not resolve uniquely",
+                serde_json::json!({"resolution": resolution}),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
 }
 
 fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
@@ -151,7 +180,7 @@ mod tests {
     fn read_tools_have_generated_schemas_and_annotations() {
         let tools = HackmdServer::tool_router().list_all();
 
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
         for tool in &tools {
             let annotations = tool
                 .annotations
@@ -183,6 +212,18 @@ mod tests {
         assert_eq!(properties["offset"]["default"], 0);
         assert_eq!(properties["sort"]["default"], "last_changed_desc");
         assert!(properties.get("folder_id").is_none());
+
+        let get_note = tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_get_note")
+            .expect("get-note tool should exist");
+        assert_eq!(get_note.input_schema["additionalProperties"], false);
+        assert!(
+            get_note.input_schema["properties"]
+                .get("note_ref")
+                .is_some()
+        );
+        assert_eq!(get_note.input_schema["required"], json!(["note_ref"]));
     }
 
     #[tokio::test]

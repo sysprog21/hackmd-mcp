@@ -77,6 +77,24 @@ impl HackmdClient {
             })
     }
 
+    pub(crate) async fn get_note(
+        &self,
+        workspace: &Workspace,
+        note_id: &str,
+    ) -> Result<NoteResponse, HackmdError> {
+        let segments: Vec<&str> = match workspace {
+            Workspace::Personal => vec!["notes", note_id],
+            Workspace::Team { team_path } => vec!["teams", team_path, "notes", note_id],
+        };
+        let path = self.url_for_segments(&segments)?.path().to_owned();
+        self.request_json(Method::GET, &segments, None)
+            .await?
+            .ok_or_else(|| HackmdError::EmptyResponse {
+                method: "GET".to_owned(),
+                path,
+            })
+    }
+
     #[allow(dead_code, reason = "called by the API operation tasks")]
     pub(crate) async fn request_json<T: DeserializeOwned>(
         &self,

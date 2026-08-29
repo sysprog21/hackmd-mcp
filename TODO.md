@@ -182,11 +182,6 @@ test (see P3) for each and record the answer here.
 
 ## P1 — essential RMCP tools
 
-- [ ] Add `hackmd_get_note` with full content and normalized metadata. Include
-  `patch_path` exactly `notes/{id}.md` for personal notes or
-  `teams/{team_path}/notes/{id}.md` for team notes, unencoded, for safe content
-  edits. Normalize `folderPaths` into a `folder_ids` array here, since this is
-  the only response that carries folder ancestry.
 - [ ] Add `hackmd_create_note`, `hackmd_update_note`, and `hackmd_delete_note`.
   Use `workspace` for both `/notes` and `/teams/{team_path}/notes`. Create
   accepts title, content, tags, description, permalink, read/write/comment/

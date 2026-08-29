@@ -88,3 +88,8 @@
   filter/sort locally, then slice. Return `total`, `count`, `offset`,
   `has_more`, `next_offset`, and a slim note summary. Do not offer folder
   filtering here: list responses carry no `folderPaths`.
+- [x] Add `hackmd_get_note` with full content and normalized metadata. Include
+  `patch_path` exactly `notes/{id}.md` for personal notes or
+  `teams/{team_path}/notes/{id}.md` for team notes, unencoded, for safe content
+  edits. Normalize `folderPaths` into a `folder_ids` array here, since this is
+  the only response that carries folder ancestry.

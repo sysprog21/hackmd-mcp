@@ -3,6 +3,7 @@
 mod client;
 mod config;
 mod dto;
+mod get_note;
 mod list_notes;
 mod models;
 mod note_ref;
