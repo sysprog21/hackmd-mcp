@@ -7,3 +7,9 @@
   default-features = false, features = ["macros", "server", "transport-io"]
   }`; use its transitive `schemars` rather than a second MCP framework or
   hand-written JSON-RPC dispatcher.
+- [x] Add only the required application dependencies: `tokio` (macros,
+  multi-thread runtime, time), `reqwest` with rustls + JSON, `serde`,
+  `serde_json`, `thiserror`, `url`, `directories`, `tracing`,
+  `tracing-subscriber`, and `tempfile` (tests/atomic writes). Add `clap` only
+  with the later `--help`/`--version` task. Keep modules private behind a small
+  `lib.rs` test surface.

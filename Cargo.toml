@@ -7,7 +7,19 @@ license = "MIT"
 description = "Local-first MCP server for the HackMD API"
 
 [dependencies]
+directories = "6"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rmcp = { version = "3", default-features = false, features = ["macros", "server", "transport-io"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"
