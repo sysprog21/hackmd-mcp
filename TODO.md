@@ -193,10 +193,6 @@ test (see P3) for each and record the answer here.
 
 ## P2.5 — local Markdown sync
 
-- [ ] Make conflict results agent-actionable: include a bounded unified-diff
-  summary, local/baseline absolute paths, a clear `merge_required` status, and
-  instructions to call `hackmd_save_remote_snapshot`. When a snapshot exists,
-  include its third absolute path. Do not silently reapply an agent edit.
 - [ ] Require `confirm_large_file: true` before pulling or pushing bodies over
   5 MB; refuse bodies over 50 MB. These are the thresholds the official
   `push-to-hackmd` skill already uses, still pending a verified HackMD limit.

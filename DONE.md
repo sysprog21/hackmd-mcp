@@ -183,3 +183,7 @@
 - [x] Add `hackmd_save_remote_snapshot` with optional explicit overwrite.
   Atomically save the tracked remote body as sibling `*.remote.md`, refuse an
   existing snapshot by default, and never overwrite the working Markdown file.
+- [x] Make safe-push conflicts agent-actionable with bounded baseline→local and
+  baseline→remote unified diffs, absolute local/baseline paths,
+  `merge_required: true`, snapshot instructions, and the existing absolute
+  `*.remote.md` path when present. Never silently reapply an agent edit.

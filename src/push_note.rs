@@ -3,6 +3,7 @@ use std::{fs, path::PathBuf};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use similar::TextDiff;
 use thiserror::Error;
 
 use crate::{
@@ -60,6 +61,13 @@ pub(crate) struct PushNoteOutput {
     pub(crate) local_path: PathBuf,
     pub(crate) baseline_path: PathBuf,
     pub(crate) pushed: bool,
+    pub(crate) merge_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) diff_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) instructions: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -166,24 +174,26 @@ async fn push_resolved(
             )));
         }
         if remote != tracked.baseline_body {
-            return Ok(Ok(output(
-                PushStatus::Conflict,
+            return Ok(Ok(conflict_output(
                 &note.workspace,
                 &note.note_id,
                 &tracked.state.local_path,
                 &tracked.baseline_path,
-                false,
+                &tracked.baseline_body,
+                &local,
+                &remote,
             )));
         }
         let recheck = client.get_note(&note.workspace, &note.note_id).await?;
         if recheck.content.as_deref() != Some(tracked.baseline_body.as_str()) {
-            return Ok(Ok(output(
-                PushStatus::Conflict,
+            return Ok(Ok(conflict_output(
                 &note.workspace,
                 &note.note_id,
                 &tracked.state.local_path,
                 &tracked.baseline_path,
-                false,
+                &tracked.baseline_body,
+                &local,
+                recheck.content.as_deref().unwrap_or_default(),
             )));
         }
     } else if remote == local {
@@ -239,7 +249,59 @@ fn output(
         local_path: local_path.to_path_buf(),
         baseline_path: baseline_path.to_path_buf(),
         pushed,
+        merge_required: false,
+        diff_summary: None,
+        snapshot_path: None,
+        instructions: None,
     }
+}
+
+fn conflict_output(
+    workspace: &Workspace,
+    note_id: &str,
+    local_path: &std::path::Path,
+    baseline_path: &std::path::Path,
+    baseline: &str,
+    local: &str,
+    remote: &str,
+) -> PushNoteOutput {
+    let candidate_snapshot = local_path.with_extension("remote.md");
+    PushNoteOutput {
+        status: PushStatus::Conflict,
+        workspace: workspace.clone(),
+        note_id: note_id.to_owned(),
+        local_path: local_path.to_path_buf(),
+        baseline_path: baseline_path.to_path_buf(),
+        pushed: false,
+        merge_required: true,
+        diff_summary: Some(conflict_diff(baseline, local, remote)),
+        snapshot_path: candidate_snapshot.exists().then_some(candidate_snapshot),
+        instructions: Some(
+            "Merge the local and remote changes; call hackmd_save_remote_snapshot with local_path to save the current remote body. Do not overwrite until the merge is reviewed."
+                .to_owned(),
+        ),
+    }
+}
+
+fn conflict_diff(baseline: &str, local: &str, remote: &str) -> String {
+    const MAX_CHARS: usize = 4_000;
+    let local_diff = TextDiff::from_lines(baseline, local)
+        .unified_diff()
+        .context_radius(2)
+        .header("baseline", "local")
+        .to_string();
+    let remote_diff = TextDiff::from_lines(baseline, remote)
+        .unified_diff()
+        .context_radius(2)
+        .header("baseline", "remote")
+        .to_string();
+    let combined = format!("LOCAL CHANGES\n{local_diff}\nREMOTE CHANGES\n{remote_diff}");
+    let mut chars = combined.chars();
+    let mut bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
 }
 
 fn persist_advanced_state(
@@ -261,7 +323,7 @@ fn persist_advanced_state(
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{PushNoteError, PushNoteInput, PushStatus, PushStrategy, push_note};
+    use super::{PushNoteError, PushNoteInput, PushStatus, PushStrategy, conflict_diff, push_note};
     use crate::{
         client::HackmdClient,
         config::Config,
@@ -354,6 +416,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "local edit").expect("local fixture should write");
+        fs::write(local_path.with_extension("remote.md"), "prior snapshot")
+            .expect("snapshot fixture should write");
         let fixture = crate::test_support::SequenceServer::spawn([(
             200,
             r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
@@ -371,7 +435,29 @@ mod tests {
                 .ends_with("personal--note-id.baseline.md")
         );
         assert_eq!(output.local_path, local_path);
+        assert!(output.merge_required);
+        assert!(output.snapshot_path.is_some());
+        assert!(
+            output
+                .instructions
+                .as_deref()
+                .expect("instructions should exist")
+                .contains("hackmd_save_remote_snapshot")
+        );
+        let diff = output.diff_summary.expect("diff summary should exist");
+        assert!(diff.contains("LOCAL CHANGES"));
+        assert!(diff.contains("REMOTE CHANGES"));
         assert_eq!(fixture.finish().len(), 1);
+    }
+
+    #[test]
+    fn conflict_diff_is_bounded() {
+        let baseline = "base\n".repeat(2_000);
+        let local = "local\n".repeat(2_000);
+        let remote = "remote\n".repeat(2_000);
+        let summary = conflict_diff(&baseline, &local, &remote);
+        assert!(summary.chars().count() <= 4_001);
+        assert!(summary.ends_with('…'));
     }
 
     #[tokio::test]
