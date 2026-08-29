@@ -65,6 +65,30 @@ fn assert_waiting_then_stop(mut child: Child) -> Output {
 }
 
 #[test]
+fn help_and_version_exit_without_starting_the_transport() {
+    let help = Command::new(env!("CARGO_BIN_EXE_hackmd-mcp"))
+        .arg("--help")
+        .output()
+        .expect("help should run");
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).expect("help should be UTF-8");
+    assert!(help.contains("Local-first MCP server for the HackMD API"));
+    assert!(help.contains("--version"));
+
+    let version = Command::new(env!("CARGO_BIN_EXE_hackmd-mcp"))
+        .arg("--version")
+        .output()
+        .expect("version should run");
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8(version.stdout)
+            .expect("version should be UTF-8")
+            .trim(),
+        concat!("hackmd-mcp ", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
 fn server_waits_for_input_without_writing_transport_noise() {
     let output = assert_waiting_then_stop(spawn_server(None, None, None));
     assert!(output.stdout.is_empty(), "stdout is reserved for MCP");

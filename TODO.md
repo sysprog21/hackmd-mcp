@@ -191,27 +191,6 @@ test (see P3) for each and record the answer here.
 
 ## P4 — remote use
 
-- [ ] Add `clap` and implement `--version` / `--help`, sample Claude
-  Desktop/Codex configs, `.env.example`, and a clear token-security warning.
-  Support dotenv only as a local convenience; inherited environment wins.
-  Document pinning an exact released version in MCP client config rather than a
-  mutable tag, since a client silently starts whatever the tag resolves to.
-- [ ] Add Streamable HTTP only after stdio is stable. Require bearer/OAuth
-  authentication, per-user token isolation, URL allowlisting, rate limits, and
-  secure refresh-token storage/rotation before accepting user credentials over
-  HTTP. Enable RMCP's `transport-streamable-http-server` feature only in this
-  mode and mount its `StreamableHttpService` on `/mcp`; do not implement legacy
-  two-endpoint HTTP+SSE. `hackmd-mcp-proxy` is the worked example of what this
-  costs: SQLite-backed client/session/token stores, ChaCha20-Poly1305 credential
-  encryption, PKCE, and refresh-token rotation. Its `http/`, `store/`, `oauth.rs`,
-  and `crypto.rs` come to roughly 1,900 lines that a local stdio server needs
-  none of.
-- [ ] Keep GitHub sync out of the core server. Add it only as an opt-in feature
-  after a concrete workflow requires it; it needs separate GitHub credentials,
-  durable sync state, conflict handling, and frontmatter normalization.
-  `hackmd-mcp-server` carries all four and its frontmatter normalization needed
-  its own bug fix.
-
 ## Deliberately deferred
 
 - A bounded `hackmd_watch_note_sync` polling tool. A watch capped at 20 seconds

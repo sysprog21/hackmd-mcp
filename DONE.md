@@ -157,7 +157,7 @@
   `data.link`. A guarded team probe confirmed the inferred team route returns
   404, so reject team uploads with an explicit unsupported error.
 - [x] Add fixture tests for known quirks: `202` readbacks, POST-then-PATCH folder
-  assignment, folder-path normalization, order-map merge preservation, move
+  assignment, folder-path normalization, order-map merge preservation, folder
   move rejection, root-folder create omission, and folder IDs containing `/`.
 - [x] Add personal `hackmd_list_trash` (`GET /trash`) and
   `hackmd_restore_note` (`PUT /trash/{note_id}/restore`) with slim pagination,
@@ -236,3 +236,18 @@
   every MCP tool call and HackMD request. `RUST_LOG` opts into debug detail;
   the optional `otel` feature plus `HACKMD_MCP_OTEL=true` exports spans through
   the standard OTLP environment configuration. MCP stdout remains transport-only.
+
+## P4 — remote use
+
+- [x] Add `clap`-generated `--help` and `--version`, covered through the built
+  executable. Add `README.md`, `.env.example`, `.env` ignore protection, sample
+  Claude Desktop and Codex stdio configurations, token/state security guidance,
+  inherited-environment precedence, and exact-release pinning guidance.
+- [x] Keep transport stdio-only. Streamable HTTP is intentionally excluded
+  because no remote multi-user requirement exists and a secure implementation
+  would require authentication, per-user token isolation, URL allowlisting,
+  rate limits, encrypted credential storage, and refresh-token rotation. Do not
+  accept credentials over HTTP until that separately reviewed scope exists.
+- [x] Keep GitHub sync out of the core server. No concrete workflow currently
+  justifies separate GitHub credentials, durable sync/conflict state, and a
+  frontmatter-normalization policy; revisit only as an opt-in feature.

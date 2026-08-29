@@ -16,6 +16,7 @@ otel = [
 ]
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 directories = "6"
 fastrand = "2"
 httpdate = "1"
