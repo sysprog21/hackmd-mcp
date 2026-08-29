@@ -211,3 +211,7 @@
   explicitly paginated projections; folder lists now do the same with a
   default limit of 20 and maximum of 100. Only the explicitly invoked
   `hackmd_get_note` read returns full note content.
+- [x] Evaluate a short TTL cache and omit it pending profiling evidence. The
+  external 60-second list cache exists to support full-body search, which this
+  server deliberately excludes; ordinary discovery traffic does not yet
+  justify stale reads or write-invalidation state. Note bodies remain uncached.
