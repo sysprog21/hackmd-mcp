@@ -182,9 +182,6 @@ test (see P3) for each and record the answer here.
 
 ## P1 — essential RMCP tools
 
-- [ ] Let RMCP 3.x negotiate MCP initialization and generate `tools/list` /
-  `tools/call`; do not hard-code a protocol version or manually maintain tool
-  JSON schemas.
 - [ ] Return `CallToolResult::success` with concise text and structured JSON
   for successful tools. Return `CallToolResult::error` for API failures and
   handler-level validation failures; allow RMCP's schema decoder to reject
