@@ -4,6 +4,7 @@ use rmcp::{ServiceExt, tool_router};
 use rmcp::{handler::server::wrapper::Parameters, schemars, tool};
 use serde::Deserialize;
 
+use crate::check_sync::CheckNoteSyncInput;
 use crate::client::HackmdClient;
 use crate::config::Config;
 use crate::crud::{CreateNoteInput, DeleteNoteInput, UpdateNoteInput};
@@ -522,6 +523,30 @@ impl HackmdServer {
             Err(error) => tool_result::error(error.to_string()),
         }
     }
+
+    #[tool(
+        name = "hackmd_check_note_sync",
+        description = "Read local, private baseline, and remote note state without writing, returning in_sync, remote_changed, local_changed, or conflict plus SHA-256 hashes.",
+        annotations(
+            title = "Check HackMD Note Sync",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn check_note_sync(
+        &self,
+        Parameters(input): Parameters<CheckNoteSyncInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::check_sync::check_note_sync(&self.client, input).await {
+            Ok(output) => tool_result::success(
+                "Checked tracked HackMD note sync state",
+                serde_json::to_value(output).expect("sync-check output should serialize"),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
 }
 
 fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
@@ -551,7 +576,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 18] = [
+    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 19] = [
         ("hackmd_get_me", true, false, true),
         ("hackmd_list_teams", true, false, true),
         ("hackmd_list_notes", true, false, true),
@@ -570,6 +595,7 @@ mod tests {
         ("hackmd_upload_note_image", false, false, false),
         ("hackmd_pull_note", false, true, false),
         ("hackmd_push_note", false, true, true),
+        ("hackmd_check_note_sync", true, false, true),
     ];
 
     async fn protocol_client(
@@ -626,7 +652,7 @@ mod tests {
     fn tools_have_generated_schemas_and_exact_annotations() {
         let tools = HackmdServer::tool_router().list_all();
 
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 19);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = tools
                 .iter()
@@ -851,7 +877,7 @@ mod tests {
             .list_tools(None)
             .await
             .expect("tools/list should succeed");
-        assert_eq!(listed.tools.len(), 18);
+        assert_eq!(listed.tools.len(), 19);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = listed
                 .tools

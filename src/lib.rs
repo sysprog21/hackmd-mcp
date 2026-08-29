@@ -1,5 +1,6 @@
 //! A local-first MCP server for the `HackMD` API.
 
+mod check_sync;
 mod client;
 mod config;
 mod crud;

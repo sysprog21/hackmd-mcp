@@ -193,9 +193,6 @@ test (see P3) for each and record the answer here.
 
 ## P2.5 — local Markdown sync
 
-- [ ] Add read-only `hackmd_check_note_sync` taking `local_path`. It resolves
-  the sidecar and returns `in_sync`, `remote_changed`, `local_changed`, or
-  `conflict`, with remote timestamp/body hash and no filesystem writes.
 - [ ] Add `hackmd_save_remote_snapshot` taking `local_path` and optional
   `overwrite_snapshot: false`. Fetch the tracked remote body and atomically
   create sibling `*.remote.md`; refuse an existing snapshot unless overwrite is

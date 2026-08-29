@@ -176,3 +176,7 @@
 - [x] Require `confirm: true` for overwrite mode, mark the tool destructive,
   PATCH the exact local body, read back accepted `202` updates, and persist the
   new baseline only after confirmation.
+- [x] Add read-only `hackmd_check_note_sync` taking `local_path`. Resolve its
+  private sidecar and return `in_sync`, `remote_changed`, `local_changed`, or
+  `conflict` with remote timestamp and SHA-256 baseline/local/remote hashes,
+  without filesystem writes.
