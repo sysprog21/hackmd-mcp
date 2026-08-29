@@ -12,7 +12,7 @@ use crate::{
     client::{HackmdClient, HackmdError},
     models::Workspace,
     note_ref::{NoteRefError, NoteResolution},
-    state::{LocalFileIdentity, StateError, TrackedNoteState, write_local_atomic},
+    state::{StateError, TrackedNoteState, local_file_identity, write_local_atomic},
 };
 
 const WARNING_BYTES: usize = 5 * 1024 * 1024;
@@ -190,28 +190,6 @@ fn is_markdown(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-}
-
-fn local_file_identity(path: &Path) -> Result<LocalFileIdentity, PullNoteError> {
-    let canonical_path = fs::canonicalize(path).map_err(PullNoteError::PathIo)?;
-    let metadata = fs::metadata(&canonical_path).map_err(PullNoteError::PathIo)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(LocalFileIdentity {
-            canonical_path,
-            device_id: Some(metadata.dev()),
-            file_id: Some(metadata.ino()),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(LocalFileIdentity {
-            canonical_path,
-            device_id: None,
-            file_id: None,
-        })
-    }
 }
 
 #[cfg(test)]

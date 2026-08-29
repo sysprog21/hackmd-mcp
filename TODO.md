@@ -193,22 +193,6 @@ test (see P3) for each and record the answer here.
 
 ## P2.5 — local Markdown sync
 
-- [ ] Add `hackmd_push_note` (`workspace`, `note_ref`, `local_path`,
-  `strategy: "safe" | "overwrite"`). In `safe` mode, fetch remote content and
-  compare it and the local file to the sidecar base:
-  - remote unchanged → PATCH local content;
-  - local unchanged → report that there is nothing to push;
-  - both changed → return a conflict with local/base paths and do not overwrite
-    either side.
-  This is the `safe-sync.sh` contract from the official skills, with the
-  baseline held in the sidecar instead of a temp file.
-- [ ] Re-fetch immediately before every PATCH, compare the recheck body to the
-  recorded baseline, and abort on any difference. This narrows, but cannot
-  eliminate, the race between comparison and HackMD's non-transactional update.
-  Only update the sidecar after a confirmed successful PATCH/read-back.
-- [ ] In `overwrite` mode, PATCH the exact local file content only when the
-  request supplies `confirm: true`; mark the tool destructive. Read back after
-  a `202` response and update the sidecar only after the write is confirmed.
 - [ ] Add read-only `hackmd_check_note_sync` taking `local_path`. It resolves
   the sidecar and returns `in_sync`, `remote_changed`, `local_changed`, or
   `conflict`, with remote timestamp/body hash and no filesystem writes.

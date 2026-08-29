@@ -18,6 +18,7 @@ use crate::history::HistoryInput;
 use crate::image_upload::UploadNoteImageInput;
 use crate::list_notes::ListNotesInput;
 use crate::pull_note::PullNoteInput;
+use crate::push_note::PushNoteInput;
 use crate::tool_result;
 
 /// MCP server whose handlers share one configured `HackMD` client.
@@ -493,6 +494,34 @@ impl HackmdServer {
             Err(error) => tool_result::error(error.to_string()),
         }
     }
+
+    #[tool(
+        name = "hackmd_push_note",
+        description = "Push a tracked local Markdown file with safe baseline comparison by default. strategy: overwrite requires confirm: true and replaces unversioned remote content.",
+        annotations(
+            title = "Push HackMD Note",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn push_note(
+        &self,
+        Parameters(input): Parameters<PushNoteInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::push_note::push_note(&self.client, input).await {
+            Ok(Ok(output)) => tool_result::success(
+                "Evaluated tracked HackMD note push",
+                serde_json::to_value(output).expect("push output should serialize"),
+            ),
+            Ok(Err(resolution)) => tool_result::success(
+                "The note reference did not resolve uniquely",
+                serde_json::json!({"resolution": resolution}),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
 }
 
 fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
@@ -522,7 +551,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 17] = [
+    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 18] = [
         ("hackmd_get_me", true, false, true),
         ("hackmd_list_teams", true, false, true),
         ("hackmd_list_notes", true, false, true),
@@ -540,6 +569,7 @@ mod tests {
         ("hackmd_set_folder_order", false, false, true),
         ("hackmd_upload_note_image", false, false, false),
         ("hackmd_pull_note", false, true, false),
+        ("hackmd_push_note", false, true, true),
     ];
 
     async fn protocol_client(
@@ -596,7 +626,7 @@ mod tests {
     fn tools_have_generated_schemas_and_exact_annotations() {
         let tools = HackmdServer::tool_router().list_all();
 
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = tools
                 .iter()
@@ -821,7 +851,7 @@ mod tests {
             .list_tools(None)
             .await
             .expect("tools/list should succeed");
-        assert_eq!(listed.tools.len(), 17);
+        assert_eq!(listed.tools.len(), 18);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = listed
                 .tools
@@ -886,6 +916,21 @@ mod tests {
             pull.input_schema["properties"]["create_parent_dirs"]["default"],
             false
         );
+        let push = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_push_note")
+            .expect("push tool should be listed");
+        assert_eq!(push.input_schema["additionalProperties"], false);
+        assert_eq!(
+            push.input_schema["required"],
+            json!(["note_ref", "local_path"])
+        );
+        assert_eq!(
+            push.input_schema["properties"]["strategy"]["default"],
+            "safe"
+        );
+        assert_eq!(push.input_schema["properties"]["confirm"]["default"], false);
         stop_protocol(client, server_task).await;
     }
 

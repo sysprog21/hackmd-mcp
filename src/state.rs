@@ -35,6 +35,12 @@ pub(crate) struct StateStore {
     root: PathBuf,
 }
 
+pub(crate) struct LoadedTrackedState {
+    pub(crate) state: TrackedNoteState,
+    pub(crate) baseline_body: String,
+    pub(crate) baseline_path: PathBuf,
+}
+
 impl StateStore {
     pub(crate) fn new(root: PathBuf) -> Self {
         Self { root }
@@ -77,6 +83,38 @@ impl StateStore {
         write_private_atomic(&paths.sidecar, &sidecar)?;
         Ok(())
     }
+
+    pub(crate) fn load_for_local_path(
+        &self,
+        local_path: &Path,
+    ) -> Result<LoadedTrackedState, StateError> {
+        let canonical = fs::canonicalize(local_path)?;
+        let tracked = self.root.join("tracked");
+        let entries = fs::read_dir(tracked).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                StateError::NotTracked
+            } else {
+                StateError::Io(error)
+            }
+        })?;
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let state: TrackedNoteState = serde_json::from_slice(&fs::read(&path)?)?;
+            if state.local_file_identity.canonical_path == canonical {
+                let paths = self.paths_for(&state.workspace, &state.internal_id);
+                let baseline_body = fs::read_to_string(&paths.baseline)?;
+                return Ok(LoadedTrackedState {
+                    state,
+                    baseline_body,
+                    baseline_path: paths.baseline,
+                });
+            }
+        }
+        Err(StateError::NotTracked)
+    }
 }
 
 pub(crate) fn write_local_atomic(path: &Path, contents: &[u8]) -> Result<(), StateError> {
@@ -94,6 +132,28 @@ pub(crate) fn write_local_atomic(path: &Path, contents: &[u8]) -> Result<(), Sta
         .persist(path)
         .map_err(|error| StateError::Io(error.error))?;
     Ok(())
+}
+
+pub(crate) fn local_file_identity(path: &Path) -> Result<LocalFileIdentity, StateError> {
+    let canonical_path = fs::canonicalize(path)?;
+    let metadata = fs::metadata(&canonical_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(LocalFileIdentity {
+            canonical_path,
+            device_id: Some(metadata.dev()),
+            file_id: Some(metadata.ino()),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(LocalFileIdentity {
+            canonical_path,
+            device_id: None,
+            file_id: None,
+        })
+    }
 }
 
 struct StatePaths {
@@ -140,6 +200,8 @@ fn set_private_permissions(_file: &fs::File) -> io::Result<()> {
 
 #[derive(Debug, Error)]
 pub(crate) enum StateError {
+    #[error("local Markdown file is not tracked; pull it before sync operations")]
+    NotTracked,
     #[error("invalid local state path")]
     InvalidStatePath,
     #[error("local state I/O failed")]

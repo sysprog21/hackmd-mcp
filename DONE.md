@@ -166,3 +166,13 @@
 - [x] Validate paths before remote access: reject relative paths, directories,
   existing files without confirmation, and existing non-Markdown files without
   overwrite; resolve symlinks and create parents only when explicitly enabled.
+- [x] Add `hackmd_push_note` with safe and overwrite strategies. Safe mode
+  compares local and remote bodies to the private exact baseline, reports
+  no-op/remote-only/conflict states without mutation, and pushes only when the
+  remote baseline is unchanged.
+- [x] Immediately re-fetch before every safe PATCH and abort to a conflict if
+  the baseline changed. Advance private sync state only after PATCH plus an
+  exact-content readback.
+- [x] Require `confirm: true` for overwrite mode, mark the tool destructive,
+  PATCH the exact local body, read back accepted `202` updates, and persist the
+  new baseline only after confirmation.
