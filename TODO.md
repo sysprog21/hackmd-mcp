@@ -180,12 +180,6 @@ test (see P3) for each and record the answer here.
 
 ## P0 — RMCP 3.x foundation
 
-- [ ] Implement a single `HackmdClient`: URL-encode every path segment, attach
-  bearer auth, handle empty `204`/`202` responses, parse JSON once, and map
-  network/timeout/401/403/404/409/429/5xx failures to concise, actionable MCP
-  errors. Include request method/path and status, never the token. Model the
-  hint text on `py-hackmd-mcp`'s `_ERROR_HINTS`: name the fix, not just the
-  code, and truncate an unrecognized 4xx body to about 300 characters.
 - [ ] Use typed request/response DTOs with `serde` rename rules and permission
   enums. Reject empty PATCH bodies. Build payloads from explicitly supplied
   fields only, and never default a permission field. Validate the

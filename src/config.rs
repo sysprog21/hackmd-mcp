@@ -77,6 +77,22 @@ impl Config {
         self.api_token.is_some()
     }
 
+    pub(crate) fn api_token(&self) -> Option<&str> {
+        self.api_token.as_ref().map(SecretToken::expose)
+    }
+
+    pub(crate) fn api_url(&self) -> &Url {
+        &self.api_url
+    }
+
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    pub(crate) fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
     pub(crate) fn state_dir(&self) -> &Path {
         &self.state_dir
     }
@@ -91,6 +107,27 @@ impl Config {
         get: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, ConfigError> {
         Self::from_getter_with_policy(get, ApiUrlPolicy::AllowLoopbackHttp)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_loopback_test(api_url: &str, token: Option<&str>) -> Self {
+        Self::with_loopback_http_for_tests(|key| match key {
+            "HACKMD_API_URL" => Some(api_url.to_owned()),
+            "HACKMD_API_TOKEN" => token.map(str::to_owned),
+            _ => None,
+        })
+        .expect("loopback test URL must be valid")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_loopback_test_with_timeout(
+        api_url: &str,
+        token: &str,
+        request_timeout: Duration,
+    ) -> Self {
+        let mut config = Self::for_loopback_test(api_url, Some(token));
+        config.request_timeout = request_timeout;
+        config
     }
 }
 
@@ -188,7 +225,13 @@ impl Default for RetryConfig {
     }
 }
 
-struct SecretToken(#[allow(dead_code, reason = "used by the following HTTP client task")] String);
+struct SecretToken(String);
+
+impl SecretToken {
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
 
 impl fmt::Debug for SecretToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -21,7 +21,7 @@ impl HackmdServer {
 }
 
 pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Arc::new(HackmdClient::new(Config::from_env()?));
+    let client = Arc::new(HackmdClient::new(Config::from_env()?)?);
     if !client.has_api_token() {
         tracing::warn!("HACKMD_API_TOKEN is not set; API tools will return a configuration error");
     }
@@ -80,7 +80,9 @@ mod tests {
 
     #[test]
     fn server_owns_the_shared_client() {
-        let client = Arc::new(HackmdClient::new(Config::for_tests()));
+        let client = Arc::new(
+            HackmdClient::new(Config::for_tests()).expect("test client should be constructed"),
+        );
         let server = HackmdServer::new(Arc::clone(&client));
 
         assert_eq!(Arc::strong_count(&client), 2);
@@ -120,7 +122,9 @@ mod tests {
 
     #[test]
     fn tool_call_reports_actionable_missing_token_error() {
-        let server = HackmdServer::new(Arc::new(HackmdClient::new(Config::for_tests())));
+        let server = HackmdServer::new(Arc::new(
+            HackmdClient::new(Config::for_tests()).expect("test client should be constructed"),
+        ));
         let error = server
             .schema_probe(rmcp::handler::server::wrapper::Parameters(
                 SchemaProbeInput {
@@ -138,7 +142,8 @@ mod tests {
 
     #[test]
     fn server_handler_enables_tools_only() {
-        let client = HackmdClient::new(Config::for_tests());
+        let client =
+            HackmdClient::new(Config::for_tests()).expect("test client should be constructed");
         let info = HackmdServer::new(Arc::new(client)).get_info();
 
         assert!(info.capabilities.tools.is_some());

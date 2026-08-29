@@ -46,3 +46,9 @@
   request-supplied URL allowlisting to the remote-HTTP task. `hackmd-mcp` added
   an API-URL allowlist specifically to close an SSRF hole once it accepted the
   URL from a request header.
+- [x] Implement a single `HackmdClient`: URL-encode every path segment, attach
+  bearer auth, handle empty `204`/`202` responses, parse JSON once, and map
+  network/timeout/401/403/404/409/429/5xx failures to concise, actionable MCP
+  errors. Include request method/path and status, never the token. Model the
+  hint text on `py-hackmd-mcp`'s `_ERROR_HINTS`: name the fix, not just the
+  code, and truncate an unrecognized 4xx body to about 300 characters.
