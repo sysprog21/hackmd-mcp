@@ -131,7 +131,7 @@ impl StateStore {
     ) -> Result<(), StateError> {
         let paths = self.paths_for(&state.workspace, &state.internal_id);
         let parent = paths.sidecar.parent().ok_or(StateError::InvalidStatePath)?;
-        fs::create_dir_all(parent)?;
+        create_private_dir_all(parent)?;
         write_private_atomic(&paths.baseline, baseline_body.as_bytes())?;
         let sidecar = serde_json::to_vec_pretty(state)?;
         write_private_atomic(&paths.sidecar, &sidecar)?;
@@ -257,6 +257,25 @@ fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<(), StateError> 
     Ok(())
 }
 
+/// Creates the state tree owner-only. The sidecar files are already 0600, but
+/// their names spell out note IDs and team paths, so the directory listing is
+/// worth hiding from other local accounts too.
+fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
 #[cfg(unix)]
 fn set_private_permissions(file: &fs::File) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -312,6 +331,37 @@ mod tests {
                 file_id: Some(2),
             },
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let root = directory.path().join("state");
+        let store = StateStore::new(root.clone());
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").expect("local fixture should write");
+        store
+            .persist_from_sync(
+                &TrackedNoteState::capture(
+                    "id".to_owned(),
+                    Workspace::Personal,
+                    local_path,
+                    "baseline",
+                    Some(1),
+                )
+                .expect("fixture state should capture"),
+                "baseline",
+            )
+            .expect("state should persist");
+
+        let mode = fs::metadata(root.join("tracked"))
+            .expect("tracked directory should exist")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[test]

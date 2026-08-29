@@ -110,6 +110,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_write_that_never_becomes_visible_is_an_error() {
+        const OLD: &str = r#"{"id":"note-id","title":"Title","content":"old"}"#;
+        // Fetch, PATCH, then every read-back the window has time for.
+        let fixture = SequenceServer::spawn([
+            (200, OLD),
+            (202, ""),
+            (200, OLD),
+            (200, OLD),
+            (200, OLD),
+            (200, OLD),
+            (200, OLD),
+        ]);
+        let client = fixture.client();
+        let input = EditNoteInput {
+            workspace: Workspace::Personal,
+            note_ref: "note-id".to_owned(),
+            patch:
+                "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch"
+                    .to_owned(),
+        };
+
+        assert!(matches!(
+            edit_note(&client, input).await,
+            Err(EditNoteError::ReadbackMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn changed_edit_gets_then_patches_full_updated_content() {
         let server = SequenceServer::spawn([
             (200, r#"{"id":"note-id","title":"Title","content":"old\n"}"#),

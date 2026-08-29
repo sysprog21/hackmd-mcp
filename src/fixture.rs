@@ -9,7 +9,8 @@ use std::{
 };
 
 use crate::{
-    client::HackmdClient, config::Config, models::Workspace, sync::state::TrackedNoteState,
+    client::HackmdClient, config::Config, local::LocalFiles, models::Workspace,
+    sync::state::TrackedNoteState,
 };
 
 /// The token every fixture client presents. Nothing verifies it; it exists so
@@ -109,22 +110,16 @@ impl SequenceServer {
             .expect("fixture client should build")
     }
 
-    /// A client whose state directory already tracks `local_path` at
+    /// Local storage whose state directory already tracks `local_path` at
     /// `baseline`, which is the starting point every sync tool test needs.
-    pub(crate) fn tracked_client(
-        &self,
+    pub(crate) fn tracked_files(
         state_root: &Path,
         note_id: &str,
         local_path: &Path,
         baseline: &str,
-    ) -> HackmdClient {
-        let client = HackmdClient::new(Config::for_loopback_test_with_state(
-            &self.api_url,
-            FIXTURE_TOKEN,
-            &state_root.join("state"),
-        ))
-        .expect("fixture client should build");
-        client
+    ) -> LocalFiles {
+        let files = LocalFiles::new(state_root.join("state"), None);
+        files
             .state()
             .persist_from_sync(
                 &TrackedNoteState::capture(
@@ -138,7 +133,7 @@ impl SequenceServer {
                 baseline,
             )
             .expect("tracked state should persist");
-        client
+        files
     }
 
     /// The single request this fixture was expected to serve.
@@ -186,7 +181,9 @@ fn read_request(stream: &mut TcpStream) -> String {
             })
             .unwrap_or(0);
         if request.len() >= header_end + 4 + length {
-            return String::from_utf8(request).expect("fixture request should be UTF-8");
+            // Lossy: multipart uploads carry binary bodies, and assertions only
+            // ever look at the textual parts.
+            return String::from_utf8_lossy(&request).into_owned();
         }
     }
 }

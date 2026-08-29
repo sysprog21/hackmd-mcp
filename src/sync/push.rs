@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::{
     client::{HackmdClient, HackmdError},
     dto::UpdateNoteRequest,
+    local::{LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
     sync::state::{StateError, TrackedNoteState},
@@ -72,6 +73,8 @@ pub(crate) struct PushNoteOutput {
 
 #[derive(Debug, Error)]
 pub(crate) enum PushNoteError {
+    #[error(transparent)]
+    Access(#[from] LocalAccessError),
     #[error("local_path must be absolute")]
     RelativePath,
     #[error("local_path must be a readable regular file")]
@@ -103,10 +106,12 @@ pub(crate) enum PushNoteError {
 
 pub(crate) async fn push_note(
     client: &HackmdClient,
+    files: &LocalFiles,
     input: PushNoteInput,
 ) -> Result<Result<PushNoteOutput, NoteResolution>, PushNoteError> {
+    files.allow(&input.local_path)?;
     let local = validate_and_read_local(&input)?;
-    let tracked = client.state().load_for_local_path(&input.local_path)?;
+    let tracked = files.state().load_for_local_path(&input.local_path)?;
     let resolution =
         crate::note::reference::resolve_note_ref(client, input.workspace.clone(), &input.note_ref)
             .await?;
@@ -117,18 +122,13 @@ pub(crate) async fn push_note(
         return Err(PushNoteError::TrackingMismatch);
     }
     let remote_note = client.get_note(&note.workspace, &note.note_id).await?;
-    let remote = remote_note
-        .content
-        .ok_or_else(|| PushNoteError::MissingRemoteContent {
-            note_id: note.note_id.clone(),
-        })?;
     push_resolved(
         client,
+        files,
         input.strategy,
         tracked,
         note,
-        remote_note.last_changed_at,
-        remote,
+        remote_note,
         local,
     )
     .await
@@ -162,13 +162,20 @@ fn validate_body_size(size_bytes: usize, confirmed: bool) -> Result<(), PushNote
 
 async fn push_resolved(
     client: &HackmdClient,
+    files: &LocalFiles,
     strategy: PushStrategy,
     tracked: crate::sync::state::LoadedTrackedState,
     note: crate::note::reference::ResolvedNoteRef,
-    remote_timestamp: Option<i64>,
-    remote: String,
+    remote_note: crate::dto::NoteResponse,
     local: String,
 ) -> Result<Result<PushNoteOutput, NoteResolution>, PushNoteError> {
+    let remote_timestamp = remote_note.last_changed_at;
+    let remote = remote_note
+        .content
+        .ok_or_else(|| PushNoteError::MissingRemoteContent {
+            note_id: note.note_id.clone(),
+        })?;
+
     // Every result reports the tracked canonical path, not the caller's
     // spelling of it, so the snapshot path here is the one
     // hackmd_save_remote_snapshot would write.
@@ -187,6 +194,13 @@ async fn push_resolved(
             };
             return Ok(Ok(output(&target, status, false)));
         }
+
+        // The remote body was read once, in push_note, and only local string
+        // comparisons have happened since. A second read here would observe the
+        // same instant at the cost of another round trip, and it could not
+        // close the window that matters anyway: HackMD has no conditional
+        // write, so an edit landing between this check and the PATCH below is
+        // overwritten either way.
         if remote != tracked.baseline_body {
             return Ok(Ok(conflict_output(
                 &target,
@@ -195,23 +209,9 @@ async fn push_resolved(
                 &remote,
             )));
         }
-
-        // Last look before writing. This narrows the window in which a
-        // concurrent editor is clobbered but cannot close it: HackMD offers no
-        // conditional write, so a remote edit landing between this read and the
-        // PATCH below is still overwritten.
-        let recheck = client.get_note(&note.workspace, &note.note_id).await?;
-        if recheck.content.as_deref() != Some(tracked.baseline_body.as_str()) {
-            return Ok(Ok(conflict_output(
-                &target,
-                &tracked.baseline_body,
-                &local,
-                recheck.content.as_deref().unwrap_or_default(),
-            )));
-        }
     } else if remote == local {
         let result = output(&target, PushStatus::NothingToPush, false);
-        advance_state(client, tracked.state, &local, remote_timestamp)?;
+        advance_state(files, tracked.state, &local, remote_timestamp)?;
         return Ok(Ok(result));
     }
     client
@@ -235,12 +235,7 @@ async fn push_resolved(
         });
     }
     let result = output(&target, PushStatus::Pushed, true);
-    advance_state(
-        client,
-        tracked.state,
-        &local,
-        readback.value.last_changed_at,
-    )?;
+    advance_state(files, tracked.state, &local, readback.value.last_changed_at)?;
     Ok(Ok(result))
 }
 
@@ -309,13 +304,13 @@ fn conflict_diff(baseline: &str, local: &str, remote: &str) -> String {
 }
 
 fn advance_state(
-    client: &HackmdClient,
+    files: &LocalFiles,
     state: TrackedNoteState,
     body: &str,
     remote_timestamp: Option<i64>,
 ) -> Result<(), PushNoteError> {
     let state = state.advance(body, remote_timestamp)?;
-    client.state().persist_from_sync(&state, body)?;
+    files.state().persist_from_sync(&state, body)?;
     Ok(())
 }
 
@@ -346,15 +341,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn safe_push_rechecks_patches_reads_back_and_advances_baseline() {
+    async fn a_push_that_never_becomes_visible_is_an_error() {
+        const BASELINE: &str = r#"{"id":"note-id","title":"Note","content":"baseline"}"#;
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "local edit").expect("local fixture should write");
+        // Read, PATCH, then read-backs that keep showing the old body.
         let fixture = crate::fixture::SequenceServer::spawn([
-            (
-                200,
-                r#"{"id":"note-id","title":"Note","content":"baseline"}"#,
-            ),
+            (200, BASELINE),
+            (202, ""),
+            (200, BASELINE),
+            (200, BASELINE),
+            (200, BASELINE),
+            (200, BASELINE),
+            (200, BASELINE),
+        ]);
+        let client = fixture.client();
+        let files = crate::fixture::SequenceServer::tracked_files(
+            directory.path(),
+            "note-id",
+            &local_path,
+            "baseline",
+        );
+
+        assert!(matches!(
+            push_note(
+                &client,
+                &files,
+                input(&local_path, PushStrategy::Safe, false)
+            )
+            .await,
+            Err(PushNoteError::ReadbackMismatch { .. })
+        ));
+        // The baseline must not advance to a body HackMD never confirmed.
+        let loaded = files
+            .state()
+            .load_for_local_path(&local_path)
+            .expect("state should still load");
+        assert_eq!(loaded.baseline_body, "baseline");
+    }
+
+    #[tokio::test]
+    async fn safe_push_patches_reads_back_and_advances_baseline() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "local edit").expect("local fixture should write");
+
+        // One read, one PATCH, one read-back: the safe strategy compares
+        // against the body it already fetched rather than fetching it twice.
+        let fixture = crate::fixture::SequenceServer::spawn([
             (
                 200,
                 r#"{"id":"note-id","title":"Note","content":"baseline"}"#,
@@ -365,18 +400,28 @@ mod tests {
                 r#"{"id":"note-id","title":"Note","content":"local edit","lastChangedAt":2}"#,
             ),
         ]);
-        let client = fixture.tracked_client(directory.path(), "note-id", &local_path, "baseline");
-        let output = push_note(&client, input(&local_path, PushStrategy::Safe, false))
-            .await
-            .expect("safe push should succeed")
-            .expect("direct note should resolve");
+        let client = fixture.client();
+        let files = crate::fixture::SequenceServer::tracked_files(
+            directory.path(),
+            "note-id",
+            &local_path,
+            "baseline",
+        );
+        let output = push_note(
+            &client,
+            &files,
+            input(&local_path, PushStrategy::Safe, false),
+        )
+        .await
+        .expect("safe push should succeed")
+        .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::Pushed);
         assert!(output.pushed);
         let requests = fixture.finish();
-        assert_eq!(requests.len(), 4);
-        assert!(requests[2].starts_with("PATCH /v1/notes/note-id HTTP/1.1\r\n"));
-        assert!(requests[2].ends_with(r#"{"content":"local edit"}"#));
-        let loaded = client
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].starts_with("PATCH /v1/notes/note-id HTTP/1.1\r\n"));
+        assert!(requests[1].ends_with(r#"{"content":"local edit"}"#));
+        let loaded = files
             .state()
             .load_for_local_path(&local_path)
             .expect("advanced state should load");
@@ -395,11 +440,21 @@ mod tests {
             200,
             r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
         )]);
-        let client = fixture.tracked_client(directory.path(), "note-id", &local_path, "baseline");
-        let output = push_note(&client, input(&local_path, PushStrategy::Safe, false))
-            .await
-            .expect("comparison should succeed")
-            .expect("direct note should resolve");
+        let client = fixture.client();
+        let files = crate::fixture::SequenceServer::tracked_files(
+            directory.path(),
+            "note-id",
+            &local_path,
+            "baseline",
+        );
+        let output = push_note(
+            &client,
+            &files,
+            input(&local_path, PushStrategy::Safe, false),
+        )
+        .await
+        .expect("comparison should succeed")
+        .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::Conflict);
         assert!(!output.pushed);
         assert!(
@@ -442,11 +497,21 @@ mod tests {
             200,
             r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
         )]);
-        let client = fixture.tracked_client(directory.path(), "note-id", &local_path, "baseline");
-        let output = push_note(&client, input(&local_path, PushStrategy::Safe, false))
-            .await
-            .expect("comparison should succeed")
-            .expect("direct note should resolve");
+        let client = fixture.client();
+        let files = crate::fixture::SequenceServer::tracked_files(
+            directory.path(),
+            "note-id",
+            &local_path,
+            "baseline",
+        );
+        let output = push_note(
+            &client,
+            &files,
+            input(&local_path, PushStrategy::Safe, false),
+        )
+        .await
+        .expect("comparison should succeed")
+        .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::RemoteChanged);
         assert_eq!(fixture.finish().len(), 1);
     }
@@ -460,11 +525,21 @@ mod tests {
             200,
             r#"{"id":"note-id","title":"Note","content":"baseline"}"#,
         )]);
-        let client = fixture.tracked_client(directory.path(), "note-id", &local_path, "baseline");
-        let output = push_note(&client, input(&local_path, PushStrategy::Safe, false))
-            .await
-            .expect("comparison should succeed")
-            .expect("direct note should resolve");
+        let client = fixture.client();
+        let files = crate::fixture::SequenceServer::tracked_files(
+            directory.path(),
+            "note-id",
+            &local_path,
+            "baseline",
+        );
+        let output = push_note(
+            &client,
+            &files,
+            input(&local_path, PushStrategy::Safe, false),
+        )
+        .await
+        .expect("comparison should succeed")
+        .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::NothingToPush);
         assert!(!output.pushed);
         assert_eq!(fixture.finish().len(), 1);
@@ -476,8 +551,14 @@ mod tests {
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "local").expect("local fixture should write");
         let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        let files = crate::local::LocalFiles::new(directory.path().join("state"), None);
         assert!(matches!(
-            push_note(&client, input(&local_path, PushStrategy::Overwrite, false)).await,
+            push_note(
+                &client,
+                &files,
+                input(&local_path, PushStrategy::Overwrite, false)
+            )
+            .await,
             Err(PushNoteError::OverwriteConfirmationRequired)
         ));
     }
@@ -498,11 +579,21 @@ mod tests {
                 r#"{"id":"note-id","title":"Note","content":"forced local","lastChangedAt":3}"#,
             ),
         ]);
-        let client = fixture.tracked_client(directory.path(), "note-id", &local_path, "baseline");
-        let output = push_note(&client, input(&local_path, PushStrategy::Overwrite, true))
-            .await
-            .expect("overwrite should succeed")
-            .expect("direct note should resolve");
+        let client = fixture.client();
+        let files = crate::fixture::SequenceServer::tracked_files(
+            directory.path(),
+            "note-id",
+            &local_path,
+            "baseline",
+        );
+        let output = push_note(
+            &client,
+            &files,
+            input(&local_path, PushStrategy::Overwrite, true),
+        )
+        .await
+        .expect("overwrite should succeed")
+        .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::Pushed);
         let requests = fixture.finish();
         assert!(requests[1].starts_with("PATCH /v1/notes/note-id HTTP/1.1\r\n"));

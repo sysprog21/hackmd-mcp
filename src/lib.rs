@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod dto;
 mod folders;
+mod local;
 mod models;
 mod note;
 mod observability;

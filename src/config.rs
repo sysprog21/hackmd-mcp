@@ -17,8 +17,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRIES: u8 = 3;
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
-const SUPPORTED_ENV_KEYS: [&str; 3] =
-    ["HACKMD_API_TOKEN", "HACKMD_API_URL", "HACKMD_MCP_STATE_DIR"];
+const SUPPORTED_ENV_KEYS: [&str; 4] = [
+    "HACKMD_API_TOKEN",
+    "HACKMD_API_URL",
+    "HACKMD_MCP_STATE_DIR",
+    "HACKMD_MCP_WORKSPACE_ROOT",
+];
 
 /// Application configuration loaded from the local process environment.
 #[derive(Debug)]
@@ -29,6 +33,7 @@ pub(crate) struct Config {
     connect_timeout: Duration,
     retry: RetryConfig,
     state_dir: PathBuf,
+    workspace_root: Option<PathBuf>,
 }
 
 impl Config {
@@ -69,6 +74,9 @@ impl Config {
         let state_dir = get("HACKMD_MCP_STATE_DIR")
             .filter(|path| !path.trim().is_empty())
             .map_or_else(default_state_dir, |path| Ok(PathBuf::from(path)))?;
+        let workspace_root = get("HACKMD_MCP_WORKSPACE_ROOT")
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from);
 
         let api_url = Url::parse(&api_url).map_err(ConfigError::InvalidApiUrl)?;
         validate_api_url(&api_url, policy)?;
@@ -80,6 +88,7 @@ impl Config {
             connect_timeout: CONNECT_TIMEOUT,
             retry: RetryConfig::default(),
             state_dir,
+            workspace_root,
         })
     }
 
@@ -107,6 +116,12 @@ impl Config {
         &self.state_dir
     }
 
+    /// Optional tree the local sync tools are confined to. `None` keeps the
+    /// original behavior of accepting any absolute path.
+    pub(crate) fn workspace_root(&self) -> Option<&Path> {
+        self.workspace_root.as_deref()
+    }
+
     pub(crate) const fn retry(&self) -> RetryConfig {
         self.retry
     }
@@ -131,17 +146,6 @@ impl Config {
             _ => None,
         })
         .expect("loopback test URL must be valid")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_loopback_test_with_state(
-        api_url: &str,
-        token: &str,
-        state_dir: &Path,
-    ) -> Self {
-        let mut config = Self::for_loopback_test(api_url, Some(token));
-        config.state_dir = state_dir.to_path_buf();
-        config
     }
 
     #[cfg(test)]
@@ -228,8 +232,35 @@ fn load_dotenv(path: &Path) -> HashMap<String, String> {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return HashMap::new();
     };
+    warn_if_readable_by_others(path);
 
     contents.lines().filter_map(parse_dotenv_line).collect()
+}
+
+/// The `.env` this just read holds an API token. Its permissions are the user's
+/// to set, but a file every local account can read is worth one line on stderr,
+/// which is the only moment anyone will look.
+fn warn_if_readable_by_others(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return;
+        };
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                path = %path.display(),
+                mode = format!("{:o}", mode & 0o777),
+                "dotenv file is readable by other accounts; chmod 600 it"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 fn parse_dotenv_line(line: &str) -> Option<(String, String)> {

@@ -412,7 +412,7 @@ mod tests {
         assert!(output.compatibility_patch_applied);
         let requests = server.finish();
         assert!(requests[0].starts_with("POST /v1/notes HTTP/1.1\r\n"));
-        assert!(requests[0].ends_with(r#"{"parentFolderId":"folder-id","title":"New"}"#));
+        assert!(requests[0].ends_with(r#"{"title":"New","parentFolderId":"folder-id"}"#));
         assert!(requests[1].starts_with("GET /v1/notes/new-id HTTP/1.1\r\n"));
         assert!(requests[2].starts_with("PATCH /v1/notes/new-id HTTP/1.1\r\n"));
         assert!(requests[2].ends_with(r#"{"parentFolderId":"folder-id"}"#));

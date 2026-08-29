@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
+    local::{LocalAccessError, LocalFiles},
     sync::state::{StateError, write_local_atomic},
 };
 
@@ -27,6 +28,8 @@ pub(crate) struct SaveRemoteSnapshotOutput {
 
 #[derive(Debug, Error)]
 pub(crate) enum SaveRemoteSnapshotError {
+    #[error(transparent)]
+    Access(#[from] LocalAccessError),
     #[error("local_path must be absolute")]
     RelativePath,
     #[error("remote snapshot already exists; retry with overwrite_snapshot: true")]
@@ -41,12 +44,14 @@ pub(crate) enum SaveRemoteSnapshotError {
 
 pub(crate) async fn save_remote_snapshot(
     client: &HackmdClient,
+    files: &LocalFiles,
     input: SaveRemoteSnapshotInput,
 ) -> Result<SaveRemoteSnapshotOutput, SaveRemoteSnapshotError> {
     if !input.local_path.is_absolute() {
         return Err(SaveRemoteSnapshotError::RelativePath);
     }
-    let tracked = client.state().load_for_local_path(&input.local_path)?;
+    files.allow(&input.local_path)?;
+    let tracked = files.state().load_for_local_path(&input.local_path)?;
     let snapshot_path = tracked.state.local_path.with_extension("remote.md");
     if snapshot_path.exists() && !input.overwrite_snapshot {
         return Err(SaveRemoteSnapshotError::SnapshotExists);
@@ -81,10 +86,17 @@ mod tests {
             (200, r#"{"id":"id","title":"Note","content":"remote one"}"#),
             (200, r#"{"id":"id","title":"Note","content":"remote two"}"#),
         ]);
-        let client = fixture.tracked_client(directory.path(), "id", &local_path, "baseline");
+        let client = fixture.client();
+        let files = crate::fixture::SequenceServer::tracked_files(
+            directory.path(),
+            "id",
+            &local_path,
+            "baseline",
+        );
 
         let output = save_remote_snapshot(
             &client,
+            &files,
             SaveRemoteSnapshotInput {
                 local_path: local_path.clone(),
                 overwrite_snapshot: false,
@@ -104,6 +116,7 @@ mod tests {
         assert!(matches!(
             save_remote_snapshot(
                 &client,
+                &files,
                 SaveRemoteSnapshotInput {
                     local_path: local_path.clone(),
                     overwrite_snapshot: false,
@@ -114,6 +127,7 @@ mod tests {
         ));
         save_remote_snapshot(
             &client,
+            &files,
             SaveRemoteSnapshotInput {
                 local_path: local_path.clone(),
                 overwrite_snapshot: true,

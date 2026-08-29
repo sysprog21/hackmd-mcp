@@ -73,6 +73,11 @@ Cross-cutting pieces:
   collections, so filtering, sorting, and paging all happen locally.
 - `client::poll_readback` absorbs `HackMD`'s asynchronous write visibility. Any read-back after
   a write goes through it rather than trusting a single immediate GET.
+- `local::LocalFiles` owns everything on this machine: the `StateStore` and the optional
+  `HACKMD_MCP_WORKSPACE_ROOT` confinement. The server constructs it and passes it to the
+  five tools that touch local paths; `HackmdClient` is HTTP only and knows nothing about
+  the filesystem. Any new tool that accepts a caller-supplied path calls `files.allow`
+  before doing anything else.
 - `observability.rs` sends JSON tracing to stderr only. Stdout belongs to the MCP transport;
   a stray `println!` corrupts the protocol and `tests/stdio.rs` will catch it.
 

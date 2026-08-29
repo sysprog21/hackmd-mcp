@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
+    local::{LocalAccessError, LocalFiles},
     sync::state::{StateError, body_hash, timestamp_text},
 };
 
@@ -38,6 +39,8 @@ pub(crate) struct CheckNoteSyncOutput {
 
 #[derive(Debug, Error)]
 pub(crate) enum CheckNoteSyncError {
+    #[error(transparent)]
+    Access(#[from] LocalAccessError),
     #[error("local_path must be absolute")]
     RelativePath,
     #[error("local Markdown file could not be read")]
@@ -52,13 +55,15 @@ pub(crate) enum CheckNoteSyncError {
 
 pub(crate) async fn check_note_sync(
     client: &HackmdClient,
+    files: &LocalFiles,
     input: CheckNoteSyncInput,
 ) -> Result<CheckNoteSyncOutput, CheckNoteSyncError> {
     if !input.local_path.is_absolute() {
         return Err(CheckNoteSyncError::RelativePath);
     }
+    files.allow(&input.local_path)?;
     let local = fs::read_to_string(&input.local_path).map_err(|_| CheckNoteSyncError::LocalRead)?;
-    let tracked = client.state().load_for_local_path(&input.local_path)?;
+    let tracked = files.state().load_for_local_path(&input.local_path)?;
     let remote_note = client
         .get_note(&tracked.state.workspace, &tracked.state.internal_id)
         .await?;
@@ -116,7 +121,13 @@ mod tests {
                 r#"{"id":"id","title":"Note","content":"remote","lastChangedAt":2}"#,
             ),
         ]);
-        let client = fixture.tracked_client(directory.path(), "id", &local_path, "baseline");
+        let client = fixture.client();
+        let files = crate::fixture::SequenceServer::tracked_files(
+            directory.path(),
+            "id",
+            &local_path,
+            "baseline",
+        );
 
         let mut statuses = Vec::new();
         for (local, expected) in [
@@ -128,6 +139,7 @@ mod tests {
             fs::write(&local_path, local).expect("local fixture should update");
             let output = check_note_sync(
                 &client,
+                &files,
                 CheckNoteSyncInput {
                     local_path: local_path.clone(),
                 },

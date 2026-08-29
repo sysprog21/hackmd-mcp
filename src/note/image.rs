@@ -1,4 +1,8 @@
-use std::path::PathBuf;
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -6,6 +10,7 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
+    local::{LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
 };
@@ -33,10 +38,14 @@ pub(crate) struct UploadNoteImageOutput {
 
 #[derive(Debug, Error)]
 pub(crate) enum UploadNoteImageError {
+    #[error(transparent)]
+    Access(#[from] LocalAccessError),
     #[error("image_path must be absolute")]
     RelativePath,
     #[error("image_path is not a readable regular file")]
     InvalidFile,
+    #[error("image_path is not a PNG, JPEG, GIF, or WebP image")]
+    UnsupportedFormat,
     #[error(
         "image is {size_bytes} bytes; files above {} MiB are refused",
         IMAGE_MAX_BYTES / 1024 / 1024
@@ -55,13 +64,44 @@ pub(crate) enum UploadNoteImageError {
     Api(#[from] HackmdError),
 }
 
+/// Reads the file's magic bytes.
+///
+/// The tool hands a local file to a remote CDN that answers with a public link,
+/// so the file has to be what the caller says it is. Without this, one confused
+/// or coerced tool call publishes a private key as readily as a screenshot.
+fn is_image(path: &Path) -> Result<bool, UploadNoteImageError> {
+    let mut header = [0_u8; 12];
+    let mut file = File::open(path).map_err(|_| UploadNoteImageError::InvalidFile)?;
+    let read = read_header(&mut file, &mut header)?;
+    let header = &header[..read];
+    Ok(header.starts_with(b"\x89PNG\r\n\x1a\n")
+        || header.starts_with(b"\xff\xd8\xff")
+        || header.starts_with(b"GIF87a")
+        || header.starts_with(b"GIF89a")
+        || (header.len() == 12 && header.starts_with(b"RIFF") && &header[8..12] == b"WEBP"))
+}
+
+fn read_header(file: &mut File, header: &mut [u8]) -> Result<usize, UploadNoteImageError> {
+    let mut filled = 0;
+    while filled < header.len() {
+        match file.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(_) => return Err(UploadNoteImageError::InvalidFile),
+        }
+    }
+    Ok(filled)
+}
+
 pub(crate) async fn upload_note_image(
     client: &HackmdClient,
+    files: &LocalFiles,
     input: UploadNoteImageInput,
 ) -> Result<Result<UploadNoteImageOutput, NoteResolution>, UploadNoteImageError> {
     if !input.image_path.is_absolute() {
         return Err(UploadNoteImageError::RelativePath);
     }
+    files.allow(&input.image_path)?;
     let metadata =
         std::fs::metadata(&input.image_path).map_err(|_| UploadNoteImageError::InvalidFile)?;
     if !metadata.is_file() {
@@ -73,6 +113,9 @@ pub(crate) async fn upload_note_image(
     }
     if size_bytes > IMAGE_WARNING_BYTES && !input.confirm_large_file {
         return Err(UploadNoteImageError::ConfirmationRequired { size_bytes });
+    }
+    if !is_image(&input.image_path)? {
+        return Err(UploadNoteImageError::UnsupportedFormat);
     }
     let resolution =
         crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
@@ -100,14 +143,20 @@ mod tests {
         IMAGE_MAX_BYTES, IMAGE_WARNING_BYTES, UploadNoteImageError, UploadNoteImageInput,
         upload_note_image,
     };
+
+    /// Local access with no configured root, matching the default deployment.
+    fn files() -> crate::local::LocalFiles {
+        crate::local::LocalFiles::new(std::env::temp_dir().join("hackmd-mcp-test"), None)
+    }
+
+    /// A PNG signature followed by a marker the multipart assertions can find.
+    const PNG_FIXTURE: &[u8] = b"\x89PNG\r\n\x1a\nfixture-image";
     use crate::{client::HackmdClient, config::Config, models::Workspace};
 
     #[tokio::test]
     async fn uploads_streaming_multipart_and_returns_only_link() {
         let mut image = tempfile::NamedTempFile::new().expect("temp image should create");
-        image
-            .write_all(b"fixture-image")
-            .expect("image should write");
+        image.write_all(PNG_FIXTURE).expect("image should write");
         let fixture = crate::fixture::SequenceServer::spawn([(
             201,
             r#"{"data":{"link":"https://hackmd.io/_uploads/image.png"}}"#,
@@ -115,6 +164,7 @@ mod tests {
         let client = fixture.client();
         let output = upload_note_image(
             &client,
+            &files(),
             UploadNoteImageInput {
                 workspace: Workspace::Personal,
                 note_ref: "note/id".to_owned(),
@@ -134,6 +184,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refuses_to_upload_a_file_that_is_not_an_image() {
+        let mut secret = tempfile::NamedTempFile::new().expect("temp file should create");
+        secret
+            .write_all(b"-----BEGIN OPENSSH PRIVATE KEY-----\n")
+            .expect("file should write");
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        let input = UploadNoteImageInput {
+            workspace: Workspace::Personal,
+            note_ref: "note-id".to_owned(),
+            image_path: secret.path().to_path_buf(),
+            confirm_large_file: false,
+        };
+
+        // Rejected before the note reference is resolved, so nothing leaves the
+        // machine and no request is made.
+        assert!(matches!(
+            upload_note_image(&client, &files(), input).await,
+            Err(UploadNoteImageError::UnsupportedFormat)
+        ));
+    }
+
+    #[tokio::test]
     async fn rejects_relative_team_and_oversize_inputs_before_upload() {
         let client = HackmdClient::new(Config::for_tests()).expect("client should build");
         let relative = serde_json::from_value(json!({
@@ -142,7 +214,7 @@ mod tests {
         }))
         .expect("input should deserialize");
         assert!(matches!(
-            upload_note_image(&client, relative).await,
+            upload_note_image(&client, &files(), relative).await,
             Err(UploadNoteImageError::RelativePath)
         ));
 
@@ -158,7 +230,7 @@ mod tests {
             confirm_large_file: true,
         };
         assert!(matches!(
-            upload_note_image(&client, input).await,
+            upload_note_image(&client, &files(), input).await,
             Err(UploadNoteImageError::TooLarge { .. })
         ));
 
@@ -174,11 +246,14 @@ mod tests {
             confirm_large_file: false,
         };
         assert!(matches!(
-            upload_note_image(&client, warning_input).await,
+            upload_note_image(&client, &files(), warning_input).await,
             Err(UploadNoteImageError::ConfirmationRequired { .. })
         ));
 
-        let team_image = tempfile::NamedTempFile::new().expect("temp image should create");
+        let mut team_image = tempfile::NamedTempFile::new().expect("temp image should create");
+        team_image
+            .write_all(PNG_FIXTURE)
+            .expect("image should write");
         let team_input = UploadNoteImageInput {
             workspace: Workspace::Team {
                 team_path: "core".to_owned(),
@@ -188,18 +263,20 @@ mod tests {
             confirm_large_file: false,
         };
         assert!(matches!(
-            upload_note_image(&client, team_input).await,
+            upload_note_image(&client, &files(), team_input).await,
             Err(UploadNoteImageError::TeamUnsupported)
         ));
     }
 
     #[tokio::test]
     async fn payload_too_large_has_a_resize_hint() {
-        let image = tempfile::NamedTempFile::new().expect("temp image should create");
+        let mut image = tempfile::NamedTempFile::new().expect("temp image should create");
+        image.write_all(PNG_FIXTURE).expect("image should write");
         let fixture = crate::fixture::SequenceServer::spawn([(413, r#"{"error":"too large"}"#)]);
         let client = fixture.client();
         let error = upload_note_image(
             &client,
+            &files(),
             UploadNoteImageInput {
                 workspace: Workspace::Personal,
                 note_ref: "id".to_owned(),

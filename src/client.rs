@@ -1,5 +1,5 @@
 use reqwest::{Method, StatusCode};
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::{
@@ -17,7 +17,6 @@ use crate::{
         UpdateNoteRequest,
     },
     models::Workspace,
-    sync::state::StateStore,
 };
 
 /// HTTP client shared by all `HackMD` tool handlers.
@@ -25,7 +24,6 @@ use crate::{
 pub(crate) struct HackmdClient {
     config: Config,
     http: reqwest::Client,
-    state: StateStore,
 }
 
 impl HackmdClient {
@@ -35,20 +33,11 @@ impl HackmdClient {
             .timeout(config.request_timeout())
             .build()
             .map_err(|_| HackmdError::ClientBuild)?;
-        let state = StateStore::new(config.state_dir().to_path_buf());
-        Ok(Self {
-            config,
-            http,
-            state,
-        })
+        Ok(Self { config, http })
     }
 
     pub(crate) fn has_api_token(&self) -> bool {
         self.config.has_api_token()
-    }
-
-    pub(crate) fn state(&self) -> &StateStore {
-        &self.state
     }
 
     pub(crate) async fn get_me(&self) -> Result<ProfileResponse, HackmdError> {
@@ -91,7 +80,7 @@ impl HackmdClient {
     }
 
     pub(crate) async fn restore_note(&self, note_id: &str) -> Result<Option<Value>, HackmdError> {
-        self.request_json_idempotent(Method::PUT, &["trash", note_id, "restore"], None)
+        self.request_json_idempotent(Method::PUT, &["trash", note_id, "restore"], None::<&Value>)
             .await
     }
 
@@ -118,8 +107,7 @@ impl HackmdClient {
         payload: &CreateNoteRequest,
     ) -> Result<NoteResponse, HackmdError> {
         let segments = workspace_route(workspace, &["notes"]);
-        let body = to_json(payload)?;
-        self.request_required(Method::POST, &segments, Some(&body))
+        self.request_required(Method::POST, &segments, Some(payload))
             .await
     }
 
@@ -130,8 +118,7 @@ impl HackmdClient {
         payload: &UpdateNoteRequest,
     ) -> Result<Option<NoteResponse>, HackmdError> {
         let segments = workspace_route(workspace, &["notes", note_id]);
-        let body = to_json(payload)?;
-        self.request_json_idempotent(Method::PATCH, &segments, Some(&body))
+        self.request_json_idempotent(Method::PATCH, &segments, Some(payload))
             .await
     }
 
@@ -141,7 +128,8 @@ impl HackmdClient {
         note_id: &str,
     ) -> Result<Option<Value>, HackmdError> {
         let segments = workspace_route(workspace, &["notes", note_id]);
-        self.request_json(Method::DELETE, &segments, None).await
+        self.request_json(Method::DELETE, &segments, None::<&Value>)
+            .await
     }
 
     pub(crate) async fn list_folders(
@@ -167,8 +155,7 @@ impl HackmdClient {
         payload: &CreateFolderRequest,
     ) -> Result<FolderResponse, HackmdError> {
         let segments = workspace_route(workspace, &["folders"]);
-        let body = to_json(payload)?;
-        self.request_required(Method::POST, &segments, Some(&body))
+        self.request_required(Method::POST, &segments, Some(payload))
             .await
     }
 
@@ -179,8 +166,7 @@ impl HackmdClient {
         payload: &UpdateFolderRequest,
     ) -> Result<Option<FolderResponse>, HackmdError> {
         let segments = workspace_route(workspace, &["folders", folder_id]);
-        let body = to_json(payload)?;
-        self.request_json_idempotent(Method::PATCH, &segments, Some(&body))
+        self.request_json_idempotent(Method::PATCH, &segments, Some(payload))
             .await
     }
 
@@ -190,7 +176,8 @@ impl HackmdClient {
         folder_id: &str,
     ) -> Result<Option<Value>, HackmdError> {
         let segments = workspace_route(workspace, &["folders", folder_id]);
-        self.request_json(Method::DELETE, &segments, None).await
+        self.request_json(Method::DELETE, &segments, None::<&Value>)
+            .await
     }
 
     pub(crate) async fn get_folder_order(
@@ -266,7 +253,8 @@ impl HackmdClient {
 
     /// Issues a GET whose response body is mandatory.
     async fn get_required<T: DeserializeOwned>(&self, segments: &[&str]) -> Result<T, HackmdError> {
-        self.request_required(Method::GET, segments, None).await
+        self.request_required(Method::GET, segments, None::<&Value>)
+            .await
     }
 
     /// Issues a request that must answer with a JSON body, turning `HackMD`'s
@@ -275,7 +263,7 @@ impl HackmdClient {
         &self,
         method: Method,
         segments: &[&str],
-        body: Option<&Value>,
+        body: Option<&(impl Serialize + Sync)>,
     ) -> Result<T, HackmdError> {
         match self.request_json(method.clone(), segments, body).await? {
             Some(value) => Ok(value),
@@ -293,7 +281,7 @@ impl HackmdClient {
         &self,
         method: Method,
         path_segments: &[&str],
-        body: Option<&Value>,
+        body: Option<&(impl Serialize + Sync)>,
     ) -> Result<Option<T>, HackmdError> {
         let retryable = method == Method::GET;
         self.request_json_with_retry(method, path_segments, body, retryable)
@@ -309,7 +297,7 @@ impl HackmdClient {
         &self,
         method: Method,
         path_segments: &[&str],
-        body: Option<&Value>,
+        body: Option<&(impl Serialize + Sync)>,
     ) -> Result<Option<T>, HackmdError> {
         self.request_json_with_retry(method, path_segments, body, true)
             .await
@@ -319,7 +307,7 @@ impl HackmdClient {
         &self,
         method: Method,
         path_segments: &[&str],
-        body: Option<&Value>,
+        body: Option<&(impl Serialize + Sync)>,
         retryable: bool,
     ) -> Result<Option<T>, HackmdError> {
         let url = self.url_for_segments(path_segments)?;
@@ -543,10 +531,6 @@ fn workspace_route<'a>(workspace: &'a Workspace, resource: &[&'a str]) -> Vec<&'
     }
 }
 
-fn to_json<T: serde::Serialize>(payload: &T) -> Result<Value, HackmdError> {
-    serde_json::to_value(payload).map_err(|_| HackmdError::InvalidPayload)
-}
-
 fn request_error(error: &reqwest::Error, method: String, path: String) -> HackmdError {
     if error.is_timeout() {
         HackmdError::Timeout { method, path }
@@ -671,8 +655,6 @@ pub(crate) enum HackmdError {
     InvalidBaseUrl,
     #[error("HackMD API path segments such as note IDs and team paths must not be empty")]
     EmptyPathSegment,
-    #[error("failed to serialize a validated HackMD request payload")]
-    InvalidPayload,
     #[error("image file could not be opened for upload")]
     ImageRead,
     #[error(
@@ -773,7 +755,7 @@ mod tests {
             .request_json::<Value>(
                 Method::GET,
                 &["teams", "team/path", "notes", "note ?#"],
-                None,
+                None::<&Value>,
             )
             .await
             .expect("fixture request should succeed")
@@ -830,7 +812,7 @@ mod tests {
             let server = SequenceServer::spawn([(status, "")]);
             let client = server.client_without_retry(FIXTURE_TOKEN);
             let response = client
-                .request_json::<Value>(Method::PATCH, &["notes", "id"], None)
+                .request_json::<Value>(Method::PATCH, &["notes", "id"], None::<&Value>)
                 .await
                 .expect("empty success should be accepted");
             assert_eq!(response, None);
@@ -911,7 +893,7 @@ mod tests {
             let server = SequenceServer::spawn([(status, r#"{"error":"fixture"}"#)]);
             let client = server.client_without_retry(FIXTURE_TOKEN);
             let error = client
-                .request_json::<Value>(Method::GET, &["notes", "id"], None)
+                .request_json::<Value>(Method::GET, &["notes", "id"], None::<&Value>)
                 .await
                 .expect_err("failure status should map to an error");
             let message = error.to_string();
@@ -940,7 +922,7 @@ mod tests {
         .expect("fixture client should build");
 
         let message = client
-            .request_json::<Value>(Method::GET, &["notes"], None)
+            .request_json::<Value>(Method::GET, &["notes"], None::<&Value>)
             .await
             .expect_err("429 should map to rate-limit detail")
             .to_string();
@@ -957,7 +939,7 @@ mod tests {
         let client = server.client_without_retry(TOKEN);
 
         let message = client
-            .request_json::<Value>(Method::GET, &["notes"], None)
+            .request_json::<Value>(Method::GET, &["notes"], None::<&Value>)
             .await
             .expect_err("503 should retain safe error detail")
             .to_string();
@@ -974,7 +956,7 @@ mod tests {
         let client = server.client_with_token(TOKEN);
 
         let message = client
-            .request_json::<Value>(Method::GET, &["notes"], None)
+            .request_json::<Value>(Method::GET, &["notes"], None::<&Value>)
             .await
             .expect_err("400 should map to a generic API error")
             .to_string();
@@ -991,7 +973,7 @@ mod tests {
         let client = server.client();
 
         let message = client
-            .request_json::<Value>(Method::GET, &["me"], None)
+            .request_json::<Value>(Method::GET, &["me"], None::<&Value>)
             .await
             .expect_err("invalid JSON should fail")
             .to_string();
@@ -1017,7 +999,7 @@ mod tests {
         .expect("network fixture client should build");
         assert!(matches!(
             network_client
-                .request_json::<Value>(Method::GET, &["me"], None)
+                .request_json::<Value>(Method::GET, &["me"], None::<&Value>)
                 .await,
             Err(HackmdError::Network { .. })
         ));
@@ -1033,7 +1015,7 @@ mod tests {
             HackmdClient::new(timeout_config).expect("timeout fixture client should build");
         assert!(matches!(
             timeout_client
-                .request_json::<Value>(Method::GET, &["me"], None)
+                .request_json::<Value>(Method::GET, &["me"], None::<&Value>)
                 .await,
             Err(HackmdError::Timeout { .. })
         ));
@@ -1045,7 +1027,7 @@ mod tests {
         let client = HackmdClient::new(Config::for_tests()).expect("test client should build");
         assert!(matches!(
             client
-                .request_json::<Value>(Method::GET, &["me"], None)
+                .request_json::<Value>(Method::GET, &["me"], None::<&Value>)
                 .await,
             Err(HackmdError::MissingToken { .. })
         ));
@@ -1056,7 +1038,7 @@ mod tests {
         let client = HackmdClient::new(Config::for_tests()).expect("test client should build");
         assert!(matches!(
             client
-                .request_json::<Value>(Method::GET, &["notes", "  "], None)
+                .request_json::<Value>(Method::GET, &["notes", "  "], None::<&Value>)
                 .await,
             Err(HackmdError::EmptyPathSegment)
         ));
@@ -1117,7 +1099,7 @@ mod tests {
         ))
         .expect("retry client should build");
         let response = get_client
-            .request_json::<Value>(Method::GET, &["retry"], None)
+            .request_json::<Value>(Method::GET, &["retry"], None::<&Value>)
             .await
             .expect("GET should recover")
             .expect("GET should return JSON");

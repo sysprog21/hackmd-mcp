@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use rmcp::{ServiceExt, tool_router};
 use rmcp::{handler::server::wrapper::Parameters, schemars, tool};
@@ -13,6 +13,7 @@ use crate::{
         CreateFolderInput, DeleteFolderInput, FolderRefInput, FolderWorkspaceInput,
         SetFolderOrderInput, UpdateFolderInput,
     },
+    local::LocalFiles,
     note::{
         crud::{CreateNoteInput, DeleteNoteInput, UpdateNoteInput},
         edit::EditNoteInput,
@@ -33,21 +34,31 @@ use crate::{
 #[derive(Debug, Clone)]
 pub(crate) struct HackmdServer {
     client: Arc<HackmdClient>,
+    /// Local storage and path policy. The client stays purely about HTTP.
+    files: Arc<LocalFiles>,
 }
 
 impl HackmdServer {
-    pub(crate) fn new(client: Arc<HackmdClient>) -> Self {
-        Self { client }
+    pub(crate) fn new(client: Arc<HackmdClient>, files: Arc<LocalFiles>) -> Self {
+        Self { client, files }
     }
 }
 
 pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Arc::new(HackmdClient::new(Config::from_env()?)?);
+    let config = Config::from_env()?;
+    let files = Arc::new(LocalFiles::new(
+        config.state_dir().to_path_buf(),
+        config.workspace_root().map(Path::to_path_buf),
+    ));
+    if let Some(root) = config.workspace_root() {
+        tracing::info!(root = %root.display(), "local file tools are confined to this tree");
+    }
+    let client = Arc::new(HackmdClient::new(config)?);
     if !client.has_api_token() {
         tracing::warn!("HACKMD_API_TOKEN is not set; API tools will return a configuration error");
     }
 
-    HackmdServer::new(client)
+    HackmdServer::new(client, files)
         .serve(rmcp::transport::stdio())
         .await?
         .waiting()
@@ -504,7 +515,7 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<UploadNoteImageInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::note::image::upload_note_image(&self.client, input).await {
+        match crate::note::image::upload_note_image(&self.client, &self.files, input).await {
             Ok(Ok(output)) => reply::success(
                 "Uploaded HackMD note image",
                 serde_json::to_value(output).expect("image-upload output should serialize"),
@@ -529,7 +540,7 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<PullNoteInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::sync::pull::pull_note(&self.client, input).await {
+        match crate::sync::pull::pull_note(&self.client, &self.files, input).await {
             Ok(Ok(output)) => reply::success(
                 format!("Pulled HackMD note {}", output.note_id),
                 serde_json::to_value(output).expect("pull output should serialize"),
@@ -554,7 +565,7 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<PushNoteInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::sync::push::push_note(&self.client, input).await {
+        match crate::sync::push::push_note(&self.client, &self.files, input).await {
             Ok(Ok(output)) => reply::success(
                 "Evaluated tracked HackMD note push",
                 serde_json::to_value(output).expect("push output should serialize"),
@@ -579,7 +590,7 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<CheckNoteSyncInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::sync::check::check_note_sync(&self.client, input).await {
+        match crate::sync::check::check_note_sync(&self.client, &self.files, input).await {
             Ok(output) => reply::success(
                 "Checked tracked HackMD note sync state",
                 serde_json::to_value(output).expect("sync-check output should serialize"),
@@ -603,7 +614,7 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<SaveRemoteSnapshotInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::sync::snapshot::save_remote_snapshot(&self.client, input).await {
+        match crate::sync::snapshot::save_remote_snapshot(&self.client, &self.files, input).await {
             Ok(output) => reply::success(
                 "Saved HackMD remote snapshot",
                 serde_json::to_value(output).expect("snapshot output should serialize"),
@@ -673,6 +684,15 @@ struct EmptyInput {}
 
 #[cfg(test)]
 mod tests {
+    /// Local access with no configured root: tool tests exercise the tools, not
+    /// the path policy, which has its own tests in `local`.
+    fn test_files() -> Arc<crate::local::LocalFiles> {
+        Arc::new(crate::local::LocalFiles::new(
+            std::env::temp_dir().join("hackmd-mcp-test"),
+            None,
+        ))
+    }
+
     use super::{EmptyInput, HackmdServer, profile_result, teams_result};
     use crate::client::HackmdClient;
     use crate::config::Config;
@@ -712,9 +732,10 @@ mod tests {
         tokio::task::JoinHandle<()>,
     ) {
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
-        let server = HackmdServer::new(Arc::new(
-            HackmdClient::new(config).expect("protocol-test client should build"),
-        ));
+        let server = HackmdServer::new(
+            Arc::new(HackmdClient::new(config).expect("protocol-test client should build")),
+            test_files(),
+        );
         let server_task = tokio::spawn(async move {
             server
                 .serve(server_transport)
@@ -748,7 +769,7 @@ mod tests {
         let client = Arc::new(
             HackmdClient::new(Config::for_tests()).expect("test client should be constructed"),
         );
-        let server = HackmdServer::new(Arc::clone(&client));
+        let server = HackmdServer::new(Arc::clone(&client), test_files());
 
         assert_eq!(Arc::strong_count(&client), 2);
         drop(server);
@@ -860,9 +881,12 @@ mod tests {
 
     #[tokio::test]
     async fn tool_call_reports_actionable_missing_token_error() {
-        let server = HackmdServer::new(Arc::new(
-            HackmdClient::new(Config::for_tests()).expect("test client should be constructed"),
-        ));
+        let server = HackmdServer::new(
+            Arc::new(
+                HackmdClient::new(Config::for_tests()).expect("test client should be constructed"),
+            ),
+            test_files(),
+        );
         let result = server
             .get_me(rmcp::handler::server::wrapper::Parameters(EmptyInput {}))
             .await;
@@ -941,9 +965,12 @@ mod tests {
 
     #[tokio::test]
     async fn update_tool_explains_create_only_permissions() {
-        let server = HackmdServer::new(Arc::new(
-            HackmdClient::new(Config::for_tests()).expect("test client should be constructed"),
-        ));
+        let server = HackmdServer::new(
+            Arc::new(
+                HackmdClient::new(Config::for_tests()).expect("test client should be constructed"),
+            ),
+            test_files(),
+        );
         let input = serde_json::from_value(json!({
             "note_ref": "id",
             "suggest_edit_permission": "owners"
@@ -969,7 +996,7 @@ mod tests {
             r#"{"id":"note-id","title":"Title","content":"old"}"#,
         )]);
         let client = fixture.client();
-        let server = HackmdServer::new(Arc::new(client));
+        let server = HackmdServer::new(Arc::new(client), test_files());
         let input = serde_json::from_value(json!({
             "note_ref": "note-id",
             "patch": "*** Begin Patch\n*** Update File: notes/other.md\n@@\n-old\n+new\n*** End Patch"
@@ -1040,7 +1067,7 @@ mod tests {
     fn server_handler_enables_tools_only() {
         let client =
             HackmdClient::new(Config::for_tests()).expect("test client should be constructed");
-        let info = HackmdServer::new(Arc::new(client)).get_info();
+        let info = HackmdServer::new(Arc::new(client), test_files()).get_info();
 
         assert!(info.capabilities.tools.is_some());
         assert!(info.capabilities.prompts.is_none());

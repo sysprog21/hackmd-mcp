@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
+    local::{LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
     sync::state::{StateError, TrackedNoteState, write_local_atomic},
@@ -42,6 +43,8 @@ pub(crate) struct PullNoteOutput {
 
 #[derive(Debug, Error)]
 pub(crate) enum PullNoteError {
+    #[error(transparent)]
+    Access(#[from] LocalAccessError),
     #[error("local_path must be absolute")]
     RelativePath,
     #[error("local_path points to a directory")]
@@ -75,8 +78,10 @@ pub(crate) enum PullNoteError {
 
 pub(crate) async fn pull_note(
     client: &HackmdClient,
+    files: &LocalFiles,
     input: PullNoteInput,
 ) -> Result<Result<PullNoteOutput, NoteResolution>, PullNoteError> {
+    files.allow(&input.local_path)?;
     let destination = validate_destination(&input)?;
     let allow_existing_destination = destination.exists() && input.overwrite_local;
     let resolution =
@@ -105,7 +110,7 @@ pub(crate) async fn pull_note(
         &body,
         remote.last_changed_at,
     )?;
-    client.state().persist_from_sync(&state, &body)?;
+    files.state().persist_from_sync(&state, &body)?;
     Ok(Ok(PullNoteOutput {
         workspace: note.workspace,
         note_id: note.note_id,
@@ -203,9 +208,34 @@ mod tests {
     use crate::{
         client::HackmdClient,
         config::Config,
+        local::LocalFiles,
         models::Workspace,
         sync::{BODY_MAX_BYTES, BODY_WARNING_BYTES},
     };
+
+    #[tokio::test]
+    async fn a_workspace_root_stops_a_write_outside_it() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let root = directory.path().join("notes");
+        fs::create_dir(&root).expect("root should create");
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        let files = LocalFiles::new(directory.path().join("state"), Some(root));
+        let input = PullNoteInput {
+            workspace: Workspace::Personal,
+            note_ref: "note-id".to_owned(),
+            local_path: directory.path().join("outside.md"),
+            overwrite_local: true,
+            create_parent_dirs: true,
+            confirm_large_file: false,
+        };
+
+        // Refused before the note is even resolved, so no request is made and
+        // nothing is written.
+        assert!(matches!(
+            pull_note(&client, &files, input).await,
+            Err(PullNoteError::Access(_))
+        ));
+    }
 
     #[tokio::test]
     async fn clean_pull_writes_exact_body_and_private_sync_state() {
@@ -216,14 +246,11 @@ mod tests {
             200,
             r##"{"id":"note/id","title":"Remote","content":"# Exact\n\nBody\n","lastChangedAt":123}"##,
         )]);
-        let client = HackmdClient::new(Config::for_loopback_test_with_state(
-            &fixture.api_url,
-            "fixture-token",
-            &state_dir,
-        ))
-        .expect("fixture client should build");
+        let client = fixture.client();
+        let files = LocalFiles::new(state_dir.clone(), None);
         let output = pull_note(
             &client,
+            &files,
             PullNoteInput {
                 workspace: Workspace::Personal,
                 note_ref: "note/id".to_owned(),
@@ -288,13 +315,14 @@ mod tests {
     #[tokio::test]
     async fn path_guards_fail_before_network_or_filesystem_mutation() {
         let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        let files = LocalFiles::new(std::env::temp_dir().join("hackmd-mcp-test"), None);
         let relative = serde_json::from_value(json!({
             "note_ref": "id",
             "local_path": "note.md"
         }))
         .expect("input should deserialize");
         assert!(matches!(
-            pull_note(&client, relative).await,
+            pull_note(&client, &files, relative).await,
             Err(PullNoteError::RelativePath)
         ));
 
@@ -310,7 +338,7 @@ mod tests {
             confirm_large_file: false,
         };
         assert!(matches!(
-            pull_note(&client, input).await,
+            pull_note(&client, &files, input).await,
             Err(PullNoteError::DestinationExists)
         ));
 
@@ -325,7 +353,7 @@ mod tests {
             confirm_large_file: false,
         };
         assert!(matches!(
-            pull_note(&client, input).await,
+            pull_note(&client, &files, input).await,
             Err(PullNoteError::ExistingNonMarkdown)
         ));
 
@@ -338,7 +366,7 @@ mod tests {
             confirm_large_file: false,
         };
         assert!(matches!(
-            pull_note(&client, input).await,
+            pull_note(&client, &files, input).await,
             Err(PullNoteError::DestinationDirectory)
         ));
 
@@ -352,7 +380,7 @@ mod tests {
             confirm_large_file: false,
         };
         assert!(matches!(
-            pull_note(&client, input).await,
+            pull_note(&client, &files, input).await,
             Err(PullNoteError::MissingParent)
         ));
         assert!(
