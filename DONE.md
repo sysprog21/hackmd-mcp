@@ -141,3 +141,9 @@
 - [x] Implement `hackmd_set_folder_order` as GET `folder-order`, replace only
   the requested parent entry (`root` for top level), and PUT the whole map back
   while preserving every unrelated key.
+- [x] Treat HackMD folder and note-move operations as asynchronous where
+  applicable: read back after accepted PATCH requests, and verify safe body
+  edits match the requested content.
+- [x] Create a note in a folder as POST followed by PATCH and read-back. Keep
+  the read-back regardless of whether a future live test permits dropping the
+  compatibility PATCH.

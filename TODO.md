@@ -190,11 +190,6 @@ test (see P3) for each and record the answer here.
   pagination as note lists. Mark restore non-destructive/idempotent; keep delete
   destructive. Describe delete according to whichever behavior the live test in
   "Contradictions" confirms. Mock both routes and their empty/accepted responses.
-- [ ] Treat HackMD folder operations as asynchronous where applicable: after a
-  note move or other `202` PATCH, read back to verify.
-- [ ] Create a note in a folder as POST followed by PATCH and read-back. Keep
-  the read-back regardless of how the POST-drops-`parentFolderId` question
-  resolves; drop only the extra PATCH if a live test proves POST assigns it.
 - [ ] Add `hackmd_upload_note_image` taking `workspace`, `note_ref`, and an
   absolute `image_path`; stream multipart data under field name `image`, warn
   through a tool error above 5 MB unless `confirm_large_file: true`, refuse above

@@ -160,7 +160,7 @@ pub(crate) async fn create_note(
     };
     payload.validate()?;
     client.ensure_team_exists(&input.workspace).await?;
-    let note = client.create_note(&input.workspace, &payload).await?;
+    let mut note = client.create_note(&input.workspace, &payload).await?;
     if let Some(folder_id) = folder.as_ref() {
         let placement = UpdateNoteRequest {
             parent_folder_id: Some(Some(folder_id.clone())),
@@ -169,6 +169,13 @@ pub(crate) async fn create_note(
         placement.validate()?;
         client
             .update_note(&input.workspace, &note.id, &placement)
+            .await
+            .map_err(|source| CrudError::FolderPlacement {
+                note_id: note.id.clone(),
+                source,
+            })?;
+        note = client
+            .get_note(&input.workspace, &note.id)
             .await
             .map_err(|source| CrudError::FolderPlacement {
                 note_id: note.id.clone(),
@@ -207,14 +214,15 @@ pub(crate) async fn update_note(
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
-    let response = client
+    client
         .update_note(&note.workspace, &note.note_id, &payload)
         .await?;
+    let response = client.get_note(&note.workspace, &note.note_id).await?;
     Ok(Ok(UpdateNoteOutput {
         workspace: note.workspace,
         note_id: note.note_id,
         accepted: true,
-        response,
+        response: Some(response),
     }))
 }
 
@@ -289,6 +297,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_update_is_read_back() {
+        let server =
+            SequenceServer::spawn([(202, ""), (200, r#"{"id":"note/id","title":"Updated"}"#)]);
+        let client = HackmdClient::new(Config::for_loopback_test(
+            &server.api_url,
+            Some("fixture-token"),
+        ))
+        .expect("fixture client should build");
+        let input = serde_json::from_value(json!({
+            "note_ref": "note/id",
+            "title": "Updated"
+        }))
+        .expect("update input should deserialize");
+        let output = update_note(&client, input)
+            .await
+            .expect("update should succeed")
+            .expect("direct reference should resolve");
+        assert_eq!(
+            output.response.expect("readback should exist").title,
+            "Updated"
+        );
+        let requests = server.finish();
+        assert!(requests[0].starts_with("PATCH /v1/notes/note%2Fid HTTP/1.1\r\n"));
+        assert!(requests[1].starts_with("GET /v1/notes/note%2Fid HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
     async fn invalid_payloads_fail_before_resolution_or_network() {
         let client = HackmdClient::new(Config::for_tests()).expect("client should build");
         let empty_update: UpdateNoteInput =
@@ -313,7 +348,14 @@ mod tests {
 
     #[tokio::test]
     async fn create_folder_placement_uses_post_then_patch() {
-        let server = SequenceServer::spawn([(201, r#"{"id":"new-id","title":"New"}"#), (202, "")]);
+        let server = SequenceServer::spawn([
+            (201, r#"{"id":"new-id","title":"New"}"#),
+            (202, ""),
+            (
+                200,
+                r#"{"id":"new-id","title":"New","folderPaths":[{"id":"folder-id","name":"Folder"}]}"#,
+            ),
+        ]);
         let client = HackmdClient::new(Config::for_loopback_test(
             &server.api_url,
             Some("fixture-token"),
@@ -336,6 +378,8 @@ mod tests {
         assert!(!requests[0].contains("parentFolderId"));
         assert!(requests[1].starts_with("PATCH /v1/notes/new-id HTTP/1.1\r\n"));
         assert!(requests[1].ends_with(r#"{"parentFolderId":"folder-id"}"#));
+        assert!(requests[2].starts_with("GET /v1/notes/new-id HTTP/1.1\r\n"));
+        assert_eq!(output.note.folder_paths[0].id, "folder-id");
     }
 
     #[tokio::test]

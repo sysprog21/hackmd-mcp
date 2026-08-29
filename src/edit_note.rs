@@ -41,6 +41,8 @@ pub(crate) enum EditNoteError {
     Patch(#[from] PatchError),
     #[error("GET returned note {note_id} without editable content")]
     MissingContent { note_id: String },
+    #[error("HackMD accepted the edit for note {note_id}, but read-back content did not match")]
+    ReadbackMismatch { note_id: String },
 }
 
 pub(crate) async fn edit_note(
@@ -72,6 +74,12 @@ pub(crate) async fn edit_note(
                 },
             )
             .await?;
+        let readback = client.get_note(&note.workspace, &note.note_id).await?;
+        if readback.content.as_deref() != Some(updated.as_str()) {
+            return Err(EditNoteError::ReadbackMismatch {
+                note_id: note.note_id,
+            });
+        }
     }
     Ok(Ok(EditNoteOutput {
         workspace: note.workspace,
@@ -111,6 +119,7 @@ mod tests {
         let server = SequenceServer::spawn([
             (200, r#"{"id":"note-id","title":"Title","content":"old\n"}"#),
             (202, ""),
+            (200, r#"{"id":"note-id","title":"Title","content":"new\n"}"#),
         ]);
         let patch =
             "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch";
@@ -124,6 +133,7 @@ mod tests {
         assert!(requests[0].starts_with("GET /v1/notes/note-id HTTP/1.1\r\n"));
         assert!(requests[1].starts_with("PATCH /v1/notes/note-id HTTP/1.1\r\n"));
         assert!(requests[1].ends_with(r#"{"content":"new\n"}"#));
+        assert!(requests[2].starts_with("GET /v1/notes/note-id HTTP/1.1\r\n"));
     }
 
     #[tokio::test]
@@ -187,6 +197,7 @@ mod tests {
         let server = SequenceServer::spawn([
             (200, r#"{"id":"note-id","title":"Title","content":"old"}"#),
             (202, ""),
+            (200, r#"{"id":"note-id","title":"Title","content":"new"}"#),
         ]);
         let patch = "*** Begin Patch\n*** Update File: teams/core/notes/note-id.md\n@@\n-old\n+new\n*** End Patch";
         let output = edit_note(
@@ -206,5 +217,6 @@ mod tests {
         let requests = server.finish();
         assert!(requests[0].starts_with("GET /v1/teams/core/notes/note-id HTTP/1.1\r\n"));
         assert!(requests[1].starts_with("PATCH /v1/teams/core/notes/note-id HTTP/1.1\r\n"));
+        assert!(requests[2].starts_with("GET /v1/teams/core/notes/note-id HTTP/1.1\r\n"));
     }
 }
