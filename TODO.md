@@ -180,11 +180,6 @@ test (see P3) for each and record the answer here.
 
 ## P0 — RMCP 3.x foundation
 
-- [ ] Reject non-HTTPS `HACKMD_API_URL` overrides in normal operation. Permit
-  loopback HTTP only through a test-only config constructor; defer
-  request-supplied URL allowlisting to the remote-HTTP task. `hackmd-mcp` added
-  an API-URL allowlist specifically to close an SSRF hole once it accepted the
-  URL from a request header.
 - [ ] Implement a single `HackmdClient`: URL-encode every path segment, attach
   bearer auth, handle empty `204`/`202` responses, parse JSON once, and map
   network/timeout/401/403/404/409/429/5xx failures to concise, actionable MCP

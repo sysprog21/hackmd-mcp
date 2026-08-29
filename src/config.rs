@@ -7,6 +7,8 @@ use std::{
 
 use directories::BaseDirs;
 use thiserror::Error;
+#[cfg(test)]
+use url::Host;
 use url::Url;
 
 const DEFAULT_API_URL: &str = "https://api.hackmd.io/v1";
@@ -43,6 +45,13 @@ impl Config {
     }
 
     fn from_getter(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        Self::from_getter_with_policy(&mut get, ApiUrlPolicy::HttpsOnly)
+    }
+
+    fn from_getter_with_policy(
+        mut get: impl FnMut(&str) -> Option<String>,
+        policy: ApiUrlPolicy,
+    ) -> Result<Self, ConfigError> {
         let api_token = get("HACKMD_API_TOKEN")
             .filter(|token| !token.trim().is_empty())
             .map(SecretToken);
@@ -51,9 +60,12 @@ impl Config {
             .filter(|path| !path.trim().is_empty())
             .map_or_else(default_state_dir, |path| Ok(PathBuf::from(path)))?;
 
+        let api_url = Url::parse(&api_url).map_err(ConfigError::InvalidApiUrl)?;
+        validate_api_url(&api_url, policy)?;
+
         Ok(Self {
             api_token,
-            api_url: Url::parse(&api_url).map_err(ConfigError::InvalidApiUrl)?,
+            api_url,
             request_timeout: REQUEST_TIMEOUT,
             connect_timeout: CONNECT_TIMEOUT,
             retry: RetryConfig::default(),
@@ -72,6 +84,44 @@ impl Config {
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
         Self::from_getter(|_| None).expect("hard-coded defaults must remain valid")
+    }
+
+    #[cfg(test)]
+    fn with_loopback_http_for_tests(
+        get: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self, ConfigError> {
+        Self::from_getter_with_policy(get, ApiUrlPolicy::AllowLoopbackHttp)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ApiUrlPolicy {
+    HttpsOnly,
+    #[cfg(test)]
+    AllowLoopbackHttp,
+}
+
+fn validate_api_url(url: &Url, policy: ApiUrlPolicy) -> Result<(), ConfigError> {
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    #[cfg(test)]
+    if matches!(policy, ApiUrlPolicy::AllowLoopbackHttp)
+        && url.scheme() == "http"
+        && url.host().is_some_and(|host| is_loopback_host(&host))
+    {
+        return Ok(());
+    }
+    let _ = policy;
+    Err(ConfigError::InsecureApiUrl)
+}
+
+#[cfg(test)]
+fn is_loopback_host(host: &Host<&str>) -> bool {
+    match host {
+        Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
     }
 }
 
@@ -150,6 +200,8 @@ impl fmt::Debug for SecretToken {
 pub(crate) enum ConfigError {
     #[error("HACKMD_API_URL must be a valid URL")]
     InvalidApiUrl(#[source] url::ParseError),
+    #[error("HACKMD_API_URL must use HTTPS")]
+    InsecureApiUrl,
     #[error("platform state directory is unavailable; set HACKMD_MCP_STATE_DIR")]
     StateDirectoryUnavailable,
 }
@@ -230,6 +282,42 @@ mod tests {
 
         assert_eq!(error.to_string(), "HACKMD_API_URL must be a valid URL");
         assert!(!error.to_string().contains(invalid));
+    }
+
+    #[test]
+    fn normal_configuration_rejects_non_https_urls() {
+        for insecure in [
+            "http://api.hackmd.io/v1",
+            "http://127.0.0.1:8080/v1",
+            "file:///tmp/fake-api",
+        ] {
+            let error = config_from(&[("HACKMD_API_URL", insecure)])
+                .expect_err("normal configuration must require HTTPS");
+            assert_eq!(error.to_string(), "HACKMD_API_URL must use HTTPS");
+            assert!(!error.to_string().contains(insecure));
+        }
+    }
+
+    #[test]
+    fn test_policy_allows_only_loopback_http() {
+        for loopback in [
+            "http://localhost:8080/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://[::1]:8080/v1",
+        ] {
+            let values = HashMap::from([("HACKMD_API_URL", loopback)]);
+            let config = Config::with_loopback_http_for_tests(|key| {
+                values.get(key).map(ToString::to_string)
+            })
+            .expect("test policy should allow loopback HTTP");
+            assert_eq!(config.api_url.as_str(), loopback);
+        }
+
+        let values = HashMap::from([("HACKMD_API_URL", "http://example.test/v1")]);
+        let error =
+            Config::with_loopback_http_for_tests(|key| values.get(key).map(ToString::to_string))
+                .expect_err("test policy must reject remote HTTP");
+        assert_eq!(error.to_string(), "HACKMD_API_URL must use HTTPS");
     }
 
     #[test]

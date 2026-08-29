@@ -41,3 +41,8 @@
   private baseline file per tracked note: internal ID, workspace, local path,
   baseline body hash, last observed remote timestamp, and local file identity.
   Create state only through pull/push; never store API tokens.
+- [x] Reject non-HTTPS `HACKMD_API_URL` overrides in normal operation. Permit
+  loopback HTTP only through a test-only config constructor; defer
+  request-supplied URL allowlisting to the remote-HTTP task. `hackmd-mcp` added
+  an API-URL allowlist specifically to close an SSRF hole once it accepted the
+  URL from a request header.
