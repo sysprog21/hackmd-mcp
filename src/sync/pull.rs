@@ -5,18 +5,15 @@ use std::{
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
     models::Workspace,
-    note_ref::{NoteRefError, NoteResolution},
-    state::{StateError, TrackedNoteState, local_file_identity, write_local_atomic},
+    note::reference::{NoteRefError, NoteResolution},
+    sync::state::{StateError, TrackedNoteState, write_local_atomic},
+    sync::{BODY_MAX_BYTES, BODY_WARNING_BYTES},
 };
-
-const WARNING_BYTES: usize = 5 * 1024 * 1024;
-const MAX_BYTES: usize = 50 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -61,7 +58,10 @@ pub(crate) enum PullNoteError {
     MissingContent { note_id: String },
     #[error("remote body is {size_bytes} bytes; retry with confirm_large_file: true")]
     ConfirmationRequired { size_bytes: usize },
-    #[error("remote body is {size_bytes} bytes; bodies above 50 MiB are refused")]
+    #[error(
+        "remote body is {size_bytes} bytes; bodies above {} MiB are refused",
+        BODY_MAX_BYTES / 1024 / 1024
+    )]
     TooLarge { size_bytes: usize },
     #[error("local path validation failed")]
     PathIo(#[source] std::io::Error),
@@ -80,7 +80,7 @@ pub(crate) async fn pull_note(
     let destination = validate_destination(&input)?;
     let allow_existing_destination = destination.exists() && input.overwrite_local;
     let resolution =
-        crate::note_ref::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
+        crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
@@ -98,17 +98,13 @@ pub(crate) async fn pull_note(
         allow_existing_destination,
     )?;
     write_local_atomic(&destination, body.as_bytes())?;
-    let identity = local_file_identity(&destination)?;
-    let state = TrackedNoteState {
-        internal_id: note.note_id.clone(),
-        workspace: note.workspace.clone(),
-        local_path: destination.clone(),
-        baseline_body_hash: format!("sha256:{:x}", Sha256::digest(body.as_bytes())),
-        last_observed_remote_timestamp: remote
-            .last_changed_at
-            .map_or_else(String::new, |timestamp| timestamp.to_string()),
-        local_file_identity: identity,
-    };
+    let state = TrackedNoteState::capture(
+        note.note_id.clone(),
+        note.workspace.clone(),
+        destination.clone(),
+        &body,
+        remote.last_changed_at,
+    )?;
     client.state().persist_from_sync(&state, &body)?;
     Ok(Ok(PullNoteOutput {
         workspace: note.workspace,
@@ -120,10 +116,10 @@ pub(crate) async fn pull_note(
 }
 
 fn validate_body_size(size_bytes: usize, confirmed: bool) -> Result<(), PullNoteError> {
-    if size_bytes > MAX_BYTES {
+    if size_bytes > BODY_MAX_BYTES {
         return Err(PullNoteError::TooLarge { size_bytes });
     }
-    if size_bytes > WARNING_BYTES && !confirmed {
+    if size_bytes > BODY_WARNING_BYTES && !confirmed {
         return Err(PullNoteError::ConfirmationRequired { size_bytes });
     }
     Ok(())
@@ -203,17 +199,20 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{
-        MAX_BYTES, PullNoteError, PullNoteInput, WARNING_BYTES, pull_note, validate_body_size,
+    use super::{PullNoteError, PullNoteInput, pull_note, validate_body_size};
+    use crate::{
+        client::HackmdClient,
+        config::Config,
+        models::Workspace,
+        sync::{BODY_MAX_BYTES, BODY_WARNING_BYTES},
     };
-    use crate::{client::HackmdClient, config::Config, models::Workspace};
 
     #[tokio::test]
     async fn clean_pull_writes_exact_body_and_private_sync_state() {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let destination = directory.path().join("nested/note.md");
         let state_dir = directory.path().join("state");
-        let fixture = crate::test_support::SequenceServer::spawn([(
+        let fixture = crate::fixture::SequenceServer::spawn([(
             200,
             r##"{"id":"note/id","title":"Remote","content":"# Exact\n\nBody\n","lastChangedAt":123}"##,
         )]);
@@ -237,7 +236,15 @@ mod tests {
         .await
         .expect("pull should succeed")
         .expect("direct note should resolve");
-        assert_eq!(output.local_path, destination);
+
+        // The tool reports the canonical destination: on macOS the temporary
+        // directory itself lives behind a /var -> /private/var symlink.
+        assert_eq!(
+            output.local_path,
+            destination
+                .canonicalize()
+                .expect("destination should exist")
+        );
         assert_eq!(
             fs::read_to_string(&destination).expect("note should read"),
             "# Exact\n\nBody\n"
@@ -358,15 +365,15 @@ mod tests {
 
     #[test]
     fn pull_body_limits_have_exact_boundaries() {
-        assert!(validate_body_size(WARNING_BYTES, false).is_ok());
+        assert!(validate_body_size(BODY_WARNING_BYTES, false).is_ok());
         assert!(matches!(
-            validate_body_size(WARNING_BYTES + 1, false),
+            validate_body_size(BODY_WARNING_BYTES + 1, false),
             Err(PullNoteError::ConfirmationRequired { .. })
         ));
-        assert!(validate_body_size(WARNING_BYTES + 1, true).is_ok());
-        assert!(validate_body_size(MAX_BYTES, true).is_ok());
+        assert!(validate_body_size(BODY_WARNING_BYTES + 1, true).is_ok());
+        assert!(validate_body_size(BODY_MAX_BYTES, true).is_ok());
         assert!(matches!(
-            validate_body_size(MAX_BYTES + 1, true),
+            validate_body_size(BODY_MAX_BYTES + 1, true),
             Err(PullNoteError::TooLarge { .. })
         ));
     }

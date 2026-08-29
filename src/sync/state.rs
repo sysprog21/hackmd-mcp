@@ -5,6 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
@@ -19,6 +20,55 @@ pub(crate) struct TrackedNoteState {
     pub(crate) baseline_body_hash: String,
     pub(crate) last_observed_remote_timestamp: String,
     pub(crate) local_file_identity: LocalFileIdentity,
+}
+
+impl TrackedNoteState {
+    /// Records the note as tracked at the moment `baseline_body` is what both
+    /// `local_path` and `HackMD` hold. Every sync tool goes through here so the
+    /// stored hash and file identity can never disagree with the baseline.
+    pub(crate) fn capture(
+        internal_id: String,
+        workspace: Workspace,
+        local_path: PathBuf,
+        baseline_body: &str,
+        remote_timestamp: Option<i64>,
+    ) -> Result<Self, StateError> {
+        Ok(Self {
+            local_file_identity: local_file_identity(&local_path)?,
+            internal_id,
+            workspace,
+            local_path,
+            baseline_body_hash: body_hash(baseline_body),
+            last_observed_remote_timestamp: timestamp_text(remote_timestamp),
+        })
+    }
+
+    /// Re-captures this note after a successful push: same note and file, new
+    /// baseline body.
+    pub(crate) fn advance(
+        self,
+        baseline_body: &str,
+        remote_timestamp: Option<i64>,
+    ) -> Result<Self, StateError> {
+        Self::capture(
+            self.internal_id,
+            self.workspace,
+            self.local_path,
+            baseline_body,
+            remote_timestamp,
+        )
+    }
+}
+
+/// Renders a `HackMD` millisecond timestamp for the sidecar and the sync tools,
+/// which report it as text because the API omits it on some responses.
+pub(crate) fn timestamp_text(value: Option<i64>) -> String {
+    value.map_or_else(String::new, |timestamp| timestamp.to_string())
+}
+
+/// The single hash format written to sidecars and reported by the sync tools.
+pub(crate) fn body_hash(body: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
 }
 
 /// Stable identity captured for the local Markdown file.
@@ -69,7 +119,11 @@ impl StateStore {
 
     /// Persists sync state atomically per file. Only pull/push handlers should
     /// call this operation; server startup constructs the store without writes.
-    #[allow(dead_code, reason = "called by the local pull/push tool tasks")]
+    ///
+    /// Baseline and sidecar are two renames, not one transaction. A crash
+    /// between them leaves a pair whose hashes disagree, which
+    /// `load_for_local_path` refuses on the next call. The note is re-pulled
+    /// rather than synced against a baseline nobody can vouch for.
     pub(crate) fn persist_from_sync(
         &self,
         state: &TrackedNoteState,
@@ -84,6 +138,11 @@ impl StateStore {
         Ok(())
     }
 
+    /// Finds the tracked note whose recorded file is `local_path`.
+    ///
+    /// The lookup scans the sidecars and compares canonical paths rather than
+    /// deriving a filename from the path, so a note stays tracked when the
+    /// caller reaches it through a symlink or a differently spelled path.
     pub(crate) fn load_for_local_path(
         &self,
         local_path: &Path,
@@ -106,6 +165,18 @@ impl StateStore {
             if state.local_file_identity.canonical_path == canonical {
                 let paths = self.paths_for(&state.workspace, &state.internal_id);
                 let baseline_body = fs::read_to_string(&paths.baseline)?;
+
+                // A torn or hand-edited pair would silently corrupt every later
+                // three-way comparison, so refuse the state instead of
+                // guessing.
+                if body_hash(&baseline_body) != state.baseline_body_hash {
+                    return Err(StateError::BaselineMismatch {
+                        baseline_path: paths.baseline,
+                        note_id: state.internal_id,
+                        workspace: state.workspace,
+                        local_path: state.local_path,
+                    });
+                }
                 return Ok(LoadedTrackedState {
                     state,
                     baseline_body,
@@ -208,6 +279,17 @@ pub(crate) enum StateError {
     Io(#[from] io::Error),
     #[error("local state serialization failed")]
     Serialize(#[from] serde_json::Error),
+    #[error(
+        "tracked baseline {} does not match its recorded hash; re-pull note {note_id} from {workspace} to {} before syncing",
+        baseline_path.display(),
+        local_path.display()
+    )]
+    BaselineMismatch {
+        baseline_path: PathBuf,
+        note_id: String,
+        workspace: Workspace,
+        local_path: PathBuf,
+    },
 }
 
 #[cfg(test)]

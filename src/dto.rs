@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "DTOs are consumed by the following API tool tasks"
-)]
-
 use std::collections::BTreeMap;
 
 use rmcp::schemars;
@@ -158,6 +153,38 @@ fn validate_permission_order(
         return Err(PayloadError::WriteMorePermissiveThanRead);
     }
     Ok(())
+}
+
+/// A PATCH input field, distinguishing "caller said nothing" from "caller asked
+/// to clear this". Serde alone cannot express that: a bare `Option` collapses
+/// both to `None`.
+#[derive(Debug, Default)]
+pub(crate) enum PatchField {
+    #[default]
+    Unspecified,
+    Set(Option<String>),
+}
+
+impl PatchField {
+    /// Converts to the request shape: an outer `None` omits the field, an
+    /// inner `None` serializes an explicit JSON null.
+    #[allow(
+        clippy::option_option,
+        reason = "the two nesting levels are the omit/clear distinction itself"
+    )]
+    pub(crate) fn into_request(self) -> Option<Option<String>> {
+        match self {
+            Self::Unspecified => None,
+            Self::Set(value) => Some(value),
+        }
+    }
+}
+
+pub(crate) fn deserialize_patch_field<'de, D>(deserializer: D) -> Result<PatchField, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(PatchField::Set)
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

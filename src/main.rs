@@ -6,7 +6,16 @@ use clap::Parser;
 struct Cli {}
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
     let _cli = Cli::parse();
-    hackmd_mcp::run_stdio().await
+
+    // Report the message rather than returning the error: `Result` from `main`
+    // prints its `Debug` form, which shows an enum variant name instead of the
+    // fix the operator needs. Startup failures land on stderr because stdout
+    // belongs to the MCP transport.
+    if let Err(error) = hackmd_mcp::run_stdio().await {
+        eprintln!("hackmd-mcp: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
+    std::process::ExitCode::SUCCESS
 }

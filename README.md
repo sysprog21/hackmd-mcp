@@ -38,6 +38,12 @@ take precedence over `.env`. The server reads only these keys:
   `https://api.hackmd.io/v1`.
 - `HACKMD_MCP_STATE_DIR` — optional private sync-state directory.
 
+A `.env` in the working directory may not redirect a token that came from the environment: if
+`HACKMD_API_TOKEN` is inherited and only that file sets `HACKMD_API_URL`, the server refuses to
+start. Otherwise a checked-out repository could point your token at a host of its author's
+choosing. A token inside the file does not change this, because an inherited value takes
+precedence over it. Set both keys in the same place.
+
 The token is loaded lazily, redacted from diagnostics, and never validated at
 startup. Local sync state can contain note content and must also remain private.
 
@@ -86,9 +92,13 @@ separately reviewed features if a concrete workflow eventually requires them.
 ## Validation
 
 ```sh
-cargo test --all-targets --all-features
+make check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+`make check` is `cargo test --all-targets --all-features`. The Makefile also carries `make`
+(release build), `make clean`, and `make indent`, which formats the sources with rustfmt plus
+`commentflow` and `shfmt` when those are installed.
 
 The destructive live suite in `tests/live-smoke.rs` is ignored by default. Run
 it only with a dedicated test account and the explicit environment gates

@@ -56,9 +56,11 @@ fn assert_waiting_then_stop(mut child: Child) -> Output {
             .is_none(),
         "server exited while its MCP input remained open"
     );
-    child
-        .kill()
-        .expect("server should stop after the assertion");
+
+    // Close the transport instead of killing: the server then shuts down on its
+    // own and every startup diagnostic it wrote is guaranteed to be collected,
+    // however slow the machine was to reach that point.
+    drop(child.stdin.take());
     child
         .wait_with_output()
         .expect("server output should be collected")
@@ -122,6 +124,30 @@ fn token_loads_from_the_working_directory_dotenv_without_leaking() {
     let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
     assert!(!stderr.contains(DOTENV_TOKEN));
     assert!(!stderr.contains("HACKMD_API_TOKEN is not set"));
+}
+
+#[test]
+fn dotenv_cannot_redirect_an_inherited_token_to_another_host() {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    fs::write(
+        directory.path().join(".env"),
+        "HACKMD_API_URL=https://attacker.example/v1\n",
+    )
+    .expect("dotenv fixture should be written");
+
+    let output = spawn_server(
+        Some("inherited-secret-sentinel"),
+        Some(directory.path()),
+        None,
+    )
+    .wait_with_output()
+    .expect("server output should be collected");
+
+    assert!(!output.status.success(), "server must refuse to start");
+    let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
+    assert!(stderr.contains("sets HACKMD_API_URL"));
+    assert!(stderr.contains("unset HACKMD_API_TOKEN"));
+    assert!(!stderr.contains("inherited-secret-sentinel"));
 }
 
 #[test]

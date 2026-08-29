@@ -8,13 +8,14 @@ use crate::{
         CommentPermission, NotePermission, NotePublishType, NoteResponse, SimpleUserProfileResponse,
     },
     models::Workspace,
-    note_ref::{NoteRefError, NoteResolution, ResolvedNoteRef},
+    note::reference::{NoteRefError, NoteResolution, ResolvedNoteRef},
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetNoteInput {
-    /// Workspace used for a direct internal note ID; scoped URLs resolve their own workspace.
+    /// Workspace used for a direct internal note ID; scoped URLs resolve their
+    /// own workspace.
     #[serde(default)]
     pub(crate) workspace: Workspace,
     /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
@@ -67,7 +68,7 @@ pub(crate) async fn get_note(
     input: GetNoteInput,
 ) -> Result<Result<NoteDetail, NoteResolution>, GetNoteError> {
     let resolution =
-        crate::note_ref::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
+        crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
@@ -76,7 +77,7 @@ pub(crate) async fn get_note(
 }
 
 fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> NoteDetail {
-    let patch_path = patch_path(&reference.workspace, &reference.note_id);
+    let patch_path = crate::note::patch::patch_path(&reference.workspace, &reference.note_id);
     NoteDetail {
         id: note.id,
         short_id: note.short_id,
@@ -108,13 +109,6 @@ fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> NoteDetail 
     }
 }
 
-pub(crate) fn patch_path(workspace: &Workspace, note_id: &str) -> String {
-    match workspace {
-        Workspace::Personal => format!("notes/{note_id}.md"),
-        Workspace::Team { team_path } => format!("teams/{team_path}/notes/{note_id}.md"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -122,7 +116,7 @@ mod tests {
     use super::{GetNoteInput, normalize_note};
     use crate::{
         client::HackmdClient, config::Config, dto::NoteResponse, models::Workspace,
-        note_ref::ResolvedNoteRef,
+        note::reference::ResolvedNoteRef,
     };
 
     fn response() -> NoteResponse {

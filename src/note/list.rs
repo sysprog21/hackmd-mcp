@@ -4,10 +4,12 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{client::HackmdClient, dto::NoteResponse, models::Workspace};
-
-pub(crate) const DEFAULT_LIMIT: usize = 20;
-pub(crate) const MAX_LIMIT: usize = 100;
+use crate::{
+    client::HackmdClient,
+    dto::NoteResponse,
+    models::Workspace,
+    paging::{InvalidLimit, PageMeta, default_limit, paginate, validate_limit},
+};
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -22,7 +24,8 @@ pub(crate) struct ListNotesInput {
     /// Number of filtered notes to skip before returning the page.
     #[serde(default)]
     pub(crate) offset: usize,
-    /// Case-insensitive metadata search over title, description, tags, ID, and shortId.
+    /// Case-insensitive metadata search over title, description, tags, ID, and
+    /// shortId.
     pub(crate) query: Option<String>,
     /// Require every supplied tag, matched case-insensitively.
     #[serde(default)]
@@ -31,10 +34,6 @@ pub(crate) struct ListNotesInput {
     #[serde(default)]
     #[schemars(default = "default_sort")]
     pub(crate) sort: NoteSort,
-}
-
-const fn default_limit() -> usize {
-    DEFAULT_LIMIT
 }
 
 const fn default_sort() -> NoteSort {
@@ -56,11 +55,8 @@ pub(crate) enum NoteSort {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct ListNotesOutput {
-    pub(crate) total: usize,
-    pub(crate) count: usize,
-    pub(crate) offset: usize,
-    pub(crate) has_more: bool,
-    pub(crate) next_offset: Option<usize>,
+    #[serde(flatten)]
+    pub(crate) meta: PageMeta,
     pub(crate) notes: Vec<NoteSummary>,
 }
 
@@ -85,8 +81,8 @@ pub(crate) struct NoteSummary {
 
 #[derive(Debug, Error)]
 pub(crate) enum ListNotesError {
-    #[error("limit must be between 1 and {MAX_LIMIT}")]
-    InvalidLimit,
+    #[error(transparent)]
+    Limit(#[from] InvalidLimit),
     #[error(transparent)]
     Api(#[from] crate::client::HackmdError),
 }
@@ -95,9 +91,7 @@ pub(crate) async fn list_notes(
     client: &HackmdClient,
     input: ListNotesInput,
 ) -> Result<ListNotesOutput, ListNotesError> {
-    if !(1..=MAX_LIMIT).contains(&input.limit) {
-        return Err(ListNotesError::InvalidLimit);
-    }
+    validate_limit(input.limit)?;
     let notes = client.list_notes(&input.workspace).await?;
     Ok(filter_sort_page(notes, &input))
 }
@@ -155,23 +149,8 @@ pub(crate) fn page_summaries(
     offset: usize,
     limit: usize,
 ) -> ListNotesOutput {
-    let total = notes.len();
-    let notes = notes
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect::<Vec<_>>();
-    let count = notes.len();
-    let end = offset.saturating_add(count);
-    let has_more = end < total;
-    ListNotesOutput {
-        total,
-        count,
-        offset,
-        has_more,
-        next_offset: has_more.then_some(end),
-        notes,
-    }
+    let (notes, meta) = paginate(notes, offset, limit);
+    ListNotesOutput { meta, notes }
 }
 
 fn normalize(value: &str) -> String {
@@ -201,7 +180,11 @@ fn compare_notes(left: &NoteSummary, right: &NoteSummary, sort: NoteSort) -> Ord
         NoteSort::LastChangedAsc => left.last_changed_at.cmp(&right.last_changed_at),
         NoteSort::CreatedDesc => right.created_at.cmp(&left.created_at),
         NoteSort::CreatedAsc => left.created_at.cmp(&right.created_at),
-        NoteSort::TitleAsc => normalize(&left.title).cmp(&normalize(&right.title)),
+        NoteSort::TitleAsc => left
+            .title
+            .chars()
+            .flat_map(char::to_lowercase)
+            .cmp(right.title.chars().flat_map(char::to_lowercase)),
     };
     primary.then_with(|| left.id.cmp(&right.id))
 }
@@ -250,7 +233,7 @@ mod tests {
             ],
             &input,
         );
-        assert_eq!(output.total, 1);
+        assert_eq!(output.meta.total, 1);
         assert_eq!(output.notes[0].id, "a");
     }
 
@@ -268,11 +251,11 @@ mod tests {
             ],
             &input,
         );
-        assert_eq!(output.total, 4);
-        assert_eq!(output.count, 2);
-        assert_eq!(output.offset, 1);
-        assert!(output.has_more);
-        assert_eq!(output.next_offset, Some(3));
+        assert_eq!(output.meta.total, 4);
+        assert_eq!(output.meta.count, 2);
+        assert_eq!(output.meta.offset, 1);
+        assert!(output.meta.has_more);
+        assert_eq!(output.meta.next_offset, Some(3));
         assert_eq!(
             output
                 .notes
@@ -288,10 +271,10 @@ mod tests {
         let mut input = input();
         input.offset = 10;
         let output = filter_sort_page(vec![note("a", "A", 1, &[])], &input);
-        assert_eq!(output.offset, 10);
-        assert_eq!(output.count, 0);
-        assert!(!output.has_more);
-        assert_eq!(output.next_offset, None);
+        assert_eq!(output.meta.offset, 10);
+        assert_eq!(output.meta.count, 0);
+        assert!(!output.meta.has_more);
+        assert_eq!(output.meta.next_offset, None);
     }
 
     #[test]
@@ -312,7 +295,7 @@ mod tests {
         invalid.limit = 101;
         assert!(matches!(
             list_notes(&client, invalid).await,
-            Err(ListNotesError::InvalidLimit)
+            Err(ListNotesError::Limit(_))
         ));
     }
 }

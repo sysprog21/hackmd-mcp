@@ -5,8 +5,9 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
-    list_notes::{DEFAULT_LIMIT, ListNotesOutput, MAX_LIMIT, note_summary, page_summaries},
     models::Workspace,
+    note::list::{ListNotesOutput, note_summary, page_summaries},
+    paging::{InvalidLimit, default_limit, validate_limit},
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -19,10 +20,6 @@ pub(crate) struct ListTrashInput {
     /// Number of trashed notes to skip in API order.
     #[serde(default)]
     pub(crate) offset: usize,
-}
-
-const fn default_limit() -> usize {
-    DEFAULT_LIMIT
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -41,8 +38,8 @@ pub(crate) struct RestoreNoteOutput {
 
 #[derive(Debug, Error)]
 pub(crate) enum TrashError {
-    #[error("limit must be between 1 and {MAX_LIMIT}")]
-    InvalidLimit,
+    #[error(transparent)]
+    Limit(#[from] InvalidLimit),
     #[error("note_id must not be empty")]
     EmptyNoteId,
     #[error(transparent)]
@@ -53,9 +50,7 @@ pub(crate) async fn list_trash(
     client: &HackmdClient,
     input: ListTrashInput,
 ) -> Result<ListNotesOutput, TrashError> {
-    if !(1..=MAX_LIMIT).contains(&input.limit) {
-        return Err(TrashError::InvalidLimit);
-    }
+    validate_limit(input.limit)?;
     let notes = client
         .list_trash()
         .await?
@@ -83,15 +78,7 @@ pub(crate) async fn restore_note(
 #[cfg(test)]
 mod tests {
     use super::{ListTrashInput, RestoreNoteInput, TrashError, list_trash, restore_note};
-    use crate::{client::HackmdClient, config::Config, test_support::SequenceServer};
-
-    fn fixture_client(fixture: &SequenceServer) -> HackmdClient {
-        HackmdClient::new(Config::for_loopback_test(
-            &fixture.api_url,
-            Some("fixture-token"),
-        ))
-        .expect("fixture client should build")
-    }
+    use crate::{client::HackmdClient, config::Config, fixture::SequenceServer};
 
     #[tokio::test]
     async fn list_trash_is_slim_paginated_and_accepts_empty_lists() {
@@ -102,7 +89,7 @@ mod tests {
             ),
             (200, "[]"),
         ]);
-        let client = fixture_client(&fixture);
+        let client = fixture.client();
         let page = list_trash(
             &client,
             ListTrashInput {
@@ -112,8 +99,8 @@ mod tests {
         )
         .await
         .expect("trash page should succeed");
-        assert_eq!(page.total, 2);
-        assert_eq!(page.count, 1);
+        assert_eq!(page.meta.total, 2);
+        assert_eq!(page.meta.count, 1);
         assert_eq!(page.notes[0].id, "b");
         assert_eq!(page.notes[0].workspace, crate::models::Workspace::Personal);
         let serialized = serde_json::to_value(&page).expect("page should serialize");
@@ -128,8 +115,8 @@ mod tests {
         )
         .await
         .expect("empty trash should succeed");
-        assert_eq!(empty.total, 0);
-        assert_eq!(empty.next_offset, None);
+        assert_eq!(empty.meta.total, 0);
+        assert_eq!(empty.meta.next_offset, None);
         assert!(
             fixture
                 .finish()
@@ -141,7 +128,7 @@ mod tests {
     #[tokio::test]
     async fn restore_encodes_id_and_accepts_empty_or_json_responses() {
         let fixture = SequenceServer::spawn([(202, ""), (200, r#"{"restored":true}"#)]);
-        let client = fixture_client(&fixture);
+        let client = fixture.client();
         let accepted = restore_note(
             &client,
             RestoreNoteInput {
@@ -178,7 +165,7 @@ mod tests {
                 }
             )
             .await,
-            Err(TrashError::InvalidLimit)
+            Err(TrashError::Limit(_))
         ));
         assert!(matches!(
             restore_note(

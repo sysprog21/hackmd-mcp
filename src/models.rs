@@ -16,9 +16,32 @@ pub(crate) enum Workspace {
     },
 }
 
+impl std::fmt::Display for Workspace {
+    /// Names the workspace the way a tool argument would, so an error can tell
+    /// a caller where to look without them decoding a `Debug` dump.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Personal => formatter.write_str("the personal workspace"),
+            Self::Team { team_path } => write!(formatter, "team {team_path}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Workspace;
+
+    #[test]
+    fn workspace_display_names_the_tool_argument() {
+        assert_eq!(Workspace::Personal.to_string(), "the personal workspace");
+        assert_eq!(
+            Workspace::Team {
+                team_path: "core-team".to_owned()
+            }
+            .to_string(),
+            "team core-team"
+        );
+    }
 
     #[test]
     fn workspace_defaults_to_personal() {

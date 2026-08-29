@@ -7,6 +7,16 @@ pub(crate) fn success(summary: impl Into<String>, structured: Value) -> CallTool
     result
 }
 
+/// The reply for a `note_ref` that named no note, or more than one. It is a
+/// successful result carrying candidates, not an error, so the caller can pick
+/// one and retry.
+pub(crate) fn unresolved(resolution: &crate::note::reference::NoteResolution) -> CallToolResult {
+    success(
+        "The note reference did not resolve uniquely",
+        serde_json::json!({"resolution": resolution}),
+    )
+}
+
 pub(crate) fn error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }

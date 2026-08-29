@@ -2,12 +2,11 @@ use std::{fs, path::PathBuf};
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
-    state::StateError,
+    sync::state::{StateError, body_hash, timestamp_text},
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -81,17 +80,12 @@ pub(crate) async fn check_note_sync(
         local_path: tracked.state.local_path,
         baseline_path: tracked.baseline_path,
         note_id: tracked.state.internal_id,
-        remote_timestamp: remote_note
-            .last_changed_at
-            .map_or_else(String::new, |timestamp| timestamp.to_string()),
-        baseline_body_hash: hash(&tracked.baseline_body),
-        local_body_hash: hash(&local),
-        remote_body_hash: hash(&remote),
+        remote_timestamp: timestamp_text(remote_note.last_changed_at),
+        // The loader already verified this hash against the baseline file.
+        baseline_body_hash: tracked.state.baseline_body_hash,
+        local_body_hash: body_hash(&local),
+        remote_body_hash: body_hash(&remote),
     })
-}
-
-fn hash(body: &str) -> String {
-    format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
 }
 
 #[cfg(test)]
@@ -99,19 +93,12 @@ mod tests {
     use std::fs;
 
     use super::{CheckNoteSyncInput, SyncStatus, check_note_sync};
-    use crate::{
-        client::HackmdClient,
-        config::Config,
-        models::Workspace,
-        state::{TrackedNoteState, local_file_identity},
-    };
-
     #[tokio::test]
     async fn classifies_all_four_sync_states_without_writes() {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "baseline").expect("local fixture should write");
-        let fixture = crate::test_support::SequenceServer::spawn([
+        let fixture = crate::fixture::SequenceServer::spawn([
             (
                 200,
                 r#"{"id":"id","title":"Note","content":"baseline","lastChangedAt":1}"#,
@@ -129,27 +116,7 @@ mod tests {
                 r#"{"id":"id","title":"Note","content":"remote","lastChangedAt":2}"#,
             ),
         ]);
-        let client = HackmdClient::new(Config::for_loopback_test_with_state(
-            &fixture.api_url,
-            "fixture-token",
-            &directory.path().join("state"),
-        ))
-        .expect("fixture client should build");
-        client
-            .state()
-            .persist_from_sync(
-                &TrackedNoteState {
-                    internal_id: "id".to_owned(),
-                    workspace: Workspace::Personal,
-                    local_path: local_path.clone(),
-                    baseline_body_hash: "sha256:fixture".to_owned(),
-                    last_observed_remote_timestamp: "1".to_owned(),
-                    local_file_identity: local_file_identity(&local_path)
-                        .expect("identity should resolve"),
-                },
-                "baseline",
-            )
-            .expect("state should persist");
+        let client = fixture.tracked_client(directory.path(), "id", &local_path, "baseline");
 
         let mut statuses = Vec::new();
         for (local, expected) in [

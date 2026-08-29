@@ -1,18 +1,18 @@
 use std::collections::BTreeMap;
 
 use rmcp::schemars;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
     dto::{
-        CommentPermission, CreateNoteRequest, NotePermission, NoteResponse, PayloadError,
-        SuggestEditPermission, UpdateNoteRequest,
+        CommentPermission, CreateNoteRequest, NotePermission, NoteResponse, PatchField,
+        PayloadError, SuggestEditPermission, UpdateNoteRequest, deserialize_patch_field,
     },
     models::Workspace,
-    note_ref::{NoteRefError, NoteResolution},
+    note::reference::{NoteRefError, NoteResolution},
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -21,7 +21,8 @@ pub(crate) struct CreateNoteInput {
     /// Personal account or team in which to create the note.
     #[serde(default)]
     pub(crate) workspace: Workspace,
-    /// Optional note title; `HackMD` content front matter or a leading H1 may take precedence.
+    /// Optional note title; `HackMD` content front matter or a leading H1 may
+    /// take precedence.
     pub(crate) title: Option<String>,
     /// Full Markdown note body.
     pub(crate) content: Option<String>,
@@ -39,7 +40,8 @@ pub(crate) struct CreateNoteInput {
     pub(crate) comment_permission: Option<CommentPermission>,
     /// Who may suggest edits; omitted preserves the workspace default.
     pub(crate) suggest_edit_permission: Option<SuggestEditPermission>,
-    /// Folder ID for placement. The server verifies POST placement and uses PATCH only as a compatibility fallback.
+    /// Folder ID for placement. The server verifies POST placement and uses
+    /// PATCH only as a compatibility fallback.
     pub(crate) parent_folder_id: Option<String>,
     /// Per-feature `HackMD` permission overrides.
     pub(crate) note_features: Option<BTreeMap<String, Value>>,
@@ -47,30 +49,18 @@ pub(crate) struct CreateNoteInput {
     pub(crate) origin: Option<String>,
 }
 
-#[derive(Debug, Default)]
-enum ParentFolderUpdate {
-    #[default]
-    Unspecified,
-    Set(Option<String>),
-}
-
-fn deserialize_parent_folder<'de, D>(deserializer: D) -> Result<ParentFolderUpdate, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer).map(ParentFolderUpdate::Set)
-}
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpdateNoteInput {
-    /// Workspace used for a direct internal note ID; scoped URLs resolve their own workspace.
+    /// Workspace used for a direct internal note ID; scoped URLs resolve their
+    /// own workspace.
     #[serde(default)]
     pub(crate) workspace: Workspace,
     /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
     pub(crate) note_ref: String,
     pub(crate) title: Option<String>,
-    /// Explicit full-body replacement. Prefer `hackmd_edit_note` for normal content edits.
+    /// Explicit full-body replacement. Prefer `hackmd_edit_note` for normal
+    /// content edits.
     pub(crate) content: Option<String>,
     pub(crate) tags: Option<Vec<String>>,
     pub(crate) description: Option<String>,
@@ -78,9 +68,9 @@ pub(crate) struct UpdateNoteInput {
     pub(crate) read_permission: Option<NotePermission>,
     pub(crate) write_permission: Option<NotePermission>,
     /// Folder ID, or null to move the note to the workspace root.
-    #[serde(default, deserialize_with = "deserialize_parent_folder")]
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
     #[schemars(with = "Option<String>")]
-    parent_folder_id: ParentFolderUpdate,
+    parent_folder_id: PatchField,
     /// Unsupported on PATCH; supplying this produces an explanatory tool error.
     pub(crate) comment_permission: Option<CommentPermission>,
     /// Unsupported on PATCH; supplying this produces an explanatory tool error.
@@ -90,7 +80,8 @@ pub(crate) struct UpdateNoteInput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DeleteNoteInput {
-    /// Workspace used for a direct internal note ID; scoped URLs resolve their own workspace.
+    /// Workspace used for a direct internal note ID; scoped URLs resolve their
+    /// own workspace.
     #[serde(default)]
     pub(crate) workspace: Workspace,
     /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
@@ -101,6 +92,9 @@ pub(crate) struct DeleteNoteInput {
 pub(crate) struct CreateNoteOutput {
     pub(crate) note: NoteResponse,
     pub(crate) folder_placement_requested: bool,
+    /// Whether the note was actually read back inside the requested folder.
+    /// False means `HackMD` accepted the placement but never showed it.
+    pub(crate) folder_placement_confirmed: bool,
     pub(crate) compatibility_patch_applied: bool,
 }
 
@@ -140,6 +134,10 @@ pub(crate) enum CrudError {
     },
 }
 
+fn placed_in(note: &NoteResponse, folder_id: &str) -> bool {
+    note.folder_paths.iter().any(|path| path.id == folder_id)
+}
+
 pub(crate) async fn create_note(
     client: &HackmdClient,
     input: CreateNoteInput,
@@ -162,41 +160,55 @@ pub(crate) async fn create_note(
     payload.validate()?;
     client.ensure_team_exists(&input.workspace).await?;
     let mut note = client.create_note(&input.workspace, &payload).await?;
+    let note_id = note.id.clone();
     let mut compatibility_patch_applied = false;
     if let Some(folder_id) = folder.as_ref() {
+        let placement_failed = |source| CrudError::FolderPlacement {
+            note_id: note_id.clone(),
+            source,
+        };
+
+        // A single read, not a poll: POST placement is the common case, and
+        // waiting out the read-back window here would tax every foldered create
+        // to catch a case the PATCH below already repairs.
         note = client
-            .get_note(&input.workspace, &note.id)
+            .get_note(&input.workspace, &note_id)
             .await
-            .map_err(|source| CrudError::FolderPlacement {
-                note_id: note.id.clone(),
-                source,
-            })?;
-        if !note.folder_paths.iter().any(|path| path.id == *folder_id) {
+            .map_err(placement_failed)?;
+        if !placed_in(&note, folder_id) {
             let placement = UpdateNoteRequest {
                 parent_folder_id: Some(Some(folder_id.clone())),
                 ..UpdateNoteRequest::default()
             };
             placement.validate()?;
             client
-                .update_note(&input.workspace, &note.id, &placement)
+                .update_note(&input.workspace, &note_id, &placement)
                 .await
-                .map_err(|source| CrudError::FolderPlacement {
-                    note_id: note.id.clone(),
-                    source,
-                })?;
+                .map_err(placement_failed)?;
             compatibility_patch_applied = true;
-            note = client
-                .get_note(&input.workspace, &note.id)
-                .await
-                .map_err(|source| CrudError::FolderPlacement {
-                    note_id: note.id.clone(),
-                    source,
-                })?;
+
+            // Placement is a write like any other, so confirm it the way the
+            // edit and push tools confirm theirs rather than trusting one
+            // immediate read. Failing to confirm is reported as a flag, never
+            // as an error: the note exists by now, and an agent that saw an
+            // error would create a second one on retry.
+            note = crate::client::poll_readback(
+                || client.get_note(&input.workspace, &note_id),
+                |note| placed_in(note, folder_id),
+            )
+            .await
+            .map_err(placement_failed)?
+            .value;
         }
     }
+
+    // Judged from the note being returned, so the flag can never disagree with
+    // the folder_ids the caller reads out of it.
+    let folder_placement_confirmed = folder.as_ref().is_some_and(|id| placed_in(&note, id));
     Ok(CreateNoteOutput {
         note,
         folder_placement_requested: folder.is_some(),
+        folder_placement_confirmed,
         compatibility_patch_applied,
     })
 }
@@ -216,14 +228,11 @@ pub(crate) async fn update_note(
         read_permission: input.read_permission,
         write_permission: input.write_permission,
         permalink: input.permalink,
-        parent_folder_id: match input.parent_folder_id {
-            ParentFolderUpdate::Unspecified => None,
-            ParentFolderUpdate::Set(value) => Some(value),
-        },
+        parent_folder_id: input.parent_folder_id.into_request(),
     };
     payload.validate()?;
     let resolution =
-        crate::note_ref::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
+        crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
@@ -244,7 +253,7 @@ pub(crate) async fn delete_note(
     input: DeleteNoteInput,
 ) -> Result<Result<DeleteNoteOutput, NoteResolution>, CrudError> {
     let resolution =
-        crate::note_ref::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
+        crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
@@ -261,38 +270,28 @@ pub(crate) async fn delete_note(
 mod tests {
     use serde_json::json;
 
-    use super::{
-        CreateNoteInput, CrudError, ParentFolderUpdate, UpdateNoteInput, create_note, update_note,
-    };
-    use crate::{client::HackmdClient, config::Config, test_support::SequenceServer};
+    use super::{CreateNoteInput, CrudError, UpdateNoteInput, create_note, update_note};
+    use crate::{client::HackmdClient, config::Config, dto::PatchField, fixture::SequenceServer};
 
     #[test]
     fn update_distinguishes_missing_folder_from_explicit_root() {
         let missing: UpdateNoteInput = serde_json::from_value(json!({"note_ref": "id"}))
             .expect("missing folder should deserialize");
-        assert!(matches!(
-            missing.parent_folder_id,
-            ParentFolderUpdate::Unspecified
-        ));
+        assert!(matches!(missing.parent_folder_id, PatchField::Unspecified));
 
         let root: UpdateNoteInput = serde_json::from_value(json!({
             "note_ref": "id",
             "parent_folder_id": null
         }))
         .expect("null folder should deserialize");
-        assert!(matches!(
-            root.parent_folder_id,
-            ParentFolderUpdate::Set(None)
-        ));
+        assert!(matches!(root.parent_folder_id, PatchField::Set(None)));
 
         let folder: UpdateNoteInput = serde_json::from_value(json!({
             "note_ref": "id",
             "parent_folder_id": "folder-id"
         }))
         .expect("folder should deserialize");
-        assert!(
-            matches!(folder.parent_folder_id, ParentFolderUpdate::Set(Some(id)) if id == "folder-id")
-        );
+        assert!(matches!(folder.parent_folder_id, PatchField::Set(Some(id)) if id == "folder-id"));
     }
 
     #[tokio::test]
@@ -313,11 +312,7 @@ mod tests {
     async fn accepted_update_is_read_back() {
         let server =
             SequenceServer::spawn([(202, ""), (200, r#"{"id":"note/id","title":"Updated"}"#)]);
-        let client = HackmdClient::new(Config::for_loopback_test(
-            &server.api_url,
-            Some("fixture-token"),
-        ))
-        .expect("fixture client should build");
+        let client = server.client();
         let input = serde_json::from_value(json!({
             "note_ref": "note/id",
             "title": "Updated"
@@ -360,6 +355,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unplaced_note_is_reported_not_failed() {
+        const UNPLACED: &str = r#"{"id":"new-id","title":"New"}"#;
+        // Create, first read, PATCH, then every read the window has time for.
+        let server = SequenceServer::spawn([
+            (201, UNPLACED),
+            (200, UNPLACED),
+            (202, ""),
+            (200, UNPLACED),
+            (200, UNPLACED),
+            (200, UNPLACED),
+            (200, UNPLACED),
+            (200, UNPLACED),
+        ]);
+        let client = server.client();
+        let input: CreateNoteInput = serde_json::from_value(json!({
+            "title": "New",
+            "parent_folder_id": "folder-id"
+        }))
+        .expect("create input should deserialize");
+
+        let output = create_note(&client, input)
+            .await
+            .expect("an unconfirmed placement must not fail a note that exists");
+        assert_eq!(output.note.id, "new-id");
+        assert!(output.folder_placement_requested);
+        assert!(!output.folder_placement_confirmed);
+        assert!(output.compatibility_patch_applied);
+        assert!(output.note.folder_paths.is_empty());
+    }
+
+    #[tokio::test]
     async fn create_folder_placement_falls_back_when_post_drops_it() {
         let server = SequenceServer::spawn([
             (201, r#"{"id":"new-id","title":"New"}"#),
@@ -370,11 +396,7 @@ mod tests {
                 r#"{"id":"new-id","title":"New","folderPaths":[{"id":"folder-id","name":"Folder"}]}"#,
             ),
         ]);
-        let client = HackmdClient::new(Config::for_loopback_test(
-            &server.api_url,
-            Some("fixture-token"),
-        ))
-        .expect("fixture client should build");
+        let client = server.client();
         let input: CreateNoteInput = serde_json::from_value(json!({
             "title": "New",
             "parent_folder_id": "folder-id"
@@ -386,6 +408,7 @@ mod tests {
             .expect("create and placement should succeed");
         assert_eq!(output.note.id, "new-id");
         assert!(output.folder_placement_requested);
+        assert!(output.folder_placement_confirmed);
         assert!(output.compatibility_patch_applied);
         let requests = server.finish();
         assert!(requests[0].starts_with("POST /v1/notes HTTP/1.1\r\n"));
@@ -406,11 +429,7 @@ mod tests {
                 r#"{"id":"new-id","title":"New","folderPaths":[{"id":"folder-id","name":"Folder"}]}"#,
             ),
         ]);
-        let client = HackmdClient::new(Config::for_loopback_test(
-            &server.api_url,
-            Some("fixture-token"),
-        ))
-        .expect("fixture client should build");
+        let client = server.client();
         let input: CreateNoteInput = serde_json::from_value(json!({
             "title": "New",
             "parent_folder_id": "folder-id"

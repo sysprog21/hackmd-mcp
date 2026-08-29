@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "note reference infrastructure is consumed by the following note tool tasks"
-)]
-
 use serde::Serialize;
 use thiserror::Error;
 use url::Url;
@@ -88,17 +83,6 @@ pub(crate) async fn resolve_note_ref(
             }))
         }
     }
-}
-
-pub(crate) async fn resolve_exact_title(
-    client: &HackmdClient,
-    workspace: Workspace,
-    title: &str,
-) -> Result<NoteResolution, NoteRefError> {
-    let notes = client.list_notes(&workspace).await?;
-    Ok(unique_matches(&workspace, title, notes, |note, query| {
-        note.title == query
-    }))
 }
 
 fn parse_note_ref(note_ref: &str) -> Result<ParsedNoteRef, NoteRefError> {
@@ -234,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_urls_resolve_personal_user_path_before_team_paths() {
-        let fixture = crate::test_support::SequenceServer::spawn([
+        let fixture = crate::fixture::SequenceServer::spawn([
             (
                 200,
                 r#"{"id":"u","name":"User","email":"u@example.com","userPath":"alice"}"#,
@@ -244,11 +228,7 @@ mod tests {
                 r#"[{"id":"personal-id","title":"Personal","permalink":"slug"}]"#,
             ),
         ]);
-        let client = HackmdClient::new(Config::for_loopback_test(
-            &fixture.api_url,
-            Some("fixture-token"),
-        ))
-        .expect("fixture client should build");
+        let client = fixture.client();
         let result = resolve_note_ref(
             &client,
             Workspace::Team {
@@ -268,7 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_team_slug_resolves_through_team_discovery() {
-        let fixture = crate::test_support::SequenceServer::spawn([
+        let fixture = crate::fixture::SequenceServer::spawn([
             (
                 200,
                 r#"{"id":"u","name":"User","email":"u@example.com","userPath":"alice"}"#,
@@ -276,11 +256,7 @@ mod tests {
             (200, r#"[{"id":"t","name":"Core","path":"core"}]"#),
             (200, r#"[{"id":"team-id","title":"Team","shortId":"slug"}]"#),
         ]);
-        let client = HackmdClient::new(Config::for_loopback_test(
-            &fixture.api_url,
-            Some("fixture-token"),
-        ))
-        .expect("fixture client should build");
+        let client = fixture.client();
         let result = resolve_note_ref(&client, Workspace::Personal, "https://hackmd.io/@core/slug")
             .await
             .expect("team URL should resolve");

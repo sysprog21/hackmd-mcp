@@ -24,13 +24,9 @@ const SUPPORTED_ENV_KEYS: [&str; 3] =
 #[derive(Debug)]
 pub(crate) struct Config {
     api_token: Option<SecretToken>,
-    #[allow(dead_code, reason = "consumed by the following HTTP client task")]
     api_url: Url,
-    #[allow(dead_code, reason = "consumed by the following HTTP client task")]
     request_timeout: Duration,
-    #[allow(dead_code, reason = "consumed by the following HTTP client task")]
     connect_timeout: Duration,
-    #[allow(dead_code, reason = "consumed by the following HTTP client task")]
     retry: RetryConfig,
     state_dir: PathBuf,
 }
@@ -41,6 +37,20 @@ impl Config {
             .ok()
             .map(|directory| load_dotenv(&directory.join(".env")))
             .unwrap_or_default();
+        let inherited = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+
+        // The working directory is often someone else's repository. A `.env`
+        // there must not be able to point an inherited token at a host of its
+        // author's choosing, which would hand them the credential on the first
+        // request. An inherited token wins over one in the file, so a `.env`
+        // token does not make this safe; local development is unaffected as
+        // long as the environment carries no token of its own.
+        if inherited("HACKMD_API_TOKEN").is_some()
+            && inherited("HACKMD_API_URL").is_none()
+            && dotenv.contains_key("HACKMD_API_URL")
+        {
+            return Err(ConfigError::DotenvApiUrlWithInheritedToken);
+        }
         Self::from_getter(|key| std::env::var(key).ok().or_else(|| dotenv.get(key).cloned()))
     }
 
@@ -203,10 +213,15 @@ fn is_loopback_host(host: &Host<&str>) -> bool {
 }
 
 fn default_state_dir() -> Result<PathBuf, ConfigError> {
-    BaseDirs::new()
-        .and_then(|directories| directories.state_dir().map(Path::to_path_buf))
-        .map(|state_dir| state_dir.join("hackmd-mcp"))
-        .ok_or(ConfigError::StateDirectoryUnavailable)
+    let directories = BaseDirs::new().ok_or(ConfigError::StateDirectoryUnavailable)?;
+
+    // `state_dir` is Some only on Linux, where XDG defines one. macOS and
+    // Windows have no separate state location, so their private application
+    // data directory serves instead.
+    let root = directories
+        .state_dir()
+        .unwrap_or_else(|| directories.data_local_dir());
+    Ok(root.join("hackmd-mcp"))
 }
 
 fn load_dotenv(path: &Path) -> HashMap<String, String> {
@@ -287,6 +302,10 @@ pub(crate) enum ConfigError {
     InsecureApiUrl,
     #[error("platform state directory is unavailable; set HACKMD_MCP_STATE_DIR")]
     StateDirectoryUnavailable,
+    #[error(
+        "the working-directory .env sets HACKMD_API_URL while HACKMD_API_TOKEN comes from the environment, which would send that token to the endpoint the file names; set HACKMD_API_URL in the environment too, or unset HACKMD_API_TOKEN so the .env values apply as one pair"
+    )]
+    DotenvApiUrlWithInheritedToken,
 }
 
 #[cfg(test)]

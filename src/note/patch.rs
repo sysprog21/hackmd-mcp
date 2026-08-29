@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::models::Workspace;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum PatchError {
     #[error("patch must start with *** Begin Patch")]
@@ -40,6 +42,19 @@ enum HunkLine {
     Remove(String),
 }
 
+/// The identifier a patch must name in its `*** Update File:` header.
+///
+/// Deliberately not URL-encoded: this is a patch target, not a route. The
+/// caller only has to reproduce the exact string `hackmd_get_note` handed it,
+/// and the header is compared verbatim, so a patch prepared for one note can
+/// never be applied to another.
+pub(crate) fn patch_path(workspace: &Workspace, note_id: &str) -> String {
+    match workspace {
+        Workspace::Personal => format!("notes/{note_id}.md"),
+        Workspace::Team { team_path } => format!("teams/{team_path}/notes/{note_id}.md"),
+    }
+}
+
 pub(crate) fn apply_note_patch(
     content: &str,
     patch: &str,
@@ -53,25 +68,41 @@ pub(crate) fn apply_note_patch(
         });
     }
 
-    let trailing_newline = content.ends_with('\n');
-    let mut lines = content
-        .strip_suffix('\n')
-        .unwrap_or(content)
-        .split('\n')
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    if content.is_empty() {
-        lines.clear();
-    }
+    let (mut lines, endings) = split_lines(content);
     for hunk in file_patch.hunks {
         apply_hunk(&mut lines, hunk)?;
     }
+    Ok(join_lines(&lines, endings))
+}
 
-    let mut output = lines.join("\n");
-    if trailing_newline {
-        output.push('\n');
+/// Line endings of the body being patched. A body that uses one style keeps it;
+/// a body that mixes both is rewritten to CRLF, because rejoining the lines has
+/// to pick one.
+#[derive(Clone, Copy)]
+struct LineEndings {
+    crlf: bool,
+    trailing_newline: bool,
+}
+
+/// Splits a body into newline-free lines, which is what hunk lines are: they
+/// reach us through `str::lines`, with any `\r` already stripped. Splitting the
+/// body the same way is what lets CRLF context match at all.
+fn split_lines(content: &str) -> (Vec<String>, LineEndings) {
+    let endings = LineEndings {
+        crlf: content.contains("\r\n"),
+        trailing_newline: content.ends_with('\n'),
+    };
+    (content.lines().map(ToOwned::to_owned).collect(), endings)
+}
+
+fn join_lines(lines: &[String], endings: LineEndings) -> String {
+    let separator = if endings.crlf { "\r\n" } else { "\n" };
+    let mut output = lines.join(separator);
+    // A body whose every line was removed is empty, not a lone newline.
+    if endings.trailing_newline && !lines.is_empty() {
+        output.push_str(separator);
     }
-    Ok(output)
+    output
 }
 
 fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
@@ -112,8 +143,7 @@ fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
     for line in body.iter().skip(1) {
         if *line == "@@" || line.starts_with("@@ ") {
             if let Some(lines) = current.take() {
-                validate_hunk(&lines)?;
-                hunks.push(Hunk { lines });
+                push_hunk(&mut hunks, lines)?;
             }
             current = Some(Vec::new());
             continue;
@@ -136,26 +166,18 @@ fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
     let Some(lines) = current else {
         return Err(PatchError::MissingHunk);
     };
-    validate_hunk(&lines)?;
-    hunks.push(Hunk { lines });
+    push_hunk(&mut hunks, lines)?;
     Ok(FilePatch {
         target: target.to_owned(),
         hunks,
     })
 }
 
-fn validate_hunk(lines: &[HunkLine]) -> Result<(), PatchError> {
+fn push_hunk(hunks: &mut Vec<Hunk>, lines: Vec<HunkLine>) -> Result<(), PatchError> {
     if lines.is_empty() {
         return Err(PatchError::MalformedHunk("hunk cannot be empty"));
     }
-    if !lines
-        .iter()
-        .any(|line| matches!(line, HunkLine::Context(_) | HunkLine::Remove(_)))
-    {
-        return Err(PatchError::MalformedHunk(
-            "hunk must include context or removed lines",
-        ));
-    }
+    hunks.push(Hunk { lines });
     Ok(())
 }
 
@@ -176,6 +198,18 @@ fn apply_hunk(lines: &mut Vec<String>, hunk: Hunk) -> Result<(), PatchError> {
             HunkLine::Remove(_) => None,
         })
         .collect::<Vec<_>>();
+    if old.is_empty() {
+        // Nothing to anchor to: an addition-only hunk is unambiguous only when
+        // it is filling an empty note, which is the one body no context can
+        // describe.
+        if !lines.is_empty() {
+            return Err(PatchError::MalformedHunk(
+                "an addition-only hunk applies only to an empty note; anchor it with context or removed lines",
+            ));
+        }
+        *lines = new;
+        return Ok(());
+    }
     let position = find_unique_match(lines, &old)?;
     lines.splice(position..position + old.len(), new);
     Ok(())
@@ -259,6 +293,42 @@ mod tests {
     }
 
     #[test]
+    fn empty_note_accepts_an_addition_only_hunk() {
+        let patch = envelope("@@\n+first\n+second");
+        assert_eq!(
+            apply_note_patch("", &patch, TARGET),
+            Ok("first\nsecond".to_owned())
+        );
+    }
+
+    #[test]
+    fn crlf_body_matches_context_and_keeps_its_line_endings() {
+        let patch = envelope("@@\n-old\n+new");
+        assert_eq!(
+            apply_note_patch("intro\r\nold\r\n", &patch, TARGET),
+            Ok("intro\r\nnew\r\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_mixed_ending_body_is_normalized_to_crlf() {
+        let patch = envelope("@@\n-old\n+new");
+        assert_eq!(
+            apply_note_patch("intro\r\nold\n", &patch, TARGET),
+            Ok("intro\r\nnew\r\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn removing_every_line_leaves_an_empty_body() {
+        let patch = envelope("@@\n-only");
+        assert_eq!(
+            apply_note_patch("only\n", &patch, TARGET),
+            Ok(String::new())
+        );
+    }
+
+    #[test]
     fn rejects_malformed_envelopes_and_hunks_distinctly() {
         let cases = [
             (
@@ -283,7 +353,9 @@ mod tests {
             ),
             (
                 "*** Begin Patch\n*** Update File: notes/a.md\n@@\n+only-add\n*** End Patch",
-                PatchError::MalformedHunk("hunk must include context or removed lines"),
+                PatchError::MalformedHunk(
+                    "an addition-only hunk applies only to an empty note; anchor it with context or removed lines",
+                ),
             ),
         ];
         for (patch, expected) in cases {

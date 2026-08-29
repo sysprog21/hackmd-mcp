@@ -2,7 +2,13 @@
 //!
 //! These tests are ignored by default. Run explicitly with a dedicated test
 //! account/token and isolated team:
-//! `HACKMD_RUN_LIVE_TESTS=1 HACKMD_LIVE_TEST_TOKEN=... HACKMD_LIVE_TEST_TEAM_PATH=... cargo test --test live-smoke -- --ignored`
+//!
+//! ```sh
+//! HACKMD_RUN_LIVE_TESTS=1 \
+//!     HACKMD_LIVE_TEST_TOKEN=... \
+//!     HACKMD_LIVE_TEST_TEAM_PATH=... \
+//!     cargo test --test live-smoke -- --ignored
+//! ```
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

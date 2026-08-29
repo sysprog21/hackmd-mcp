@@ -6,19 +6,21 @@ use crate::{
     client::{HackmdClient, HackmdError},
     dto::UpdateNoteRequest,
     models::Workspace,
-    note_ref::{NoteRefError, NoteResolution},
-    patch::PatchError,
+    note::patch::PatchError,
+    note::reference::{NoteRefError, NoteResolution},
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EditNoteInput {
-    /// Workspace used for a direct internal note ID; scoped URLs resolve their own workspace.
+    /// Workspace used for a direct internal note ID; scoped URLs resolve their
+    /// own workspace.
     #[serde(default)]
     pub(crate) workspace: Workspace,
     /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
     pub(crate) note_ref: String,
-    /// Codex patch envelope targeting the exact `patch_path` from `hackmd_get_note`.
+    /// Codex patch envelope targeting the exact `patch_path` from
+    /// `hackmd_get_note`.
     pub(crate) patch: String,
 }
 
@@ -50,7 +52,7 @@ pub(crate) async fn edit_note(
     input: EditNoteInput,
 ) -> Result<Result<EditNoteOutput, NoteResolution>, EditNoteError> {
     let resolution =
-        crate::note_ref::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
+        crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
@@ -60,8 +62,8 @@ pub(crate) async fn edit_note(
         .ok_or_else(|| EditNoteError::MissingContent {
             note_id: note.note_id.clone(),
         })?;
-    let patch_path = crate::get_note::patch_path(&note.workspace, &note.note_id);
-    let updated = crate::patch::apply_note_patch(&content, &input.patch, &patch_path)?;
+    let patch_path = crate::note::patch::patch_path(&note.workspace, &note.note_id);
+    let updated = crate::note::patch::apply_note_patch(&content, &input.patch, &patch_path)?;
     let changed = updated != content;
     if changed {
         client
@@ -74,8 +76,12 @@ pub(crate) async fn edit_note(
                 },
             )
             .await?;
-        let readback = client.get_note(&note.workspace, &note.note_id).await?;
-        if readback.content.as_deref() != Some(updated.as_str()) {
+        let readback = crate::client::poll_readback(
+            || client.get_note(&note.workspace, &note.note_id),
+            |readback| readback.content.as_deref() == Some(updated.as_str()),
+        )
+        .await?;
+        if !readback.confirmed {
             return Err(EditNoteError::ReadbackMismatch {
                 note_id: note.note_id,
             });
@@ -93,18 +99,7 @@ pub(crate) async fn edit_note(
 #[cfg(test)]
 mod tests {
     use super::{EditNoteError, EditNoteInput, edit_note};
-    use crate::{
-        client::HackmdClient, config::Config, models::Workspace, patch::PatchError,
-        test_support::SequenceServer,
-    };
-
-    fn client(server: &SequenceServer) -> HackmdClient {
-        HackmdClient::new(Config::for_loopback_test(
-            &server.api_url,
-            Some("fixture-token"),
-        ))
-        .expect("fixture client should build")
-    }
+    use crate::{fixture::SequenceServer, models::Workspace, note::patch::PatchError};
 
     fn input(patch: &str) -> EditNoteInput {
         EditNoteInput {
@@ -123,7 +118,7 @@ mod tests {
         ]);
         let patch =
             "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch";
-        let output = edit_note(&client(&server), input(patch))
+        let output = edit_note(&server.client(), input(patch))
             .await
             .expect("edit should succeed")
             .expect("reference should resolve");
@@ -141,7 +136,7 @@ mod tests {
         let server =
             SequenceServer::spawn([(200, r#"{"id":"note-id","title":"Title","content":"same"}"#)]);
         let patch = "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n same\n*** End Patch";
-        let output = edit_note(&client(&server), input(patch))
+        let output = edit_note(&server.client(), input(patch))
             .await
             .expect("no-op should succeed")
             .expect("reference should resolve");
@@ -157,7 +152,7 @@ mod tests {
         )]);
         let patch =
             "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-missing\n+new\n*** End Patch";
-        let error = edit_note(&client(&server), input(patch))
+        let error = edit_note(&server.client(), input(patch))
             .await
             .expect_err("missing context should conflict");
         assert!(matches!(
@@ -183,7 +178,7 @@ mod tests {
         ];
         for (body, patch, expected) in cases {
             let server = SequenceServer::spawn([(200, body)]);
-            let message = edit_note(&client(&server), input(patch))
+            let message = edit_note(&server.client(), input(patch))
                 .await
                 .expect_err("patch must conflict")
                 .to_string();
@@ -201,7 +196,7 @@ mod tests {
         ]);
         let patch = "*** Begin Patch\n*** Update File: teams/core/notes/note-id.md\n@@\n-old\n+new\n*** End Patch";
         let output = edit_note(
-            &client(&server),
+            &server.client(),
             EditNoteInput {
                 workspace: Workspace::Team {
                     team_path: "core".to_owned(),

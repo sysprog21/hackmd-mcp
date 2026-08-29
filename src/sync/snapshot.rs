@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
-    state::{StateError, write_local_atomic},
+    sync::state::{StateError, write_local_atomic},
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -72,43 +72,16 @@ mod tests {
     use std::fs;
 
     use super::{SaveRemoteSnapshotError, SaveRemoteSnapshotInput, save_remote_snapshot};
-    use crate::{
-        client::HackmdClient,
-        config::Config,
-        models::Workspace,
-        state::{TrackedNoteState, local_file_identity},
-    };
-
     #[tokio::test]
     async fn snapshot_is_atomic_separate_and_requires_overwrite_confirmation() {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "local working").expect("local fixture should write");
-        let fixture = crate::test_support::SequenceServer::spawn([
+        let fixture = crate::fixture::SequenceServer::spawn([
             (200, r#"{"id":"id","title":"Note","content":"remote one"}"#),
             (200, r#"{"id":"id","title":"Note","content":"remote two"}"#),
         ]);
-        let client = HackmdClient::new(Config::for_loopback_test_with_state(
-            &fixture.api_url,
-            "fixture-token",
-            &directory.path().join("state"),
-        ))
-        .expect("fixture client should build");
-        client
-            .state()
-            .persist_from_sync(
-                &TrackedNoteState {
-                    internal_id: "id".to_owned(),
-                    workspace: Workspace::Personal,
-                    local_path: local_path.clone(),
-                    baseline_body_hash: "sha256:fixture".to_owned(),
-                    last_observed_remote_timestamp: "1".to_owned(),
-                    local_file_identity: local_file_identity(&local_path)
-                        .expect("identity should resolve"),
-                },
-                "baseline",
-            )
-            .expect("state should persist");
+        let client = fixture.tracked_client(directory.path(), "id", &local_path, "baseline");
 
         let output = save_remote_snapshot(
             &client,

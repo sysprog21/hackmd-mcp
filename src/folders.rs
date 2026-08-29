@@ -1,13 +1,17 @@
 use std::collections::{BTreeMap, HashSet};
 
 use rmcp::schemars;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
-    dto::{CreateFolderRequest, FolderResponse, PayloadError, UpdateFolderRequest},
+    dto::{
+        CreateFolderRequest, FolderResponse, PatchField, PayloadError, UpdateFolderRequest,
+        deserialize_patch_field,
+    },
     models::Workspace,
+    paging::{InvalidLimit, PageMeta, default_limit, paginate, validate_limit},
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -23,10 +27,6 @@ pub(crate) struct FolderWorkspaceInput {
     /// Number of folders to skip in API order.
     #[serde(default)]
     pub(crate) offset: usize,
-}
-
-const fn default_limit() -> usize {
-    crate::list_notes::DEFAULT_LIMIT
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -55,20 +55,6 @@ pub(crate) struct CreateFolderInput {
     pub(crate) parent_folder_id: Option<String>,
 }
 
-#[derive(Debug, Default)]
-enum NullableString {
-    #[default]
-    Unspecified,
-    Set(Option<String>),
-}
-
-fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<NullableString, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer).map(NullableString::Set)
-}
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpdateFolderInput {
@@ -79,21 +65,22 @@ pub(crate) struct UpdateFolderInput {
     /// New non-empty name; unlike other fields, name cannot be null.
     pub(crate) name: Option<String>,
     /// New description, null to clear, or omit to preserve.
-    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
     #[schemars(with = "Option<String>")]
-    description: NullableString,
+    description: PatchField,
     /// New icon, null to clear, or omit to preserve.
-    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
     #[schemars(with = "Option<String>")]
-    icon: NullableString,
+    icon: PatchField,
     /// New color, null to clear, or omit to preserve.
-    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
     #[schemars(with = "Option<String>")]
-    color: NullableString,
-    /// Reserved for API compatibility; omit because `HackMD` ignores folder moves.
-    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    color: PatchField,
+    /// Reserved for API compatibility; omit because `HackMD` ignores folder
+    /// moves.
+    #[serde(default, deserialize_with = "deserialize_patch_field")]
     #[schemars(with = "Option<String>")]
-    parent_folder_id: NullableString,
+    parent_folder_id: PatchField,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -123,11 +110,8 @@ pub(crate) struct SetFolderOrderInput {
 #[derive(Debug, Serialize)]
 pub(crate) struct FolderListOutput {
     pub(crate) workspace: Workspace,
-    pub(crate) total: usize,
-    pub(crate) count: usize,
-    pub(crate) offset: usize,
-    pub(crate) has_more: bool,
-    pub(crate) next_offset: Option<usize>,
+    #[serde(flatten)]
+    pub(crate) meta: PageMeta,
     pub(crate) folders: Vec<FolderSummary>,
 }
 
@@ -171,8 +155,8 @@ pub(crate) enum FolderError {
     NotFound { folder_id: String },
     #[error("folder_ids contains duplicate folder ID {folder_id:?}")]
     DuplicateOrderId { folder_id: String },
-    #[error("limit must be between 1 and 100")]
-    InvalidLimit,
+    #[error(transparent)]
+    Limit(#[from] InvalidLimit),
     #[error("HackMD accepted the folder update for {folder_id}, but read-back did not match")]
     ReadbackMismatch { folder_id: String },
     #[error("personal folder updates are unsupported: HackMD exposes PATCH only for team folders")]
@@ -213,15 +197,11 @@ pub(crate) async fn list_folders(
     client: &HackmdClient,
     input: FolderWorkspaceInput,
 ) -> Result<FolderListOutput, FolderError> {
-    if !(1..=crate::list_notes::MAX_LIMIT).contains(&input.limit) {
-        return Err(FolderError::InvalidLimit);
-    }
-    let folders = client.list_folders(&input.workspace).await?;
-    let total = folders.len();
-    let folders = folders
+    validate_limit(input.limit)?;
+    let folders = client
+        .list_folders(&input.workspace)
+        .await?
         .into_iter()
-        .skip(input.offset)
-        .take(input.limit)
         .map(|folder| FolderSummary {
             id: folder.id,
             name: folder.name,
@@ -230,17 +210,11 @@ pub(crate) async fn list_folders(
             color: folder.color,
             parent_folder_id: folder.parent_folder_id,
         })
-        .collect::<Vec<_>>();
-    let count = folders.len();
-    let next = input.offset.saturating_add(count);
-    let has_more = next < total;
+        .collect();
+    let (folders, meta) = paginate(folders, input.offset, input.limit);
     Ok(FolderListOutput {
         workspace: input.workspace,
-        total,
-        count,
-        offset: input.offset,
-        has_more,
-        next_offset: has_more.then_some(next),
+        meta,
         folders,
     })
 }
@@ -298,37 +272,31 @@ pub(crate) async fn update_folder(
     if matches!(input.workspace, Workspace::Personal) {
         return Err(FolderError::UnsupportedPersonalUpdate);
     }
-    let parent_folder_id = into_patch_field(input.parent_folder_id);
-    if parent_folder_id.is_some() {
+    if input.parent_folder_id.into_request().is_some() {
         return Err(FolderError::UnsupportedFolderMove);
     }
     let payload = UpdateFolderRequest {
         name: input.name,
-        description: into_patch_field(input.description),
-        icon: into_patch_field(input.icon),
-        color: into_patch_field(input.color),
-        parent_folder_id: parent_folder_id.clone(),
+        description: input.description.into_request(),
+        icon: input.icon.into_request(),
+        color: input.color.into_request(),
+        parent_folder_id: None,
     };
     payload.validate()?;
     client
         .update_folder(&input.workspace, &input.folder_id, &payload)
         .await?;
-    let mut folder = None;
-    for attempt in 0..10 {
-        let candidate = client
-            .get_folder(&input.workspace, &input.folder_id)
-            .await?;
-        if folder_matches_update(&candidate, &payload) {
-            folder = Some(candidate);
-            break;
-        }
-        if attempt < 9 {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
+    let folder = crate::client::poll_readback(
+        || client.get_folder(&input.workspace, &input.folder_id),
+        |folder| folder_matches_update(folder, &payload),
+    )
+    .await?;
+    if !folder.confirmed {
+        return Err(FolderError::ReadbackMismatch {
+            folder_id: input.folder_id.clone(),
+        });
     }
-    let folder = folder.ok_or_else(|| FolderError::ReadbackMismatch {
-        folder_id: input.folder_id.clone(),
-    })?;
+    let folder = folder.value;
     Ok(FolderOutput {
         workspace: input.workspace,
         folder,
@@ -387,63 +355,42 @@ pub(crate) async fn delete_folder(
     })
 }
 
-#[allow(
-    clippy::option_option,
-    reason = "outer None omits the PATCH field; inner None explicitly clears it"
-)]
-fn into_patch_field(value: NullableString) -> Option<Option<String>> {
-    match value {
-        NullableString::Unspecified => None,
-        NullableString::Set(value) => Some(value),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::{
-        CreateFolderInput, DeleteFolderInput, FolderError, FolderWorkspaceInput, NullableString,
+        CreateFolderInput, DeleteFolderInput, FolderError, FolderWorkspaceInput,
         SetFolderOrderInput, UpdateFolderInput, create_folder, delete_folder, list_folders,
         set_folder_order, update_folder,
     };
-    use crate::{client::HackmdClient, config::Config, models::Workspace};
-
-    fn fixture_client(server: &crate::test_support::SequenceServer) -> HackmdClient {
-        HackmdClient::new(Config::for_loopback_test(
-            &server.api_url,
-            Some("fixture-token"),
-        ))
-        .expect("fixture client should build")
-    }
+    use crate::{client::HackmdClient, config::Config, dto::PatchField, models::Workspace};
 
     #[test]
     fn update_fields_distinguish_absent_null_and_value() {
         let absent: UpdateFolderInput = serde_json::from_value(json!({"folder_id": "id"}))
             .expect("absent fields should deserialize");
-        assert!(matches!(absent.color, NullableString::Unspecified));
+        assert!(matches!(absent.color, PatchField::Unspecified));
         let clear: UpdateFolderInput = serde_json::from_value(json!({
             "folder_id": "id",
             "color": null
         }))
         .expect("null should deserialize");
-        assert!(matches!(clear.color, NullableString::Set(None)));
+        assert!(matches!(clear.color, PatchField::Set(None)));
         let set: UpdateFolderInput = serde_json::from_value(json!({
             "folder_id": "id",
             "color": "#fff"
         }))
         .expect("value should deserialize");
-        assert!(matches!(set.color, NullableString::Set(Some(value)) if value == "#fff"));
+        assert!(matches!(set.color, PatchField::Set(Some(value)) if value == "#fff"));
     }
 
     #[tokio::test]
     async fn root_create_omits_parent_and_team_create_is_preflighted() {
-        let personal = crate::test_support::SequenceServer::spawn([(
-            201,
-            r#"{"id":"root/id","name":"Root"}"#,
-        )]);
+        let personal =
+            crate::fixture::SequenceServer::spawn([(201, r#"{"id":"root/id","name":"Root"}"#)]);
         let output = create_folder(
-            &fixture_client(&personal),
+            &personal.client(),
             CreateFolderInput {
                 workspace: Workspace::Personal,
                 name: "Root".to_owned(),
@@ -461,12 +408,12 @@ mod tests {
         assert!(requests[0].ends_with(r#"{"name":"Root"}"#));
         assert!(!requests[0].contains("parentFolderId"));
 
-        let team = crate::test_support::SequenceServer::spawn([
+        let team = crate::fixture::SequenceServer::spawn([
             (200, r#"[{"id":"t","name":"Team","path":"team/path"}]"#),
             (201, r#"{"id":"nested","name":"Nested"}"#),
         ]);
         create_folder(
-            &fixture_client(&team),
+            &team.client(),
             CreateFolderInput {
                 workspace: Workspace::Team {
                     team_path: "team/path".to_owned(),
@@ -488,7 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_clears_nullable_metadata_then_reads_encoded_folder_back() {
-        let fixture = crate::test_support::SequenceServer::spawn([
+        let fixture = crate::fixture::SequenceServer::spawn([
             (202, ""),
             (200, r#"{"id":"folder/id","name":"Moved"}"#),
         ]);
@@ -498,7 +445,7 @@ mod tests {
             "description": null
         }))
         .expect("tri-state update should deserialize");
-        update_folder(&fixture_client(&fixture), input)
+        update_folder(&fixture.client(), input)
             .await
             .expect("folder update should read back");
         let requests = fixture.finish();
@@ -513,7 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_polls_until_async_change_is_visible() {
-        let fixture = crate::test_support::SequenceServer::spawn([
+        let fixture = crate::fixture::SequenceServer::spawn([
             (202, ""),
             (200, r#"{"id":"folder","name":"Old"}"#),
             (200, r#"{"id":"folder","name":"New"}"#),
@@ -524,7 +471,7 @@ mod tests {
             "name": "New"
         }))
         .expect("folder update should deserialize");
-        let output = update_folder(&fixture_client(&fixture), input)
+        let output = update_folder(&fixture.client(), input)
             .await
             .expect("eventual folder update should succeed");
         assert_eq!(output.folder.name, "New");
@@ -562,12 +509,12 @@ mod tests {
 
     #[tokio::test]
     async fn nonempty_delete_requires_confirmation_without_mutation() {
-        let fixture = crate::test_support::SequenceServer::spawn([(
+        let fixture = crate::fixture::SequenceServer::spawn([(
             200,
             r#"[{"id":"parent","name":"Parent"},{"id":"child","name":"Child","parentFolderId":"parent"}]"#,
         )]);
         let output = delete_folder(
-            &fixture_client(&fixture),
+            &fixture.client(),
             DeleteFolderInput {
                 workspace: Workspace::Personal,
                 folder_id: "parent".to_owned(),
@@ -584,12 +531,12 @@ mod tests {
 
     #[tokio::test]
     async fn folder_order_merge_preserves_unrelated_entries() {
-        let fixture = crate::test_support::SequenceServer::spawn([
+        let fixture = crate::fixture::SequenceServer::spawn([
             (200, r#"{"root":["old"],"other":["keep"]}"#),
             (204, ""),
         ]);
         let output = set_folder_order(
-            &fixture_client(&fixture),
+            &fixture.client(),
             SetFolderOrderInput {
                 workspace: Workspace::Personal,
                 parent_folder_id: None,
@@ -607,7 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn folder_list_is_slim_and_explicitly_paginated() {
-        let fixture = crate::test_support::SequenceServer::spawn([(
+        let fixture = crate::fixture::SequenceServer::spawn([(
             200,
             r#"[
                 {"id":"a","name":"A","createdAt":1,"updatedAt":2},
@@ -616,7 +563,7 @@ mod tests {
             ]"#,
         )]);
         let output = list_folders(
-            &fixture_client(&fixture),
+            &fixture.client(),
             FolderWorkspaceInput {
                 workspace: Workspace::Personal,
                 limit: 1,
@@ -625,11 +572,11 @@ mod tests {
         )
         .await
         .expect("folder list should succeed");
-        assert_eq!(output.total, 3);
-        assert_eq!(output.count, 1);
-        assert_eq!(output.offset, 1);
-        assert!(output.has_more);
-        assert_eq!(output.next_offset, Some(2));
+        assert_eq!(output.meta.total, 3);
+        assert_eq!(output.meta.count, 1);
+        assert_eq!(output.meta.offset, 1);
+        assert!(output.meta.has_more);
+        assert_eq!(output.meta.next_offset, Some(2));
         let value = serde_json::to_value(&output.folders[0]).expect("summary should serialize");
         assert_eq!(value["id"], "b");
         assert!(value.get("created_at").is_none());
@@ -649,6 +596,6 @@ mod tests {
         )
         .await
         .expect_err("zero limit should be rejected");
-        assert!(matches!(error, FolderError::InvalidLimit));
+        assert!(matches!(error, FolderError::Limit(_)));
     }
 }

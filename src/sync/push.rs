@@ -1,8 +1,10 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use similar::TextDiff;
 use thiserror::Error;
 
@@ -10,12 +12,10 @@ use crate::{
     client::{HackmdClient, HackmdError},
     dto::UpdateNoteRequest,
     models::Workspace,
-    note_ref::{NoteRefError, NoteResolution},
-    state::{StateError, TrackedNoteState, local_file_identity},
+    note::reference::{NoteRefError, NoteResolution},
+    sync::state::{StateError, TrackedNoteState},
+    sync::{BODY_MAX_BYTES, BODY_WARNING_BYTES},
 };
-
-const WARNING_BYTES: usize = 5 * 1024 * 1024;
-const MAX_BYTES: usize = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -80,7 +80,10 @@ pub(crate) enum PushNoteError {
     OverwriteConfirmationRequired,
     #[error("local file is {size_bytes} bytes; retry with confirm_large_file: true")]
     LargeFileConfirmationRequired { size_bytes: usize },
-    #[error("local file is {size_bytes} bytes; files above 50 MiB are refused")]
+    #[error(
+        "local file is {size_bytes} bytes; files above {} MiB are refused",
+        BODY_MAX_BYTES / 1024 / 1024
+    )]
     TooLarge { size_bytes: usize },
     #[error("note_ref/workspace resolves to a different note than the local sync sidecar")]
     TrackingMismatch,
@@ -105,7 +108,8 @@ pub(crate) async fn push_note(
     let local = validate_and_read_local(&input)?;
     let tracked = client.state().load_for_local_path(&input.local_path)?;
     let resolution =
-        crate::note_ref::resolve_note_ref(client, input.workspace.clone(), &input.note_ref).await?;
+        crate::note::reference::resolve_note_ref(client, input.workspace.clone(), &input.note_ref)
+            .await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
@@ -113,14 +117,21 @@ pub(crate) async fn push_note(
         return Err(PushNoteError::TrackingMismatch);
     }
     let remote_note = client.get_note(&note.workspace, &note.note_id).await?;
-    let remote =
-        remote_note
-            .content
-            .clone()
-            .ok_or_else(|| PushNoteError::MissingRemoteContent {
-                note_id: note.note_id.clone(),
-            })?;
-    push_resolved(client, input, tracked, note, remote_note, remote, local).await
+    let remote = remote_note
+        .content
+        .ok_or_else(|| PushNoteError::MissingRemoteContent {
+            note_id: note.note_id.clone(),
+        })?;
+    push_resolved(
+        client,
+        input.strategy,
+        tracked,
+        note,
+        remote_note.last_changed_at,
+        remote,
+        local,
+    )
+    .await
 }
 
 fn validate_and_read_local(input: &PushNoteInput) -> Result<String, PushNoteError> {
@@ -140,10 +151,10 @@ fn validate_and_read_local(input: &PushNoteInput) -> Result<String, PushNoteErro
 }
 
 fn validate_body_size(size_bytes: usize, confirmed: bool) -> Result<(), PushNoteError> {
-    if size_bytes > MAX_BYTES {
+    if size_bytes > BODY_MAX_BYTES {
         return Err(PushNoteError::TooLarge { size_bytes });
     }
-    if size_bytes > WARNING_BYTES && !confirmed {
+    if size_bytes > BODY_WARNING_BYTES && !confirmed {
         return Err(PushNoteError::LargeFileConfirmationRequired { size_bytes });
     }
     Ok(())
@@ -151,62 +162,57 @@ fn validate_body_size(size_bytes: usize, confirmed: bool) -> Result<(), PushNote
 
 async fn push_resolved(
     client: &HackmdClient,
-    input: PushNoteInput,
-    tracked: crate::state::LoadedTrackedState,
-    note: crate::note_ref::ResolvedNoteRef,
-    remote_note: crate::dto::NoteResponse,
+    strategy: PushStrategy,
+    tracked: crate::sync::state::LoadedTrackedState,
+    note: crate::note::reference::ResolvedNoteRef,
+    remote_timestamp: Option<i64>,
     remote: String,
     local: String,
 ) -> Result<Result<PushNoteOutput, NoteResolution>, PushNoteError> {
-    if matches!(input.strategy, PushStrategy::Safe) {
+    // Every result reports the tracked canonical path, not the caller's
+    // spelling of it, so the snapshot path here is the one
+    // hackmd_save_remote_snapshot would write.
+    let target = Target {
+        workspace: &note.workspace,
+        note_id: &note.note_id,
+        local_path: &tracked.state.local_path,
+        baseline_path: &tracked.baseline_path,
+    };
+    if matches!(strategy, PushStrategy::Safe) {
         if local == tracked.baseline_body {
             let status = if remote == tracked.baseline_body {
                 PushStatus::NothingToPush
             } else {
                 PushStatus::RemoteChanged
             };
-            return Ok(Ok(output(
-                status,
-                &note.workspace,
-                &note.note_id,
-                &tracked.state.local_path,
-                &tracked.baseline_path,
-                false,
-            )));
+            return Ok(Ok(output(&target, status, false)));
         }
         if remote != tracked.baseline_body {
             return Ok(Ok(conflict_output(
-                &note.workspace,
-                &note.note_id,
-                &tracked.state.local_path,
-                &tracked.baseline_path,
+                &target,
                 &tracked.baseline_body,
                 &local,
                 &remote,
             )));
         }
+
+        // Last look before writing. This narrows the window in which a
+        // concurrent editor is clobbered but cannot close it: HackMD offers no
+        // conditional write, so a remote edit landing between this read and the
+        // PATCH below is still overwritten.
         let recheck = client.get_note(&note.workspace, &note.note_id).await?;
         if recheck.content.as_deref() != Some(tracked.baseline_body.as_str()) {
             return Ok(Ok(conflict_output(
-                &note.workspace,
-                &note.note_id,
-                &tracked.state.local_path,
-                &tracked.baseline_path,
+                &target,
                 &tracked.baseline_body,
                 &local,
                 recheck.content.as_deref().unwrap_or_default(),
             )));
         }
     } else if remote == local {
-        persist_advanced_state(client, tracked.state, &local, &remote_note)?;
-        return Ok(Ok(output(
-            PushStatus::NothingToPush,
-            &note.workspace,
-            &note.note_id,
-            &input.local_path,
-            &tracked.baseline_path,
-            false,
-        )));
+        let result = output(&target, PushStatus::NothingToPush, false);
+        advance_state(client, tracked.state, &local, remote_timestamp)?;
+        return Ok(Ok(result));
     }
     client
         .update_note(
@@ -218,37 +224,42 @@ async fn push_resolved(
             },
         )
         .await?;
-    let readback = client.get_note(&note.workspace, &note.note_id).await?;
-    if readback.content.as_deref() != Some(local.as_str()) {
+    let readback = crate::client::poll_readback(
+        || client.get_note(&note.workspace, &note.note_id),
+        |readback| readback.content.as_deref() == Some(local.as_str()),
+    )
+    .await?;
+    if !readback.confirmed {
         return Err(PushNoteError::ReadbackMismatch {
             note_id: note.note_id,
         });
     }
-    persist_advanced_state(client, tracked.state, &local, &readback)?;
-    Ok(Ok(output(
-        PushStatus::Pushed,
-        &note.workspace,
-        &note.note_id,
-        &input.local_path,
-        &tracked.baseline_path,
-        true,
-    )))
+    let result = output(&target, PushStatus::Pushed, true);
+    advance_state(
+        client,
+        tracked.state,
+        &local,
+        readback.value.last_changed_at,
+    )?;
+    Ok(Ok(result))
 }
 
-fn output(
-    status: PushStatus,
-    workspace: &Workspace,
-    note_id: &str,
-    local_path: &std::path::Path,
-    baseline_path: &std::path::Path,
-    pushed: bool,
-) -> PushNoteOutput {
+/// The note and the two files every push result names, borrowed once so the
+/// result builders do not repeat them.
+struct Target<'a> {
+    workspace: &'a Workspace,
+    note_id: &'a str,
+    local_path: &'a Path,
+    baseline_path: &'a Path,
+}
+
+fn output(target: &Target<'_>, status: PushStatus, pushed: bool) -> PushNoteOutput {
     PushNoteOutput {
         status,
-        workspace: workspace.clone(),
-        note_id: note_id.to_owned(),
-        local_path: local_path.to_path_buf(),
-        baseline_path: baseline_path.to_path_buf(),
+        workspace: target.workspace.clone(),
+        note_id: target.note_id.to_owned(),
+        local_path: target.local_path.to_path_buf(),
+        baseline_path: target.baseline_path.to_path_buf(),
         pushed,
         merge_required: false,
         diff_summary: None,
@@ -258,22 +269,13 @@ fn output(
 }
 
 fn conflict_output(
-    workspace: &Workspace,
-    note_id: &str,
-    local_path: &std::path::Path,
-    baseline_path: &std::path::Path,
+    target: &Target<'_>,
     baseline: &str,
     local: &str,
     remote: &str,
 ) -> PushNoteOutput {
-    let candidate_snapshot = local_path.with_extension("remote.md");
+    let candidate_snapshot = target.local_path.with_extension("remote.md");
     PushNoteOutput {
-        status: PushStatus::Conflict,
-        workspace: workspace.clone(),
-        note_id: note_id.to_owned(),
-        local_path: local_path.to_path_buf(),
-        baseline_path: baseline_path.to_path_buf(),
-        pushed: false,
         merge_required: true,
         diff_summary: Some(conflict_diff(baseline, local, remote)),
         snapshot_path: candidate_snapshot.exists().then_some(candidate_snapshot),
@@ -281,6 +283,7 @@ fn conflict_output(
             "Merge the local and remote changes; call hackmd_save_remote_snapshot with local_path to save the current remote body. Do not overwrite until the merge is reviewed."
                 .to_owned(),
         ),
+        ..output(target, PushStatus::Conflict, false)
     }
 }
 
@@ -305,17 +308,13 @@ fn conflict_diff(baseline: &str, local: &str, remote: &str) -> String {
     bounded
 }
 
-fn persist_advanced_state(
+fn advance_state(
     client: &HackmdClient,
-    mut state: TrackedNoteState,
+    state: TrackedNoteState,
     body: &str,
-    readback: &crate::dto::NoteResponse,
+    remote_timestamp: Option<i64>,
 ) -> Result<(), PushNoteError> {
-    state.baseline_body_hash = format!("sha256:{:x}", Sha256::digest(body.as_bytes()));
-    state.last_observed_remote_timestamp = readback
-        .last_changed_at
-        .map_or_else(String::new, |timestamp| timestamp.to_string());
-    state.local_file_identity = local_file_identity(&state.local_path)?;
+    let state = state.advance(body, remote_timestamp)?;
     client.state().persist_from_sync(&state, body)?;
     Ok(())
 }
@@ -325,45 +324,15 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::{
-        MAX_BYTES, PushNoteError, PushNoteInput, PushStatus, PushStrategy, WARNING_BYTES,
-        conflict_diff, push_note, validate_body_size,
+        PushNoteError, PushNoteInput, PushStatus, PushStrategy, conflict_diff, push_note,
+        validate_body_size,
     };
     use crate::{
         client::HackmdClient,
         config::Config,
         models::Workspace,
-        state::{TrackedNoteState, local_file_identity},
+        sync::{BODY_MAX_BYTES, BODY_WARNING_BYTES},
     };
-
-    fn tracked_client(
-        fixture: &crate::test_support::SequenceServer,
-        root: &Path,
-        local_path: &Path,
-        baseline: &str,
-    ) -> HackmdClient {
-        let client = HackmdClient::new(Config::for_loopback_test_with_state(
-            &fixture.api_url,
-            "fixture-token",
-            &root.join("state"),
-        ))
-        .expect("fixture client should build");
-        client
-            .state()
-            .persist_from_sync(
-                &TrackedNoteState {
-                    internal_id: "note-id".to_owned(),
-                    workspace: Workspace::Personal,
-                    local_path: local_path.to_path_buf(),
-                    baseline_body_hash: "sha256:fixture".to_owned(),
-                    last_observed_remote_timestamp: "1".to_owned(),
-                    local_file_identity: local_file_identity(local_path)
-                        .expect("local identity should resolve"),
-                },
-                baseline,
-            )
-            .expect("tracked state should persist");
-        client
-    }
 
     fn input(path: &Path, strategy: PushStrategy, confirm: bool) -> PushNoteInput {
         PushNoteInput {
@@ -381,7 +350,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "local edit").expect("local fixture should write");
-        let fixture = crate::test_support::SequenceServer::spawn([
+        let fixture = crate::fixture::SequenceServer::spawn([
             (
                 200,
                 r#"{"id":"note-id","title":"Note","content":"baseline"}"#,
@@ -396,7 +365,7 @@ mod tests {
                 r#"{"id":"note-id","title":"Note","content":"local edit","lastChangedAt":2}"#,
             ),
         ]);
-        let client = tracked_client(&fixture, directory.path(), &local_path, "baseline");
+        let client = fixture.tracked_client(directory.path(), "note-id", &local_path, "baseline");
         let output = push_note(&client, input(&local_path, PushStrategy::Safe, false))
             .await
             .expect("safe push should succeed")
@@ -422,11 +391,11 @@ mod tests {
         fs::write(&local_path, "local edit").expect("local fixture should write");
         fs::write(local_path.with_extension("remote.md"), "prior snapshot")
             .expect("snapshot fixture should write");
-        let fixture = crate::test_support::SequenceServer::spawn([(
+        let fixture = crate::fixture::SequenceServer::spawn([(
             200,
             r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
         )]);
-        let client = tracked_client(&fixture, directory.path(), &local_path, "baseline");
+        let client = fixture.tracked_client(directory.path(), "note-id", &local_path, "baseline");
         let output = push_note(&client, input(&local_path, PushStrategy::Safe, false))
             .await
             .expect("comparison should succeed")
@@ -469,11 +438,11 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "baseline").expect("local fixture should write");
-        let fixture = crate::test_support::SequenceServer::spawn([(
+        let fixture = crate::fixture::SequenceServer::spawn([(
             200,
             r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
         )]);
-        let client = tracked_client(&fixture, directory.path(), &local_path, "baseline");
+        let client = fixture.tracked_client(directory.path(), "note-id", &local_path, "baseline");
         let output = push_note(&client, input(&local_path, PushStrategy::Safe, false))
             .await
             .expect("comparison should succeed")
@@ -487,11 +456,11 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "baseline").expect("local fixture should write");
-        let fixture = crate::test_support::SequenceServer::spawn([(
+        let fixture = crate::fixture::SequenceServer::spawn([(
             200,
             r#"{"id":"note-id","title":"Note","content":"baseline"}"#,
         )]);
-        let client = tracked_client(&fixture, directory.path(), &local_path, "baseline");
+        let client = fixture.tracked_client(directory.path(), "note-id", &local_path, "baseline");
         let output = push_note(&client, input(&local_path, PushStrategy::Safe, false))
             .await
             .expect("comparison should succeed")
@@ -518,7 +487,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "forced local").expect("local fixture should write");
-        let fixture = crate::test_support::SequenceServer::spawn([
+        let fixture = crate::fixture::SequenceServer::spawn([
             (
                 200,
                 r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
@@ -529,7 +498,7 @@ mod tests {
                 r#"{"id":"note-id","title":"Note","content":"forced local","lastChangedAt":3}"#,
             ),
         ]);
-        let client = tracked_client(&fixture, directory.path(), &local_path, "baseline");
+        let client = fixture.tracked_client(directory.path(), "note-id", &local_path, "baseline");
         let output = push_note(&client, input(&local_path, PushStrategy::Overwrite, true))
             .await
             .expect("overwrite should succeed")
@@ -542,15 +511,15 @@ mod tests {
 
     #[test]
     fn push_body_limits_have_exact_boundaries() {
-        assert!(validate_body_size(WARNING_BYTES, false).is_ok());
+        assert!(validate_body_size(BODY_WARNING_BYTES, false).is_ok());
         assert!(matches!(
-            validate_body_size(WARNING_BYTES + 1, false),
+            validate_body_size(BODY_WARNING_BYTES + 1, false),
             Err(PushNoteError::LargeFileConfirmationRequired { .. })
         ));
-        assert!(validate_body_size(WARNING_BYTES + 1, true).is_ok());
-        assert!(validate_body_size(MAX_BYTES, true).is_ok());
+        assert!(validate_body_size(BODY_WARNING_BYTES + 1, true).is_ok());
+        assert!(validate_body_size(BODY_MAX_BYTES, true).is_ok());
         assert!(matches!(
-            validate_body_size(MAX_BYTES + 1, true),
+            validate_body_size(BODY_MAX_BYTES + 1, true),
             Err(PushNoteError::TooLarge { .. })
         ));
     }

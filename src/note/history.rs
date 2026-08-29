@@ -1,12 +1,11 @@
+use crate::{
+    client::HackmdClient,
+    models::Workspace,
+    note::list::{ListNotesError, ListNotesOutput, note_summary, page_summaries},
+    paging::{default_limit, validate_limit},
+};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
-
-use crate::{
-    client::{HackmdClient, HackmdError},
-    list_notes::{DEFAULT_LIMIT, ListNotesOutput, MAX_LIMIT, note_summary, page_summaries},
-    models::Workspace,
-};
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -20,25 +19,11 @@ pub(crate) struct HistoryInput {
     pub(crate) offset: usize,
 }
 
-const fn default_limit() -> usize {
-    DEFAULT_LIMIT
-}
-
-#[derive(Debug, Error)]
-pub(crate) enum HistoryError {
-    #[error("limit must be between 1 and {MAX_LIMIT}")]
-    InvalidLimit,
-    #[error(transparent)]
-    Api(#[from] HackmdError),
-}
-
 pub(crate) async fn get_history(
     client: &HackmdClient,
     input: HistoryInput,
-) -> Result<ListNotesOutput, HistoryError> {
-    if !(1..=MAX_LIMIT).contains(&input.limit) {
-        return Err(HistoryError::InvalidLimit);
-    }
+) -> Result<ListNotesOutput, ListNotesError> {
+    validate_limit(input.limit)?;
     let notes = client
         .get_history()
         .await?
@@ -58,8 +43,9 @@ pub(crate) async fn get_history(
 
 #[cfg(test)]
 mod tests {
-    use super::{HistoryError, HistoryInput, get_history};
-    use crate::{client::HackmdClient, config::Config, test_support::SequenceServer};
+    use super::{HistoryInput, get_history};
+    use crate::note::list::ListNotesError;
+    use crate::{client::HackmdClient, config::Config, fixture::SequenceServer};
 
     #[tokio::test]
     async fn accepts_bare_history_and_preserves_api_order_and_last_visit() {
@@ -70,11 +56,7 @@ mod tests {
                 {"id":"older","title":"Older","lastVisit":20,"teamPath":"core"}
             ]"#,
         )]);
-        let client = HackmdClient::new(Config::for_loopback_test(
-            &fixture.api_url,
-            Some("fixture-token"),
-        ))
-        .expect("fixture client should build");
+        let client = fixture.client();
         let output = get_history(
             &client,
             HistoryInput {
@@ -84,7 +66,7 @@ mod tests {
         )
         .await
         .expect("history should succeed");
-        assert_eq!(output.total, 2);
+        assert_eq!(output.meta.total, 2);
         assert_eq!(output.notes[0].id, "older");
         assert_eq!(output.notes[0].last_visit, Some(20));
         assert!(matches!(
@@ -100,11 +82,7 @@ mod tests {
             200,
             r#"{"history":[{"id":"one","title":"One","lastVisit":1}]}"#,
         )]);
-        let client = HackmdClient::new(Config::for_loopback_test(
-            &fixture.api_url,
-            Some("fixture-token"),
-        ))
-        .expect("fixture client should build");
+        let client = fixture.client();
         let output = get_history(
             &client,
             HistoryInput {
@@ -114,7 +92,7 @@ mod tests {
         )
         .await
         .expect("wrapped history should succeed");
-        assert_eq!(output.count, 1);
+        assert_eq!(output.meta.count, 1);
         fixture.finish();
 
         let no_token = HackmdClient::new(Config::for_tests()).expect("client should build");
@@ -127,7 +105,7 @@ mod tests {
                 }
             )
             .await,
-            Err(HistoryError::InvalidLimit)
+            Err(ListNotesError::Limit(_))
         ));
     }
 }

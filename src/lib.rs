@@ -1,31 +1,20 @@
 //! A local-first MCP server for the `HackMD` API.
 
-mod check_sync;
 mod client;
 mod config;
-mod crud;
 mod dto;
-mod edit_note;
 mod folders;
-mod get_note;
-mod history;
-mod image_upload;
-mod list_notes;
 mod models;
-mod note_ref;
+mod note;
 mod observability;
-mod patch;
-mod pull_note;
-mod push_note;
-mod retry_metadata;
+mod paging;
+mod reply;
+mod retry;
 mod server;
-mod snapshot;
-mod state;
-mod tool_result;
-mod trash;
+mod sync;
 
 #[cfg(test)]
-mod test_support;
+mod fixture;
 
 /// The package version exposed by the server binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

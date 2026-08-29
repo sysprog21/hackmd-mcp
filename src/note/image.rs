@@ -7,11 +7,11 @@ use thiserror::Error;
 use crate::{
     client::{HackmdClient, HackmdError},
     models::Workspace,
-    note_ref::{NoteRefError, NoteResolution},
+    note::reference::{NoteRefError, NoteResolution},
 };
 
-const WARNING_BYTES: u64 = 5 * 1024 * 1024;
-const MAX_BYTES: u64 = 10 * 1024 * 1024;
+const IMAGE_WARNING_BYTES: u64 = 5 * 1024 * 1024;
+const IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -37,10 +37,14 @@ pub(crate) enum UploadNoteImageError {
     RelativePath,
     #[error("image_path is not a readable regular file")]
     InvalidFile,
-    #[error("image is {size_bytes} bytes; files above 10 MiB are refused")]
+    #[error(
+        "image is {size_bytes} bytes; files above {} MiB are refused",
+        IMAGE_MAX_BYTES / 1024 / 1024
+    )]
     TooLarge { size_bytes: u64 },
     #[error(
-        "image is {size_bytes} bytes; retry with confirm_large_file: true or resize below 5 MiB"
+        "image is {size_bytes} bytes; retry with confirm_large_file: true or resize below {} MiB",
+        IMAGE_WARNING_BYTES / 1024 / 1024
     )]
     ConfirmationRequired { size_bytes: u64 },
     #[error("team image upload is not documented by HackMD; use a personal-workspace note")]
@@ -64,14 +68,14 @@ pub(crate) async fn upload_note_image(
         return Err(UploadNoteImageError::InvalidFile);
     }
     let size_bytes = metadata.len();
-    if size_bytes > MAX_BYTES {
+    if size_bytes > IMAGE_MAX_BYTES {
         return Err(UploadNoteImageError::TooLarge { size_bytes });
     }
-    if size_bytes > WARNING_BYTES && !input.confirm_large_file {
+    if size_bytes > IMAGE_WARNING_BYTES && !input.confirm_large_file {
         return Err(UploadNoteImageError::ConfirmationRequired { size_bytes });
     }
     let resolution =
-        crate::note_ref::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
+        crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
@@ -92,7 +96,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{UploadNoteImageError, UploadNoteImageInput, upload_note_image};
+    use super::{
+        IMAGE_MAX_BYTES, IMAGE_WARNING_BYTES, UploadNoteImageError, UploadNoteImageInput,
+        upload_note_image,
+    };
     use crate::{client::HackmdClient, config::Config, models::Workspace};
 
     #[tokio::test]
@@ -101,15 +108,11 @@ mod tests {
         image
             .write_all(b"fixture-image")
             .expect("image should write");
-        let fixture = crate::test_support::SequenceServer::spawn([(
+        let fixture = crate::fixture::SequenceServer::spawn([(
             201,
             r#"{"data":{"link":"https://hackmd.io/_uploads/image.png"}}"#,
         )]);
-        let client = HackmdClient::new(Config::for_loopback_test(
-            &fixture.api_url,
-            Some("fixture-token"),
-        ))
-        .expect("fixture client should build");
+        let client = fixture.client();
         let output = upload_note_image(
             &client,
             UploadNoteImageInput {
@@ -146,7 +149,7 @@ mod tests {
         let oversized = tempfile::NamedTempFile::new().expect("temp image should create");
         oversized
             .as_file()
-            .set_len(10 * 1024 * 1024 + 1)
+            .set_len(IMAGE_MAX_BYTES + 1)
             .expect("sparse image should resize");
         let input = UploadNoteImageInput {
             workspace: Workspace::Personal,
@@ -162,7 +165,7 @@ mod tests {
         let warning = tempfile::NamedTempFile::new().expect("temp image should create");
         warning
             .as_file()
-            .set_len(5 * 1024 * 1024 + 1)
+            .set_len(IMAGE_WARNING_BYTES + 1)
             .expect("sparse image should resize");
         let warning_input = UploadNoteImageInput {
             workspace: Workspace::Personal,
@@ -193,13 +196,8 @@ mod tests {
     #[tokio::test]
     async fn payload_too_large_has_a_resize_hint() {
         let image = tempfile::NamedTempFile::new().expect("temp image should create");
-        let fixture =
-            crate::test_support::SequenceServer::spawn([(413, r#"{"error":"too large"}"#)]);
-        let client = HackmdClient::new(Config::for_loopback_test(
-            &fixture.api_url,
-            Some("fixture-token"),
-        ))
-        .expect("fixture client should build");
+        let fixture = crate::fixture::SequenceServer::spawn([(413, r#"{"error":"too large"}"#)]);
+        let client = fixture.client();
         let error = upload_note_image(
             &client,
             UploadNoteImageInput {

@@ -17,7 +17,7 @@ use crate::{
         UpdateNoteRequest,
     },
     models::Workspace,
-    state::StateStore,
+    sync::state::StateStore,
 };
 
 /// HTTP client shared by all `HackMD` tool handlers.
@@ -25,7 +25,6 @@ use crate::{
 pub(crate) struct HackmdClient {
     config: Config,
     http: reqwest::Client,
-    #[allow(dead_code, reason = "used by the local sync tool tasks")]
     state: StateStore,
 }
 
@@ -53,23 +52,11 @@ impl HackmdClient {
     }
 
     pub(crate) async fn get_me(&self) -> Result<ProfileResponse, HackmdError> {
-        let path = self.url_for_segments(&["me"])?.path().to_owned();
-        self.request_json(Method::GET, &["me"], None)
-            .await?
-            .ok_or_else(|| HackmdError::EmptyResponse {
-                method: "GET".to_owned(),
-                path,
-            })
+        self.get_required(&["me"]).await
     }
 
     pub(crate) async fn list_teams(&self) -> Result<Vec<TeamResponse>, HackmdError> {
-        let path = self.url_for_segments(&["teams"])?.path().to_owned();
-        self.request_json(Method::GET, &["teams"], None)
-            .await?
-            .ok_or_else(|| HackmdError::EmptyResponse {
-                method: "GET".to_owned(),
-                path,
-            })
+        self.get_required(&["teams"]).await
     }
 
     pub(crate) async fn ensure_team_exists(
@@ -94,24 +81,13 @@ impl HackmdClient {
     }
 
     pub(crate) async fn get_history(&self) -> Result<Vec<NoteResponse>, HackmdError> {
-        let path = self.url_for_segments(&["history"])?.path().to_owned();
-        self.request_json::<HistoryResponse>(Method::GET, &["history"], None)
-            .await?
+        self.get_required::<HistoryResponse>(&["history"])
+            .await
             .map(HistoryResponse::into_notes)
-            .ok_or_else(|| HackmdError::EmptyResponse {
-                method: "GET".to_owned(),
-                path,
-            })
     }
 
     pub(crate) async fn list_trash(&self) -> Result<Vec<NoteResponse>, HackmdError> {
-        let path = self.url_for_segments(&["trash"])?.path().to_owned();
-        self.request_json(Method::GET, &["trash"], None)
-            .await?
-            .ok_or_else(|| HackmdError::EmptyResponse {
-                method: "GET".to_owned(),
-                path,
-            })
+        self.get_required(&["trash"]).await
     }
 
     pub(crate) async fn restore_note(&self, note_id: &str) -> Result<Option<Value>, HackmdError> {
@@ -119,22 +95,12 @@ impl HackmdClient {
             .await
     }
 
-    #[allow(dead_code, reason = "used by note resolution and list-note tool tasks")]
     pub(crate) async fn list_notes(
         &self,
         workspace: &Workspace,
     ) -> Result<Vec<NoteResponse>, HackmdError> {
-        let segments: Vec<&str> = match workspace {
-            Workspace::Personal => vec!["notes"],
-            Workspace::Team { team_path } => vec!["teams", team_path, "notes"],
-        };
-        let path = self.url_for_segments(&segments)?.path().to_owned();
-        self.request_json(Method::GET, &segments, None)
-            .await?
-            .ok_or_else(|| HackmdError::EmptyResponse {
-                method: "GET".to_owned(),
-                path,
-            })
+        self.get_required(&workspace_route(workspace, &["notes"]))
+            .await
     }
 
     pub(crate) async fn get_note(
@@ -142,17 +108,8 @@ impl HackmdClient {
         workspace: &Workspace,
         note_id: &str,
     ) -> Result<NoteResponse, HackmdError> {
-        let segments: Vec<&str> = match workspace {
-            Workspace::Personal => vec!["notes", note_id],
-            Workspace::Team { team_path } => vec!["teams", team_path, "notes", note_id],
-        };
-        let path = self.url_for_segments(&segments)?.path().to_owned();
-        self.request_json(Method::GET, &segments, None)
-            .await?
-            .ok_or_else(|| HackmdError::EmptyResponse {
-                method: "GET".to_owned(),
-                path,
-            })
+        self.get_required(&workspace_route(workspace, &["notes", note_id]))
+            .await
     }
 
     pub(crate) async fn create_note(
@@ -160,18 +117,10 @@ impl HackmdClient {
         workspace: &Workspace,
         payload: &CreateNoteRequest,
     ) -> Result<NoteResponse, HackmdError> {
-        let segments: Vec<&str> = match workspace {
-            Workspace::Personal => vec!["notes"],
-            Workspace::Team { team_path } => vec!["teams", team_path, "notes"],
-        };
-        let path = self.url_for_segments(&segments)?.path().to_owned();
-        let body = serde_json::to_value(payload).map_err(|_| HackmdError::InvalidPayload)?;
-        self.request_json(Method::POST, &segments, Some(&body))
-            .await?
-            .ok_or_else(|| HackmdError::EmptyResponse {
-                method: "POST".to_owned(),
-                path,
-            })
+        let segments = workspace_route(workspace, &["notes"]);
+        let body = to_json(payload)?;
+        self.request_required(Method::POST, &segments, Some(&body))
+            .await
     }
 
     pub(crate) async fn update_note(
@@ -180,11 +129,8 @@ impl HackmdClient {
         note_id: &str,
         payload: &UpdateNoteRequest,
     ) -> Result<Option<NoteResponse>, HackmdError> {
-        let segments: Vec<&str> = match workspace {
-            Workspace::Personal => vec!["notes", note_id],
-            Workspace::Team { team_path } => vec!["teams", team_path, "notes", note_id],
-        };
-        let body = serde_json::to_value(payload).map_err(|_| HackmdError::InvalidPayload)?;
+        let segments = workspace_route(workspace, &["notes", note_id]);
+        let body = to_json(payload)?;
         self.request_json_idempotent(Method::PATCH, &segments, Some(&body))
             .await
     }
@@ -194,10 +140,7 @@ impl HackmdClient {
         workspace: &Workspace,
         note_id: &str,
     ) -> Result<Option<Value>, HackmdError> {
-        let segments: Vec<&str> = match workspace {
-            Workspace::Personal => vec!["notes", note_id],
-            Workspace::Team { team_path } => vec!["teams", team_path, "notes", note_id],
-        };
+        let segments = workspace_route(workspace, &["notes", note_id]);
         self.request_json(Method::DELETE, &segments, None).await
     }
 
@@ -205,17 +148,8 @@ impl HackmdClient {
         &self,
         workspace: &Workspace,
     ) -> Result<Vec<FolderResponse>, HackmdError> {
-        let segments: Vec<&str> = match workspace {
-            Workspace::Personal => vec!["folders"],
-            Workspace::Team { team_path } => vec!["teams", team_path, "folders"],
-        };
-        let path = self.url_for_segments(&segments)?.path().to_owned();
-        self.request_json(Method::GET, &segments, None)
-            .await?
-            .ok_or_else(|| HackmdError::EmptyResponse {
-                method: "GET".to_owned(),
-                path,
-            })
+        self.get_required(&workspace_route(workspace, &["folders"]))
+            .await
     }
 
     pub(crate) async fn get_folder(
@@ -223,17 +157,8 @@ impl HackmdClient {
         workspace: &Workspace,
         folder_id: &str,
     ) -> Result<FolderResponse, HackmdError> {
-        let segments: Vec<&str> = match workspace {
-            Workspace::Personal => vec!["folders", folder_id],
-            Workspace::Team { team_path } => vec!["teams", team_path, "folders", folder_id],
-        };
-        let path = self.url_for_segments(&segments)?.path().to_owned();
-        self.request_json(Method::GET, &segments, None)
-            .await?
-            .ok_or_else(|| HackmdError::EmptyResponse {
-                method: "GET".to_owned(),
-                path,
-            })
+        self.get_required(&workspace_route(workspace, &["folders", folder_id]))
+            .await
     }
 
     pub(crate) async fn create_folder(
@@ -241,18 +166,10 @@ impl HackmdClient {
         workspace: &Workspace,
         payload: &CreateFolderRequest,
     ) -> Result<FolderResponse, HackmdError> {
-        let segments: Vec<&str> = match workspace {
-            Workspace::Personal => vec!["folders"],
-            Workspace::Team { team_path } => vec!["teams", team_path, "folders"],
-        };
-        let path = self.url_for_segments(&segments)?.path().to_owned();
-        let body = serde_json::to_value(payload).map_err(|_| HackmdError::InvalidPayload)?;
-        self.request_json(Method::POST, &segments, Some(&body))
-            .await?
-            .ok_or_else(|| HackmdError::EmptyResponse {
-                method: "POST".to_owned(),
-                path,
-            })
+        let segments = workspace_route(workspace, &["folders"]);
+        let body = to_json(payload)?;
+        self.request_required(Method::POST, &segments, Some(&body))
+            .await
     }
 
     pub(crate) async fn update_folder(
@@ -261,11 +178,8 @@ impl HackmdClient {
         folder_id: &str,
         payload: &UpdateFolderRequest,
     ) -> Result<Option<FolderResponse>, HackmdError> {
-        let segments: Vec<&str> = match workspace {
-            Workspace::Personal => vec!["folders", folder_id],
-            Workspace::Team { team_path } => vec!["teams", team_path, "folders", folder_id],
-        };
-        let body = serde_json::to_value(payload).map_err(|_| HackmdError::InvalidPayload)?;
+        let segments = workspace_route(workspace, &["folders", folder_id]);
+        let body = to_json(payload)?;
         self.request_json_idempotent(Method::PATCH, &segments, Some(&body))
             .await
     }
@@ -275,10 +189,7 @@ impl HackmdClient {
         workspace: &Workspace,
         folder_id: &str,
     ) -> Result<Option<Value>, HackmdError> {
-        let segments: Vec<&str> = match workspace {
-            Workspace::Personal => vec!["folders", folder_id],
-            Workspace::Team { team_path } => vec!["teams", team_path, "folders", folder_id],
-        };
+        let segments = workspace_route(workspace, &["folders", folder_id]);
         self.request_json(Method::DELETE, &segments, None).await
     }
 
@@ -286,19 +197,8 @@ impl HackmdClient {
         &self,
         workspace: &Workspace,
     ) -> Result<BTreeMap<String, Vec<String>>, HackmdError> {
-        let segments: Vec<&str> = match workspace {
-            Workspace::Personal => vec!["folders", "folder-order"],
-            Workspace::Team { team_path } => {
-                vec!["teams", team_path, "folders", "folder-order"]
-            }
-        };
-        let path = self.url_for_segments(&segments)?.path().to_owned();
-        self.request_json(Method::GET, &segments, None)
-            .await?
-            .ok_or_else(|| HackmdError::EmptyResponse {
-                method: "GET".to_owned(),
-                path,
-            })
+        self.get_required(&workspace_route(workspace, &["folders", "folder-order"]))
+            .await
     }
 
     pub(crate) async fn set_folder_order(
@@ -306,12 +206,7 @@ impl HackmdClient {
         workspace: &Workspace,
         order: &BTreeMap<String, Vec<String>>,
     ) -> Result<Option<Value>, HackmdError> {
-        let segments: Vec<&str> = match workspace {
-            Workspace::Personal => vec!["folders", "folder-order"],
-            Workspace::Team { team_path } => {
-                vec!["teams", team_path, "folders", "folder-order"]
-            }
-        };
+        let segments = workspace_route(workspace, &["folders", "folder-order"]);
         self.request_json(Method::PUT, &segments, Some(&json!({"order": order})))
             .await
     }
@@ -369,8 +264,32 @@ impl HackmdClient {
         })
     }
 
-    #[allow(dead_code, reason = "called by the API operation tasks")]
-    pub(crate) async fn request_json<T: DeserializeOwned>(
+    /// Issues a GET whose response body is mandatory.
+    async fn get_required<T: DeserializeOwned>(&self, segments: &[&str]) -> Result<T, HackmdError> {
+        self.request_required(Method::GET, segments, None).await
+    }
+
+    /// Issues a request that must answer with a JSON body, turning `HackMD`'s
+    /// empty-body success responses into an error instead of a silent `None`.
+    async fn request_required<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        segments: &[&str],
+        body: Option<&Value>,
+    ) -> Result<T, HackmdError> {
+        match self.request_json(method.clone(), segments, body).await? {
+            Some(value) => Ok(value),
+            None => Err(HackmdError::EmptyResponse {
+                method: method.as_str().to_owned(),
+                path: self.url_for_segments(segments)?.path().to_owned(),
+            }),
+        }
+    }
+
+    /// Sends a request, retrying only reads. A POST or DELETE that fails
+    /// ambiguously is left to the caller, because repeating it could create a
+    /// second note or delete something the first attempt already removed.
+    async fn request_json<T: DeserializeOwned>(
         &self,
         method: Method,
         path_segments: &[&str],
@@ -381,6 +300,11 @@ impl HackmdClient {
             .await
     }
 
+    /// Sends a request that may be retried because repeating it lands on the
+    /// same state: `HackMD`'s PATCH and PUT routes set fields to given values
+    /// rather than accumulating. A retry can still overwrite an edit made by
+    /// someone else in between, which is the same exposure the first attempt
+    /// already had.
     async fn request_json_idempotent<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -510,6 +434,10 @@ impl HackmdClient {
     }
 }
 
+/// Reads how long the server asked us to wait, preferring the standard header
+/// and falling back to `HackMD`'s own rate-limit reset. Note that
+/// `sleep_before_retry` clamps the result: a reset further out than the maximum
+/// backoff is not waited for, it is retried and allowed to fail.
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     if let Some(value) = headers
         .get(reqwest::header::RETRY_AFTER)
@@ -546,8 +474,77 @@ async fn sleep_before_retry(
         },
         |duration| duration.min(config.max_backoff),
     );
-    crate::retry_metadata::record_retry(delay, was_rate_limited);
+    crate::retry::record_retry(delay, was_rate_limited);
     tokio::time::sleep(delay).await;
+}
+
+/// How long a write is given to become visible, and the first pause between
+/// reads. The pause doubles so the window is covered in a handful of requests
+/// rather than ten: `HackMD` allows 100 requests per five minutes, and a
+/// foldered note creation spends several of them before ever polling.
+const READBACK_WINDOW: Duration = Duration::from_secs(2);
+const READBACK_FIRST_DELAY: Duration = Duration::from_millis(100);
+
+/// What a read-back saw, and whether it satisfied the caller.
+pub(crate) struct Readback<T> {
+    pub(crate) value: T,
+    pub(crate) confirmed: bool,
+}
+
+/// Re-reads a just-written resource until `accepted` holds.
+///
+/// `HackMD` applies some writes asynchronously, so the first read after a write
+/// can still answer with the previous value. When the window expires the last
+/// observation is still returned, with `confirmed: false`: a caller that treats
+/// that as failure has its error, and one that wants to report the current
+/// state has it without paying for another request.
+///
+/// The window bounds the waiting, not the reads. Each `fetch` is a full client
+/// request, so it can burn its own timeout and retries (up to four attempts of
+/// 30 seconds by default) before the deadline is even consulted.
+pub(crate) async fn poll_readback<T, Fut>(
+    mut fetch: impl FnMut() -> Fut,
+    accepted: impl Fn(&T) -> bool,
+) -> Result<Readback<T>, HackmdError>
+where
+    Fut: std::future::Future<Output = Result<T, HackmdError>>,
+{
+    let deadline = tokio::time::Instant::now() + READBACK_WINDOW;
+    let mut delay = READBACK_FIRST_DELAY;
+    loop {
+        let value = fetch().await?;
+        if accepted(&value) {
+            return Ok(Readback {
+                value,
+                confirmed: true,
+            });
+        }
+        if tokio::time::Instant::now() + delay >= deadline {
+            return Ok(Readback {
+                value,
+                confirmed: false,
+            });
+        }
+        tokio::time::sleep(delay).await;
+        delay = delay.saturating_mul(2);
+    }
+}
+
+/// Builds the path segments for a workspace-scoped route. Personal routes start
+/// at the resource; the same resource for a team nests under its team path.
+fn workspace_route<'a>(workspace: &'a Workspace, resource: &[&'a str]) -> Vec<&'a str> {
+    match workspace {
+        Workspace::Personal => resource.to_vec(),
+        Workspace::Team { team_path } => {
+            let mut segments = vec!["teams", team_path.as_str()];
+            segments.extend_from_slice(resource);
+            segments
+        }
+    }
+}
+
+fn to_json<T: serde::Serialize>(payload: &T) -> Result<Value, HackmdError> {
+    serde_json::to_value(payload).map_err(|_| HackmdError::InvalidPayload)
 }
 
 fn request_error(error: &reqwest::Error, method: String, path: String) -> HackmdError {
@@ -730,19 +727,13 @@ pub(crate) enum HackmdError {
 
 impl From<HackmdError> for rmcp::model::CallToolResult {
     fn from(error: HackmdError) -> Self {
-        crate::tool_result::error(error.to_string())
+        crate::reply::error(error.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        sync::mpsc::{self, Receiver},
-        thread::{self, JoinHandle},
-        time::Duration,
-    };
+    use std::{net::TcpListener, time::Duration};
 
     use reqwest::Method;
     use serde_json::{Value, json};
@@ -767,112 +758,15 @@ mod tests {
     }
     use crate::{
         dto::{CreateNoteRequest, UpdateNoteRequest},
+        fixture::{FIXTURE_TOKEN, SequenceServer},
         models::Workspace,
     };
-
-    struct FixtureServer {
-        api_url: String,
-        request: Receiver<String>,
-        thread: JoinHandle<()>,
-    }
-
-    impl FixtureServer {
-        fn spawn(status: u16, body: &str) -> Self {
-            Self::spawn_delayed(status, body, Duration::ZERO)
-        }
-
-        fn spawn_delayed(status: u16, body: &str, delay: Duration) -> Self {
-            let listener =
-                TcpListener::bind("127.0.0.1:0").expect("fixture listener should bind to loopback");
-            let address = listener
-                .local_addr()
-                .expect("fixture address should be available");
-            let api_url = format!("http://{address}/v1");
-            let body = body.to_owned();
-            let (sender, request) = mpsc::channel();
-            let thread = thread::spawn(move || {
-                let (mut stream, _) = listener.accept().expect("fixture should accept a request");
-                let request_bytes = read_request(&mut stream);
-                sender
-                    .send(String::from_utf8_lossy(&request_bytes).into_owned())
-                    .expect("fixture request should be captured");
-                thread::sleep(delay);
-                let response = format!(
-                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _result = stream.write_all(response.as_bytes());
-            });
-            Self {
-                api_url,
-                request,
-                thread,
-            }
-        }
-
-        fn finish(self) -> String {
-            let request = self
-                .request
-                .recv_timeout(Duration::from_secs(2))
-                .expect("fixture should capture one request");
-            self.thread.join().expect("fixture thread should finish");
-            request
-        }
-    }
-
-    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("fixture read timeout should be set");
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let count = stream
-                .read(&mut buffer)
-                .expect("request should be readable");
-            if count == 0 {
-                break;
-            }
-            request.extend_from_slice(&buffer[..count]);
-            if let Some(header_end) = find_header_end(&request) {
-                let headers = String::from_utf8_lossy(&request[..header_end]);
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        line.split_once(':').and_then(|(name, value)| {
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                    })
-                    .unwrap_or(0);
-                if request.len() >= header_end + 4 + content_length {
-                    break;
-                }
-            }
-        }
-        request
-    }
-
-    fn find_header_end(request: &[u8]) -> Option<usize> {
-        request.windows(4).position(|window| window == b"\r\n\r\n")
-    }
-
-    fn fixture_client(server: &FixtureServer, token: &str) -> HackmdClient {
-        HackmdClient::new(Config::for_loopback_test(&server.api_url, Some(token)))
-            .expect("fixture client should build")
-    }
-
-    fn fixture_client_no_retry(server: &FixtureServer, token: &str) -> HackmdClient {
-        HackmdClient::new(Config::for_loopback_test_no_retry(&server.api_url, token))
-            .expect("fixture client should build")
-    }
 
     #[tokio::test]
     async fn encodes_each_path_segment_and_attaches_bearer_auth() {
         const TOKEN: &str = "fixture-bearer-token";
-        let server = FixtureServer::spawn(200, r#"{"id":"ok"}"#);
-        let client = fixture_client(&server, TOKEN);
+        let server = SequenceServer::spawn([(200, r#"{"id":"ok"}"#)]);
+        let client = server.client_with_token(TOKEN);
         assert!(!format!("{client:?}").contains(TOKEN));
 
         let response = client
@@ -885,7 +779,7 @@ mod tests {
             .expect("fixture request should succeed")
             .expect("JSON response should be present");
         assert_eq!(response, json!({"id": "ok"}));
-        let request = server.finish();
+        let request = server.finish_one();
         assert!(request.starts_with("GET /v1/teams/team%2Fpath/notes/note%20%3F%23 HTTP/1.1\r\n"));
         assert!(
             request
@@ -896,8 +790,8 @@ mod tests {
 
     #[tokio::test]
     async fn sends_json_payload_and_parses_response_once() {
-        let server = FixtureServer::spawn(200, r#"{"saved":true}"#);
-        let client = fixture_client(&server, "fixture-token");
+        let server = SequenceServer::spawn([(200, r#"{"saved":true}"#)]);
+        let client = server.client();
         let payload = json!({"title": "hello"});
 
         let response = client
@@ -905,15 +799,15 @@ mod tests {
             .await
             .expect("fixture request should succeed");
         assert_eq!(response, Some(json!({"saved": true})));
-        let request = server.finish();
+        let request = server.finish_one();
         assert!(request.starts_with("PATCH /v1/notes/id HTTP/1.1\r\n"));
         assert!(request.ends_with(r#"{"title":"hello"}"#));
     }
 
     #[tokio::test]
     async fn omitted_optional_fields_remain_omitted_on_the_wire() {
-        let server = FixtureServer::spawn(204, "");
-        let client = fixture_client(&server, "fixture-token");
+        let server = SequenceServer::spawn([(204, "")]);
+        let client = server.client();
         let payload = serde_json::to_value(CreateNoteRequest::default())
             .expect("typed payload should serialize");
 
@@ -922,7 +816,7 @@ mod tests {
             .await
             .expect("fixture request should succeed");
         assert_eq!(response, None);
-        let request = server.finish();
+        let request = server.finish_one();
         assert!(request.starts_with("POST /v1/notes HTTP/1.1\r\n"));
         assert!(request.ends_with("{}"));
         assert!(!request.contains("readPermission"));
@@ -933,8 +827,8 @@ mod tests {
     #[tokio::test]
     async fn accepts_empty_202_and_204_responses() {
         for status in [202, 204] {
-            let server = FixtureServer::spawn(status, "");
-            let client = fixture_client_no_retry(&server, "fixture-token");
+            let server = SequenceServer::spawn([(status, "")]);
+            let client = server.client_without_retry(FIXTURE_TOKEN);
             let response = client
                 .request_json::<Value>(Method::PATCH, &["notes", "id"], None)
                 .await
@@ -947,8 +841,8 @@ mod tests {
     #[tokio::test]
     async fn typed_crud_operations_use_workspace_routes_and_payloads() {
         let created = r#"{"id":"new-id","title":"New"}"#;
-        let create_server = FixtureServer::spawn(201, created);
-        let create_client = fixture_client(&create_server, "fixture-token");
+        let create_server = SequenceServer::spawn([(201, created)]);
+        let create_client = create_server.client();
         let note = create_client
             .create_note(
                 &Workspace::Team {
@@ -962,12 +856,12 @@ mod tests {
             .await
             .expect("team note should be created");
         assert_eq!(note.id, "new-id");
-        let request = create_server.finish();
+        let request = create_server.finish_one();
         assert!(request.starts_with("POST /v1/teams/team%2Fpath/notes HTTP/1.1\r\n"));
         assert!(request.ends_with(r#"{"title":"New"}"#));
 
-        let update_server = FixtureServer::spawn(202, "");
-        let update_client = fixture_client(&update_server, "fixture-token");
+        let update_server = SequenceServer::spawn([(202, "")]);
+        let update_client = update_server.client();
         let response = update_client
             .update_note(
                 &Workspace::Personal,
@@ -980,12 +874,12 @@ mod tests {
             .await
             .expect("personal note update should be accepted");
         assert_eq!(response, None);
-        let request = update_server.finish();
+        let request = update_server.finish_one();
         assert!(request.starts_with("PATCH /v1/notes/note%2Fid HTTP/1.1\r\n"));
         assert!(request.ends_with(r#"{"parentFolderId":null}"#));
 
-        let delete_server = FixtureServer::spawn(204, "");
-        let delete_client = fixture_client(&delete_server, "fixture-token");
+        let delete_server = SequenceServer::spawn([(204, "")]);
+        let delete_client = delete_server.client();
         let response = delete_client
             .delete_note(
                 &Workspace::Team {
@@ -998,7 +892,7 @@ mod tests {
         assert_eq!(response, None);
         assert!(
             delete_server
-                .finish()
+                .finish_one()
                 .starts_with("DELETE /v1/teams/team/notes/note-id HTTP/1.1\r\n")
         );
     }
@@ -1014,8 +908,8 @@ mod tests {
             (500, "upstream HackMD error (500 Internal Server Error)"),
         ];
         for (status, expected) in cases {
-            let server = FixtureServer::spawn(status, r#"{"error":"fixture"}"#);
-            let client = fixture_client_no_retry(&server, "fixture-token");
+            let server = SequenceServer::spawn([(status, r#"{"error":"fixture"}"#)]);
+            let client = server.client_without_retry(FIXTURE_TOKEN);
             let error = client
                 .request_json::<Value>(Method::GET, &["notes", "id"], None)
                 .await
@@ -1034,7 +928,7 @@ mod tests {
             ("x-ratelimit-userremaining", "0"),
             ("x-ratelimit-userreset", "42"),
         ];
-        let server = crate::test_support::SequenceServer::spawn_with_headers([(
+        let server = crate::fixture::SequenceServer::spawn_with_headers([(
             429,
             r#"{"error":"slow down"}"#,
             HEADERS,
@@ -1059,8 +953,8 @@ mod tests {
     async fn upstream_errors_keep_bounded_redacted_body_detail() {
         const TOKEN: &str = "upstream-sensitive-token";
         let body = format!(r#"{{"error":"failure for {TOKEN}"}}"#);
-        let server = FixtureServer::spawn(503, &body);
-        let client = fixture_client_no_retry(&server, TOKEN);
+        let server = SequenceServer::spawn([(503, &body)]);
+        let client = server.client_without_retry(TOKEN);
 
         let message = client
             .request_json::<Value>(Method::GET, &["notes"], None)
@@ -1076,8 +970,8 @@ mod tests {
     async fn bounds_generic_errors_and_redacts_the_token() {
         const TOKEN: &str = "fixture-sensitive-token";
         let body = format!("{} {TOKEN} {}", "x".repeat(280), "x".repeat(400));
-        let server = FixtureServer::spawn(400, &body);
-        let client = fixture_client(&server, TOKEN);
+        let server = SequenceServer::spawn([(400, &body)]);
+        let client = server.client_with_token(TOKEN);
 
         let message = client
             .request_json::<Value>(Method::GET, &["notes"], None)
@@ -1093,8 +987,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_json_without_exposing_the_body() {
-        let server = FixtureServer::spawn(200, "not-json-sensitive-content");
-        let client = fixture_client(&server, "fixture-token");
+        let server = SequenceServer::spawn([(200, "not-json-sensitive-content")]);
+        let client = server.client();
 
         let message = client
             .request_json::<Value>(Method::GET, &["me"], None)
@@ -1129,7 +1023,7 @@ mod tests {
         ));
 
         let server =
-            FixtureServer::spawn_delayed(200, r#"{"ok":true}"#, Duration::from_millis(100));
+            SequenceServer::spawn_delayed(200, r#"{"ok":true}"#, Duration::from_millis(100));
         let timeout_config = Config::for_loopback_test_with_timeout(
             &server.api_url,
             "fixture-token",
@@ -1170,11 +1064,11 @@ mod tests {
 
     #[tokio::test]
     async fn typed_profile_and_team_operations_use_discovery_routes() {
-        let profile_server = FixtureServer::spawn(
+        let profile_server = SequenceServer::spawn([(
             200,
             r#"{"id":"user-id","name":"Alice","email":"alice@example.test","userPath":"alice","photo":null,"teams":[]}"#,
-        );
-        let profile_client = fixture_client(&profile_server, "fixture-token");
+        )]);
+        let profile_client = profile_server.client();
         let profile = profile_client
             .get_me()
             .await
@@ -1182,15 +1076,15 @@ mod tests {
         assert_eq!(profile.user_path, "alice");
         assert!(
             profile_server
-                .finish()
+                .finish_one()
                 .starts_with("GET /v1/me HTTP/1.1\r\n")
         );
 
-        let teams_server = FixtureServer::spawn(
+        let teams_server = SequenceServer::spawn([(
             200,
             r#"[{"id":"team-id","name":"Engineering","path":"engineering","description":null,"hardLimit":100,"visibility":"private"}]"#,
-        );
-        let teams_client = fixture_client(&teams_server, "fixture-token");
+        )]);
+        let teams_client = teams_server.client();
         let teams = teams_client
             .list_teams()
             .await
@@ -1198,7 +1092,7 @@ mod tests {
         assert_eq!(teams[0].path, "engineering");
         assert!(
             teams_server
-                .finish()
+                .finish_one()
                 .starts_with("GET /v1/teams HTTP/1.1\r\n")
         );
     }
@@ -1206,7 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn retries_only_gets_and_explicitly_idempotent_patches() {
         const RETRY_AFTER: &[(&str, &str)] = &[("Retry-After", "0")];
-        let get_server = crate::test_support::SequenceServer::spawn_with_headers([
+        let get_server = crate::fixture::SequenceServer::spawn_with_headers([
             (500, r#"{"error":"transient"}"#, &[]),
             (429, r#"{"error":"rate"}"#, RETRY_AFTER),
             (200, r#"{"ok":true}"#, &[]),
@@ -1230,10 +1124,8 @@ mod tests {
         assert_eq!(response, json!({"ok": true}));
         assert_eq!(get_server.finish().len(), 3);
 
-        let patch_server = crate::test_support::SequenceServer::spawn([
-            (500, r#"{"error":"transient"}"#),
-            (202, ""),
-        ]);
+        let patch_server =
+            crate::fixture::SequenceServer::spawn([(500, r#"{"error":"transient"}"#), (202, "")]);
         let patch_client = HackmdClient::new(Config::for_loopback_test_with_retry(
             &patch_server.api_url,
             "fixture-token",
@@ -1251,7 +1143,7 @@ mod tests {
         assert_eq!(patch_server.finish().len(), 2);
 
         let post_server =
-            crate::test_support::SequenceServer::spawn([(500, r#"{"error":"do not retry"}"#)]);
+            crate::fixture::SequenceServer::spawn([(500, r#"{"error":"do not retry"}"#)]);
         let post_client = HackmdClient::new(Config::for_loopback_test_with_retry(
             &post_server.api_url,
             "fixture-token",

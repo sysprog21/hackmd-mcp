@@ -5,25 +5,29 @@ use rmcp::{handler::server::wrapper::Parameters, schemars, tool};
 use serde::Deserialize;
 use tracing::Instrument;
 
-use crate::check_sync::CheckNoteSyncInput;
-use crate::client::HackmdClient;
-use crate::config::Config;
-use crate::crud::{CreateNoteInput, DeleteNoteInput, UpdateNoteInput};
-use crate::dto::{ProfileResponse, TeamResponse};
-use crate::edit_note::EditNoteInput;
-use crate::folders::{
-    CreateFolderInput, DeleteFolderInput, FolderRefInput, FolderWorkspaceInput,
-    SetFolderOrderInput, UpdateFolderInput,
+use crate::{
+    client::HackmdClient,
+    config::Config,
+    dto::{ProfileResponse, TeamResponse},
+    folders::{
+        CreateFolderInput, DeleteFolderInput, FolderRefInput, FolderWorkspaceInput,
+        SetFolderOrderInput, UpdateFolderInput,
+    },
+    note::{
+        crud::{CreateNoteInput, DeleteNoteInput, UpdateNoteInput},
+        edit::EditNoteInput,
+        get::GetNoteInput,
+        history::HistoryInput,
+        image::UploadNoteImageInput,
+        list::ListNotesInput,
+        trash::{ListTrashInput, RestoreNoteInput},
+    },
+    reply,
+    sync::{
+        check::CheckNoteSyncInput, pull::PullNoteInput, push::PushNoteInput,
+        snapshot::SaveRemoteSnapshotInput,
+    },
 };
-use crate::get_note::GetNoteInput;
-use crate::history::HistoryInput;
-use crate::image_upload::UploadNoteImageInput;
-use crate::list_notes::ListNotesInput;
-use crate::pull_note::PullNoteInput;
-use crate::push_note::PushNoteInput;
-use crate::snapshot::SaveRemoteSnapshotInput;
-use crate::tool_result;
-use crate::trash::{ListTrashInput, RestoreNoteInput};
 
 /// MCP server whose handlers share one configured `HackMD` client.
 #[derive(Debug, Clone)]
@@ -110,15 +114,15 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<ListNotesInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::list_notes::list_notes(&self.client, input).await {
-            Ok(output) => tool_result::success(
+        match crate::note::list::list_notes(&self.client, input).await {
+            Ok(output) => reply::success(
                 format!(
                     "Found {} matching HackMD note(s); returned {}",
-                    output.total, output.count
+                    output.meta.total, output.meta.count
                 ),
                 serde_json::to_value(output).expect("list-notes output should serialize"),
             ),
-            Err(error) => tool_result::error(error.to_string()),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -137,16 +141,13 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<GetNoteInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::get_note::get_note(&self.client, input).await {
-            Ok(Ok(note)) => tool_result::success(
+        match crate::note::get::get_note(&self.client, input).await {
+            Ok(Ok(note)) => reply::success(
                 format!("Fetched HackMD note {}", note.id),
                 serde_json::json!({"note": note}),
             ),
-            Ok(Err(resolution)) => tool_result::success(
-                "The note reference did not resolve uniquely",
-                serde_json::json!({"resolution": resolution}),
-            ),
-            Err(error) => tool_result::error(error.to_string()),
+            Ok(Err(resolution)) => reply::unresolved(&resolution),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -165,12 +166,12 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<CreateNoteInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::crud::create_note(&self.client, input).await {
-            Ok(output) => tool_result::success(
+        match crate::note::crud::create_note(&self.client, input).await {
+            Ok(output) => reply::success(
                 format!("Created HackMD note {}", output.note.id),
                 serde_json::json!({"result": output}),
             ),
-            Err(error) => tool_result::error(error.to_string()),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -189,16 +190,13 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<UpdateNoteInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::crud::update_note(&self.client, input).await {
-            Ok(Ok(output)) => tool_result::success(
+        match crate::note::crud::update_note(&self.client, input).await {
+            Ok(Ok(output)) => reply::success(
                 format!("HackMD accepted the update for note {}", output.note_id),
                 serde_json::json!({"result": output}),
             ),
-            Ok(Err(resolution)) => tool_result::success(
-                "The note reference did not resolve uniquely",
-                serde_json::json!({"resolution": resolution}),
-            ),
-            Err(error) => tool_result::error(error.to_string()),
+            Ok(Err(resolution)) => reply::unresolved(&resolution),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -217,16 +215,13 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<DeleteNoteInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::crud::delete_note(&self.client, input).await {
-            Ok(Ok(output)) => tool_result::success(
+        match crate::note::crud::delete_note(&self.client, input).await {
+            Ok(Ok(output)) => reply::success(
                 format!("Deleted HackMD note {}", output.note_id),
                 serde_json::json!({"result": output}),
             ),
-            Ok(Err(resolution)) => tool_result::success(
-                "The note reference did not resolve uniquely",
-                serde_json::json!({"resolution": resolution}),
-            ),
-            Err(error) => tool_result::error(error.to_string()),
+            Ok(Err(resolution)) => reply::unresolved(&resolution),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -245,15 +240,15 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<ListTrashInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::trash::list_trash(&self.client, input).await {
-            Ok(output) => tool_result::success(
+        match crate::note::trash::list_trash(&self.client, input).await {
+            Ok(output) => reply::success(
                 format!(
                     "Found {} trashed HackMD note(s); returned {}",
-                    output.total, output.count
+                    output.meta.total, output.meta.count
                 ),
                 serde_json::to_value(output).expect("trash-list output should serialize"),
             ),
-            Err(error) => tool_result::error(error.to_string()),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -272,12 +267,12 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<RestoreNoteInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::trash::restore_note(&self.client, input).await {
-            Ok(output) => tool_result::success(
+        match crate::note::trash::restore_note(&self.client, input).await {
+            Ok(output) => reply::success(
                 format!("Restored HackMD note {}", output.note_id),
                 serde_json::json!({"result": output}),
             ),
-            Err(error) => tool_result::error(error.to_string()),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -296,20 +291,17 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<EditNoteInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::edit_note::edit_note(&self.client, input).await {
+        match crate::note::edit::edit_note(&self.client, input).await {
             Ok(Ok(output)) => {
                 let summary = if output.changed {
                     format!("Edited HackMD note {}", output.note_id)
                 } else {
                     format!("HackMD note {} is unchanged", output.note_id)
                 };
-                tool_result::success(summary, serde_json::json!({"result": output}))
+                reply::success(summary, serde_json::json!({"result": output}))
             }
-            Ok(Err(resolution)) => tool_result::success(
-                "The note reference did not resolve uniquely",
-                serde_json::json!({"resolution": resolution}),
-            ),
-            Err(error) => tool_result::error(error.to_string()),
+            Ok(Err(resolution)) => reply::unresolved(&resolution),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -328,15 +320,15 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<HistoryInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::history::get_history(&self.client, input).await {
-            Ok(output) => tool_result::success(
+        match crate::note::history::get_history(&self.client, input).await {
+            Ok(output) => reply::success(
                 format!(
                     "Found {} HackMD history item(s); returned {}",
-                    output.total, output.count
+                    output.meta.total, output.meta.count
                 ),
                 serde_json::to_value(output).expect("history output should serialize"),
             ),
-            Err(error) => tool_result::error(error.to_string()),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -356,14 +348,14 @@ impl HackmdServer {
         Parameters(input): Parameters<FolderWorkspaceInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::folders::list_folders(&self.client, input).await {
-            Ok(output) => tool_result::success(
+            Ok(output) => reply::success(
                 format!(
                     "Found {} HackMD folder(s); returned {}",
-                    output.total, output.count
+                    output.meta.total, output.meta.count
                 ),
                 serde_json::to_value(output).expect("folder-list output should serialize"),
             ),
-            Err(error) => tool_result::error(error.to_string()),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -383,11 +375,11 @@ impl HackmdServer {
         Parameters(input): Parameters<FolderRefInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::folders::get_folder(&self.client, input).await {
-            Ok(output) => tool_result::success(
+            Ok(output) => reply::success(
                 format!("Fetched HackMD folder {}", output.folder.id),
                 serde_json::to_value(output).expect("folder output should serialize"),
             ),
-            Err(error) => tool_result::error(error.to_string()),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -407,11 +399,11 @@ impl HackmdServer {
         Parameters(input): Parameters<CreateFolderInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::folders::create_folder(&self.client, input).await {
-            Ok(output) => tool_result::success(
+            Ok(output) => reply::success(
                 format!("Created HackMD folder {}", output.folder.id),
                 serde_json::to_value(output).expect("folder output should serialize"),
             ),
-            Err(error) => tool_result::error(error.to_string()),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -431,11 +423,11 @@ impl HackmdServer {
         Parameters(input): Parameters<UpdateFolderInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::folders::update_folder(&self.client, input).await {
-            Ok(output) => tool_result::success(
+            Ok(output) => reply::success(
                 format!("Updated HackMD folder {}", output.folder.id),
                 serde_json::to_value(output).expect("folder output should serialize"),
             ),
-            Err(error) => tool_result::error(error.to_string()),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -464,12 +456,12 @@ impl HackmdServer {
                         output.folder_id, output.child_count
                     )
                 };
-                tool_result::success(
+                reply::success(
                     summary,
                     serde_json::to_value(output).expect("folder-delete output should serialize"),
                 )
             }
-            Err(error) => tool_result::error(error.to_string()),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -489,11 +481,11 @@ impl HackmdServer {
         Parameters(input): Parameters<SetFolderOrderInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::folders::set_folder_order(&self.client, input).await {
-            Ok(output) => tool_result::success(
+            Ok(output) => reply::success(
                 format!("Set HackMD folder order for {}", output.parent),
                 serde_json::to_value(output).expect("folder-order output should serialize"),
             ),
-            Err(error) => tool_result::error(error.to_string()),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -512,16 +504,13 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<UploadNoteImageInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::image_upload::upload_note_image(&self.client, input).await {
-            Ok(Ok(output)) => tool_result::success(
+        match crate::note::image::upload_note_image(&self.client, input).await {
+            Ok(Ok(output)) => reply::success(
                 "Uploaded HackMD note image",
                 serde_json::to_value(output).expect("image-upload output should serialize"),
             ),
-            Ok(Err(resolution)) => tool_result::success(
-                "The note reference did not resolve uniquely",
-                serde_json::json!({"resolution": resolution}),
-            ),
-            Err(error) => tool_result::error(error.to_string()),
+            Ok(Err(resolution)) => reply::unresolved(&resolution),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -540,16 +529,13 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<PullNoteInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::pull_note::pull_note(&self.client, input).await {
-            Ok(Ok(output)) => tool_result::success(
+        match crate::sync::pull::pull_note(&self.client, input).await {
+            Ok(Ok(output)) => reply::success(
                 format!("Pulled HackMD note {}", output.note_id),
                 serde_json::to_value(output).expect("pull output should serialize"),
             ),
-            Ok(Err(resolution)) => tool_result::success(
-                "The note reference did not resolve uniquely",
-                serde_json::json!({"resolution": resolution}),
-            ),
-            Err(error) => tool_result::error(error.to_string()),
+            Ok(Err(resolution)) => reply::unresolved(&resolution),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -568,16 +554,13 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<PushNoteInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::push_note::push_note(&self.client, input).await {
-            Ok(Ok(output)) => tool_result::success(
+        match crate::sync::push::push_note(&self.client, input).await {
+            Ok(Ok(output)) => reply::success(
                 "Evaluated tracked HackMD note push",
                 serde_json::to_value(output).expect("push output should serialize"),
             ),
-            Ok(Err(resolution)) => tool_result::success(
-                "The note reference did not resolve uniquely",
-                serde_json::json!({"resolution": resolution}),
-            ),
-            Err(error) => tool_result::error(error.to_string()),
+            Ok(Err(resolution)) => reply::unresolved(&resolution),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -596,12 +579,12 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<CheckNoteSyncInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::check_sync::check_note_sync(&self.client, input).await {
-            Ok(output) => tool_result::success(
+        match crate::sync::check::check_note_sync(&self.client, input).await {
+            Ok(output) => reply::success(
                 "Checked tracked HackMD note sync state",
                 serde_json::to_value(output).expect("sync-check output should serialize"),
             ),
-            Err(error) => tool_result::error(error.to_string()),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 
@@ -620,18 +603,25 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<SaveRemoteSnapshotInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::snapshot::save_remote_snapshot(&self.client, input).await {
-            Ok(output) => tool_result::success(
+        match crate::sync::snapshot::save_remote_snapshot(&self.client, input).await {
+            Ok(output) => reply::success(
                 "Saved HackMD remote snapshot",
                 serde_json::to_value(output).expect("snapshot output should serialize"),
             ),
-            Err(error) => tool_result::error(error.to_string()),
+            Err(error) => reply::error(error.to_string()),
         }
     }
 }
 
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "the handler bodies are generated by rmcp's tool_handler macro"
+)]
 #[rmcp::tool_handler(router = Self::tool_router())]
 impl rmcp::ServerHandler for HackmdServer {
+    /// Wraps every dispatch in one span and one retry scope, so each tool call
+    /// carries a request ID through its logs and reports in `_meta` how much
+    /// retrying it took.
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
@@ -648,8 +638,7 @@ impl rmcp::ServerHandler for HackmdServer {
             rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         async move {
             tracing::info!("tool call started");
-            let result =
-                crate::retry_metadata::scope_call(Self::tool_router().call(tool_context)).await;
+            let result = crate::retry::scope_call(Self::tool_router().call(tool_context)).await;
             match &result {
                 Ok(rmcp::model::CallToolResponse::Complete(response)) => tracing::info!(
                     is_error = response.is_error.unwrap_or(false),
@@ -670,16 +659,15 @@ fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
         "Authenticated as {} (userPath: {})",
         profile.name, profile.user_path
     );
-    tool_result::success(summary, serde_json::json!({"profile": profile}))
+    reply::success(summary, serde_json::json!({"profile": profile}))
 }
 
 fn teams_result(teams: &[TeamResponse]) -> rmcp::model::CallToolResult {
     let summary = format!("Found {} HackMD team(s)", teams.len());
-    tool_result::success(summary, serde_json::json!({"teams": teams}))
+    reply::success(summary, serde_json::json!({"teams": teams}))
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[allow(dead_code, reason = "constructed by RMCP's generated schema decoder")]
 #[serde(deny_unknown_fields)]
 struct EmptyInput {}
 
@@ -897,7 +885,7 @@ mod tests {
             initial_backoff: std::time::Duration::from_millis(1),
             max_backoff: std::time::Duration::from_millis(2),
         };
-        let success_fixture = crate::test_support::SequenceServer::spawn_with_headers([
+        let success_fixture = crate::fixture::SequenceServer::spawn_with_headers([
             (429, r#"{"error":"rate limited"}"#, RETRY_AFTER),
             (
                 200,
@@ -928,7 +916,7 @@ mod tests {
         stop_protocol(client, server_task).await;
         success_fixture.finish();
 
-        let error_fixture = crate::test_support::SequenceServer::spawn([
+        let error_fixture = crate::fixture::SequenceServer::spawn([
             (500, r#"{"error":"transient"}"#),
             (500, r#"{"error":"still failing"}"#),
         ]);
@@ -976,15 +964,11 @@ mod tests {
 
     #[tokio::test]
     async fn edit_conflict_is_a_tool_error_and_never_patches() {
-        let fixture = crate::test_support::SequenceServer::spawn([(
+        let fixture = crate::fixture::SequenceServer::spawn([(
             200,
             r#"{"id":"note-id","title":"Title","content":"old"}"#,
         )]);
-        let client = HackmdClient::new(Config::for_loopback_test(
-            &fixture.api_url,
-            Some("fixture-token"),
-        ))
-        .expect("fixture client should be constructed");
+        let client = fixture.client();
         let server = HackmdServer::new(Arc::new(client));
         let input = serde_json::from_value(json!({
             "note_ref": "note-id",
@@ -1163,7 +1147,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_process_list_call_covers_team_route_search_and_pagination() {
-        let fixture = crate::test_support::SequenceServer::spawn([(
+        let fixture = crate::fixture::SequenceServer::spawn([(
             200,
             r#"[
                 {"id":"a","title":"Roadmap A","description":"Rust work","tags":["rust"],"lastChangedAt":3},
@@ -1206,7 +1190,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_process_edit_calls_cover_no_op_and_conflict_without_patch() {
-        let fixture = crate::test_support::SequenceServer::spawn([
+        let fixture = crate::fixture::SequenceServer::spawn([
             (200, r#"{"id":"same","title":"Same","content":"same"}"#),
             (
                 200,
