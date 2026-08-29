@@ -189,9 +189,9 @@ pub(crate) enum HackmdError {
     },
 }
 
-impl From<HackmdError> for rmcp::ErrorData {
+impl From<HackmdError> for rmcp::model::CallToolResult {
     fn from(error: HackmdError) -> Self {
-        Self::internal_error(error.to_string(), None)
+        crate::tool_result::error(error.to_string())
     }
 }
 
@@ -488,5 +488,23 @@ mod tests {
                 .await,
             Err(HackmdError::MissingToken { .. })
         ));
+    }
+
+    #[test]
+    fn api_errors_convert_to_caller_visible_tool_errors() {
+        let result: rmcp::model::CallToolResult = HackmdError::Unauthorized {
+            method: "GET".to_owned(),
+            path: "/v1/me".to_owned(),
+        }
+        .into();
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.content[0]
+                .as_text()
+                .expect("tool error should contain text")
+                .text
+                .contains("401 unauthorized")
+        );
     }
 }

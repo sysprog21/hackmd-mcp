@@ -66,3 +66,7 @@
 - [x] Let RMCP 3.x negotiate MCP initialization and generate `tools/list` /
   `tools/call`; do not hard-code a protocol version or manually maintain tool
   JSON schemas.
+- [x] Return `CallToolResult::success` with concise text and structured JSON
+  for successful tools. Return `CallToolResult::error` for API failures and
+  handler-level validation failures; allow RMCP's schema decoder to reject
+  structurally invalid JSON-RPC parameters.

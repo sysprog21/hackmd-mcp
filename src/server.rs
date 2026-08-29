@@ -7,6 +7,7 @@ use serde::Deserialize;
 use crate::client::HackmdClient;
 use crate::config::Config;
 use crate::models::Workspace;
+use crate::tool_result;
 
 /// MCP server whose handlers share one configured `HackMD` client.
 #[derive(Debug, Clone)]
@@ -48,14 +49,16 @@ impl HackmdServer {
             workspace,
             note_ref,
         }): Parameters<SchemaProbeInput>,
-    ) -> Result<String, rmcp::ErrorData> {
+    ) -> rmcp::model::CallToolResult {
         if !self.client.has_api_token() {
-            return Err(rmcp::ErrorData::invalid_params(
+            return tool_result::error(
                 "HACKMD_API_TOKEN is not configured; set it in the server environment and restart the MCP server",
-                None,
-            ));
+            );
         }
-        Ok(format!("{workspace:?}:{note_ref}"))
+        tool_result::success(
+            "Schema probe succeeded",
+            serde_json::json!({"workspace": workspace, "note_ref": note_ref}),
+        )
     }
 }
 
@@ -125,18 +128,52 @@ mod tests {
         let server = HackmdServer::new(Arc::new(
             HackmdClient::new(Config::for_tests()).expect("test client should be constructed"),
         ));
-        let error = server
-            .schema_probe(rmcp::handler::server::wrapper::Parameters(
-                SchemaProbeInput {
-                    workspace: Workspace::Personal,
-                    note_ref: "internal-id".to_owned(),
-                },
-            ))
-            .expect_err("a tool call should require the deferred token");
+        let result = server.schema_probe(rmcp::handler::server::wrapper::Parameters(
+            SchemaProbeInput {
+                workspace: Workspace::Personal,
+                note_ref: "internal-id".to_owned(),
+            },
+        ));
 
+        assert_eq!(result.is_error, Some(true));
         assert_eq!(
-            error.message,
+            result.content[0]
+                .as_text()
+                .expect("error should be text")
+                .text,
             "HACKMD_API_TOKEN is not configured; set it in the server environment and restart the MCP server"
+        );
+    }
+
+    #[test]
+    fn tool_call_success_contains_text_and_structured_json() {
+        let config = Config::for_loopback_test("http://127.0.0.1:1/v1", Some("fixture-token"));
+        let server = HackmdServer::new(Arc::new(
+            HackmdClient::new(config).expect("test client should be constructed"),
+        ));
+        let result = server.schema_probe(rmcp::handler::server::wrapper::Parameters(
+            SchemaProbeInput {
+                workspace: Workspace::Team {
+                    team_path: "engineering".to_owned(),
+                },
+                note_ref: "note-id".to_owned(),
+            },
+        ));
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            result.content[0]
+                .as_text()
+                .expect("success should be text")
+                .text,
+            "Schema probe succeeded"
+        );
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({
+                "workspace": {"kind": "team", "team_path": "engineering"},
+                "note_ref": "note-id"
+            }))
         );
     }
 

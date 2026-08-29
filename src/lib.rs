@@ -6,6 +6,7 @@ mod dto;
 mod models;
 mod server;
 mod state;
+mod tool_result;
 
 /// The package version exposed by the server binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

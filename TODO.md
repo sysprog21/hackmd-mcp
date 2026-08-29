@@ -182,10 +182,6 @@ test (see P3) for each and record the answer here.
 
 ## P1 — essential RMCP tools
 
-- [ ] Return `CallToolResult::success` with concise text and structured JSON
-  for successful tools. Return `CallToolResult::error` for API failures and
-  handler-level validation failures; allow RMCP's schema decoder to reject
-  structurally invalid JSON-RPC parameters.
 - [ ] Add read-only `hackmd_get_me` (`GET /me`) and `hackmd_list_teams`
   (`GET /teams`) discovery tools. Return each team's `path`, because it is the
   required `workspace.team_path` for all team routes, and keep `/me`'s
