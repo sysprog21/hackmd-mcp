@@ -393,6 +393,7 @@ impl HackmdClient {
             })?;
         let retry = self.config.retry();
         let mut retries = 0_u8;
+        tracing::debug!(method = %method_text, path = %path, "HackMD request started");
         let (status, bytes) = loop {
             let mut request = self
                 .http
@@ -441,6 +442,14 @@ impl HackmdClient {
             }
             break (status, bytes);
         };
+
+        tracing::debug!(
+            method = %method_text,
+            path = %path,
+            status = status.as_u16(),
+            retries,
+            "HackMD request completed"
+        );
 
         if !status.is_success() {
             return Err(map_status_error(status, method_text, path, &bytes, token));

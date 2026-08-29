@@ -215,3 +215,7 @@
   external 60-second list cache exists to support full-body search, which this
   server deliberately excludes; ordinary discovery traffic does not yet
   justify stale reads or write-invalidation state. Note bodies remain uncached.
+- [x] Add process-unique request IDs and redacted JSON tracing to stderr for
+  every MCP tool call and HackMD request. `RUST_LOG` opts into debug detail;
+  the optional `otel` feature plus `HACKMD_MCP_OTEL=true` exports spans through
+  the standard OTLP environment configuration. MCP stdout remains transport-only.

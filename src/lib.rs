@@ -13,6 +13,7 @@ mod image_upload;
 mod list_notes;
 mod models;
 mod note_ref;
+mod observability;
 mod patch;
 mod pull_note;
 mod push_note;
@@ -39,11 +40,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Returns an error if the stdio transport cannot start or terminates with a
 /// protocol or I/O failure.
 pub async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
-    let _subscriber = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .without_time()
-        .try_init();
+    let _observability = observability::init()?;
     server::run_stdio().await
 }
 

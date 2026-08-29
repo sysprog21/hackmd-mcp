@@ -196,8 +196,6 @@ test (see P3) for each and record the answer here.
 
 ## P3 — efficiency and reliability
 
-- [ ] Add request IDs and redacted structured logs to stderr, with opt-in
-  tracing/OpenTelemetry. Keep operational diagnostics out of MCP stdout.
 - [ ] Add a guarded live smoke test suite, disabled by default and enabled only
   with a dedicated token, that verifies profile, create/read/edit/no-op, folder
   create and move, delete-then-restore, and cleanup in an isolated test

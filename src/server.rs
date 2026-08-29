@@ -3,6 +3,7 @@ use std::sync::Arc;
 use rmcp::{ServiceExt, tool_router};
 use rmcp::{handler::server::wrapper::Parameters, schemars, tool};
 use serde::Deserialize;
+use tracing::Instrument;
 
 use crate::check_sync::CheckNoteSyncInput;
 use crate::client::HackmdClient;
@@ -584,9 +585,31 @@ impl rmcp::ServerHandler for HackmdServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let request_id = crate::observability::next_request_id();
+        let tool_name = request.name.to_string();
+        let span = tracing::info_span!(
+            "mcp_tool_call",
+            request_id = %request_id,
+            tool = %tool_name
+        );
         let tool_context =
             rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        crate::retry_metadata::scope_call(Self::tool_router().call(tool_context)).await
+        async move {
+            tracing::info!("tool call started");
+            let result =
+                crate::retry_metadata::scope_call(Self::tool_router().call(tool_context)).await;
+            match &result {
+                Ok(rmcp::model::CallToolResponse::Complete(response)) => tracing::info!(
+                    is_error = response.is_error.unwrap_or(false),
+                    "tool call completed"
+                ),
+                Ok(_) => tracing::info!("tool call yielded an intermediate response"),
+                Err(error) => tracing::warn!(code = ?error.code, "tool call rejected"),
+            }
+            result
+        }
+        .instrument(span)
+        .await
     }
 }
 
