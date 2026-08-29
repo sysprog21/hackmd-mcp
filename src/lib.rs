@@ -22,6 +22,7 @@ mod server;
 mod snapshot;
 mod state;
 mod tool_result;
+mod trash;
 
 #[cfg(test)]
 mod test_support;

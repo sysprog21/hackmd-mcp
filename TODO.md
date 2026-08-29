@@ -42,7 +42,7 @@ any single line. Sources:
 `hackmd-cli` (official CLI), `hackmd-skills` (official skills + a live eval
 run), `hackMD-skill`, `hackmd-mcp` (yuna0x0), `hackmd-mcp-server` (hbarcelos),
 `py-hackmd-mcp`, `hackmd-agent-python`, `hackmd-mcp-proxy` (Rust, closest prior
-art).
+art), `hackmd-api-client-rs` (Rust client plus commit history).
 
 - Base URL `https://api.hackmd.io/v1`, bearer token auth. HackMD EE instances
   override the endpoint; the CLI calls that `HMD_API_ENDPOINT_URL`.
@@ -50,20 +50,18 @@ art).
   and `folderPaths` (hackMD-skill `api-endpoints.md`). Folder membership is only
   visible on a single-note read, as a `folderPaths` ancestor array, never as a
   scalar `parentFolderId`.
-- `POST /notes` silently drops `parentFolderId`. hackMD-skill's note-field table
-  asserts this flatly; it is not one of that skill's version-verified coverage
-  notes, so treat it as a strong claim, not a measurement. Placing a new note in
-  a folder is POST, then PATCH with `parentFolderId`, then read back. A live eval
-  run in `hackmd-skills/push-to-hackmd/evals/iteration-1` did exactly that and
-  confirmed the result through `folderPaths[].name`.
+- `POST /notes` accepts `parentFolderId`: a guarded personal-workspace probe on
+  2026-08-29 read the requested folder back in `folderPaths`. Older sources and
+  one official eval observed or assumed it was dropped, so create sends the
+  field, reads back, and uses PATCH only as a compatibility fallback.
 - `POST /folders` rejects `"parentFolderId": null` with `Validation Failed`;
   omit the field for a root folder. That one is measured: it is a revision item
   from the live eval run above.
-- `PATCH /folders/{id}` accepts `null` for `description`, `icon`, `color`, and
-  `parentFolderId` to clear them, so `null` there is the documented way to move a
-  folder to top level. Source is hackMD-skill `api-endpoints.md`, corroborated by
-  `hackmd-mcp-server`'s `UpdateFolderInput` typing those four as
-  `string | null`. Not covered by the eval run.
+- Personal folder PATCH is not exposed by HackMD. Team folder PATCH updates
+  metadata, but guarded personal and team probes on 2026-08-29 measured both a
+  destination ID and `null` `parentFolderId` returning success while leaving
+  the parent unchanged. Reject folder moves rather than reporting silent
+  success.
 - Note PATCH accepts `title`, `content`, `readPermission`, `writePermission`,
   `tags`, `description`, `permalink`, `parentFolderId`. `commentPermission`,
   `suggestEditPermission`, and `noteFeatures` are create-time only — confirmed
@@ -103,23 +101,16 @@ art).
 These come from sources that disagree. Do not encode a guess; add a guarded live
 test (see P3) for each and record the answer here.
 
-- Does `DELETE /notes/{id}` trash or permanently delete?
-  `hackMD-skill/api-endpoints.md` says permanent; `py-hackmd-mcp` says it trashes
-  and `PUT /trash/{id}/restore` recovers it. The existence of `GET /trash` favors
-  trashing. The tool stays destructive either way, but the description must be
-  right.
-- Is `parentFolderId` really dropped on note POST? The official
-  `hackmd-cli/SKILL.md` advertises `notes create --parentFolderId=<id>` as
-  working, while `hackMD-skill` states POST silently drops it and the official
-  eval run used POST-then-PATCH anyway. Implement POST + PATCH + read-back, which
-  is correct under both readings, and delete the extra PATCH only after a live
-  test proves POST assigns the folder.
-- Is there a team image-upload route? Every source documents only
-  `/notes/{id}/images`. If none exists, `hackmd_upload_note_image` must reject a
-  team workspace with a clear unsupported error rather than a 404; it still needs
-  the `workspace` argument to resolve a bare team note ID at all.
-- Does folder-order use `PUT` or `PATCH`? `hackMD-skill` documents `PUT`; the CLI
-  hides it behind an SDK call.
+- Measured 2026-08-29: personal `DELETE /notes/{id}` moves the note into
+  `GET /trash`, and `PUT /trash/{id}/restore` makes it readable again.
+- Measured 2026-08-29: personal note POST assigns a supplied `parentFolderId`.
+  Keep a readback-driven PATCH fallback for older deployments and unmeasured
+  team behavior.
+- Measured 2026-08-29: the inferred team image-upload route returns 404, so
+  `hackmd_upload_note_image` correctly rejects team workspaces with a clear
+  unsupported error.
+- Measured 2026-08-29: folder-order accepts `PUT` with `{"order": map}`; GET
+  returns the raw map.
 
 ## Lessons taken from the reviewed implementations
 
@@ -170,6 +161,14 @@ test (see P3) for each and record the answer here.
 - `hackmd-agent-python` returns retry state to the agent in a `_meta` field
   (`was_rate_limited`, `total_attempts`, `total_wait_seconds`) and caches note
   lists for 60 seconds, invalidating on write. Both are the shape P3 wants.
+- `hackmd-api-client-rs` commit `3d2d8e1` corrected response models and added
+  encoded path-segment, double-millisecond timestamp, error-body, and current
+  endpoint contract tests; follow-up `4af0888` removed speculative raw/optional
+  response APIs. Adopt its tolerant timestamps and HackMD
+  `x-ratelimit-userreset` fallback, while retaining this server's safer rule
+  against automatic POST/DELETE retries. Its nullable folder-parent type is
+  serialization evidence only and is overruled by this project's personal and
+  team live no-ops.
 - `hackmd-skills/shared/README.md` defines the anti-clobber contract this
   server's push path implements: export baseline, edit locally, re-export,
   diff baseline against the re-export, and push only on no diff. Its
@@ -185,21 +184,10 @@ test (see P3) for each and record the answer here.
 
 ## P2 — complete daily HackMD workflow
 
-- [ ] Add personal `hackmd_list_trash` (`GET /trash`) and
-  `hackmd_restore_note` (`PUT /trash/{note_id}/restore`) with the same slim
-  pagination as note lists. Mark restore non-destructive/idempotent; keep delete
-  destructive. Describe delete according to whichever behavior the live test in
-  "Contradictions" confirms. Mock both routes and their empty/accepted responses.
-
 ## P2.5 — local Markdown sync
 
 
 ## P3 — efficiency and reliability
-
-- [ ] Add a guarded live smoke test suite, disabled by default and enabled only
-  with a dedicated token, that verifies profile, create/read/edit/no-op, folder
-  create and move, delete-then-restore, and cleanup in an isolated test
-  workspace. Every item under "Contradictions to settle" is answered here.
 
 ## P4 — remote use
 

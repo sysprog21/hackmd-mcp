@@ -39,7 +39,7 @@ pub(crate) struct CreateNoteInput {
     pub(crate) comment_permission: Option<CommentPermission>,
     /// Who may suggest edits; omitted preserves the workspace default.
     pub(crate) suggest_edit_permission: Option<SuggestEditPermission>,
-    /// Folder ID for placement. The server follows create with PATCH because `HackMD` ignores it on POST.
+    /// Folder ID for placement. The server verifies POST placement and uses PATCH only as a compatibility fallback.
     pub(crate) parent_folder_id: Option<String>,
     /// Per-feature `HackMD` permission overrides.
     pub(crate) note_features: Option<BTreeMap<String, Value>>,
@@ -101,6 +101,7 @@ pub(crate) struct DeleteNoteInput {
 pub(crate) struct CreateNoteOutput {
     pub(crate) note: NoteResponse,
     pub(crate) folder_placement_requested: bool,
+    pub(crate) compatibility_patch_applied: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -154,26 +155,15 @@ pub(crate) async fn create_note(
         comment_permission: input.comment_permission,
         suggest_edit_permission: input.suggest_edit_permission,
         permalink: input.permalink,
-        parent_folder_id: None,
+        parent_folder_id: folder.clone(),
         note_features: input.note_features,
         origin: input.origin,
     };
     payload.validate()?;
     client.ensure_team_exists(&input.workspace).await?;
     let mut note = client.create_note(&input.workspace, &payload).await?;
+    let mut compatibility_patch_applied = false;
     if let Some(folder_id) = folder.as_ref() {
-        let placement = UpdateNoteRequest {
-            parent_folder_id: Some(Some(folder_id.clone())),
-            ..UpdateNoteRequest::default()
-        };
-        placement.validate()?;
-        client
-            .update_note(&input.workspace, &note.id, &placement)
-            .await
-            .map_err(|source| CrudError::FolderPlacement {
-                note_id: note.id.clone(),
-                source,
-            })?;
         note = client
             .get_note(&input.workspace, &note.id)
             .await
@@ -181,10 +171,33 @@ pub(crate) async fn create_note(
                 note_id: note.id.clone(),
                 source,
             })?;
+        if !note.folder_paths.iter().any(|path| path.id == *folder_id) {
+            let placement = UpdateNoteRequest {
+                parent_folder_id: Some(Some(folder_id.clone())),
+                ..UpdateNoteRequest::default()
+            };
+            placement.validate()?;
+            client
+                .update_note(&input.workspace, &note.id, &placement)
+                .await
+                .map_err(|source| CrudError::FolderPlacement {
+                    note_id: note.id.clone(),
+                    source,
+                })?;
+            compatibility_patch_applied = true;
+            note = client
+                .get_note(&input.workspace, &note.id)
+                .await
+                .map_err(|source| CrudError::FolderPlacement {
+                    note_id: note.id.clone(),
+                    source,
+                })?;
+        }
     }
     Ok(CreateNoteOutput {
         note,
         folder_placement_requested: folder.is_some(),
+        compatibility_patch_applied,
     })
 }
 
@@ -347,9 +360,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_folder_placement_uses_post_then_patch() {
+    async fn create_folder_placement_falls_back_when_post_drops_it() {
         let server = SequenceServer::spawn([
             (201, r#"{"id":"new-id","title":"New"}"#),
+            (200, r#"{"id":"new-id","title":"New"}"#),
             (202, ""),
             (
                 200,
@@ -372,25 +386,53 @@ mod tests {
             .expect("create and placement should succeed");
         assert_eq!(output.note.id, "new-id");
         assert!(output.folder_placement_requested);
+        assert!(output.compatibility_patch_applied);
         let requests = server.finish();
         assert!(requests[0].starts_with("POST /v1/notes HTTP/1.1\r\n"));
-        assert!(requests[0].ends_with(r#"{"title":"New"}"#));
-        assert!(!requests[0].contains("parentFolderId"));
-        assert!(requests[1].starts_with("PATCH /v1/notes/new-id HTTP/1.1\r\n"));
-        assert!(requests[1].ends_with(r#"{"parentFolderId":"folder-id"}"#));
-        assert!(requests[2].starts_with("GET /v1/notes/new-id HTTP/1.1\r\n"));
+        assert!(requests[0].ends_with(r#"{"parentFolderId":"folder-id","title":"New"}"#));
+        assert!(requests[1].starts_with("GET /v1/notes/new-id HTTP/1.1\r\n"));
+        assert!(requests[2].starts_with("PATCH /v1/notes/new-id HTTP/1.1\r\n"));
+        assert!(requests[2].ends_with(r#"{"parentFolderId":"folder-id"}"#));
+        assert!(requests[3].starts_with("GET /v1/notes/new-id HTTP/1.1\r\n"));
         assert_eq!(output.note.folder_paths[0].id, "folder-id");
+    }
+
+    #[tokio::test]
+    async fn create_skips_compatibility_patch_when_post_assigns_folder() {
+        let server = SequenceServer::spawn([
+            (201, r#"{"id":"new-id","title":"New"}"#),
+            (
+                200,
+                r#"{"id":"new-id","title":"New","folderPaths":[{"id":"folder-id","name":"Folder"}]}"#,
+            ),
+        ]);
+        let client = HackmdClient::new(Config::for_loopback_test(
+            &server.api_url,
+            Some("fixture-token"),
+        ))
+        .expect("fixture client should build");
+        let input: CreateNoteInput = serde_json::from_value(json!({
+            "title": "New",
+            "parent_folder_id": "folder-id"
+        }))
+        .expect("create input should deserialize");
+        let output = create_note(&client, input)
+            .await
+            .expect("POST-assigned folder should succeed");
+        assert!(!output.compatibility_patch_applied);
+        assert_eq!(server.finish().len(), 2);
     }
 
     #[tokio::test]
     async fn folder_placement_failure_reports_already_created_note_id() {
         let server = SequenceServer::spawn([
             (201, r#"{"id":"recoverable-id","title":"New"}"#),
+            (200, r#"{"id":"recoverable-id","title":"New"}"#),
             (500, r#"{"error":"fixture"}"#),
         ]);
-        let client = HackmdClient::new(Config::for_loopback_test(
+        let client = HackmdClient::new(Config::for_loopback_test_no_retry(
             &server.api_url,
-            Some("fixture-token"),
+            "fixture-token",
         ))
         .expect("fixture client should build");
         let input: CreateNoteInput = serde_json::from_value(json!({

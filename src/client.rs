@@ -104,6 +104,21 @@ impl HackmdClient {
             })
     }
 
+    pub(crate) async fn list_trash(&self) -> Result<Vec<NoteResponse>, HackmdError> {
+        let path = self.url_for_segments(&["trash"])?.path().to_owned();
+        self.request_json(Method::GET, &["trash"], None)
+            .await?
+            .ok_or_else(|| HackmdError::EmptyResponse {
+                method: "GET".to_owned(),
+                path,
+            })
+    }
+
+    pub(crate) async fn restore_note(&self, note_id: &str) -> Result<Option<Value>, HackmdError> {
+        self.request_json_idempotent(Method::PUT, &["trash", note_id, "restore"], None)
+            .await
+    }
+
     #[allow(dead_code, reason = "used by note resolution and list-note tool tasks")]
     pub(crate) async fn list_notes(
         &self,
@@ -480,12 +495,22 @@ impl HackmdClient {
 }
 
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
+    if let Some(value) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+    {
+        if let Ok(seconds) = value.parse::<u64>() {
+            return Some(Duration::from_secs(seconds));
+        }
+        if let Ok(target) = httpdate::parse_http_date(value) {
+            return target.duration_since(SystemTime::now()).ok();
+        }
     }
-    let target = httpdate::parse_http_date(value).ok()?;
-    target.duration_since(SystemTime::now()).ok()
+    headers
+        .get("x-ratelimit-userreset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 async fn sleep_before_retry(
@@ -635,8 +660,24 @@ mod tests {
     use reqwest::Method;
     use serde_json::{Value, json};
 
-    use super::{HackmdClient, HackmdError};
+    use super::{HackmdClient, HackmdError, retry_after};
     use crate::config::Config;
+
+    #[test]
+    fn retry_delay_uses_hackmd_reset_header_as_fallback() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-userreset",
+            reqwest::header::HeaderValue::from_static("4"),
+        );
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(4)));
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("2"),
+        );
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(2)));
+    }
     use crate::{
         dto::{CreateNoteRequest, UpdateNoteRequest},
         models::Workspace,

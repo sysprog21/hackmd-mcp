@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use rmcp::schemars;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -159,7 +159,7 @@ pub(crate) enum PayloadError {
 pub(crate) struct ProfileResponse {
     pub(crate) id: String,
     pub(crate) name: String,
-    pub(crate) email: String,
+    pub(crate) email: Option<String>,
     pub(crate) user_path: String,
     pub(crate) photo: Option<String>,
     #[serde(default)]
@@ -184,9 +184,12 @@ pub(crate) struct NoteResponse {
     pub(crate) title: String,
     pub(crate) short_id: Option<String>,
     pub(crate) publish_link: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_millis")]
     pub(crate) created_at: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_optional_millis")]
     pub(crate) last_changed_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_optional_millis")]
     pub(crate) last_visit: Option<i64>,
     pub(crate) read_permission: Option<NotePermission>,
     pub(crate) write_permission: Option<NotePermission>,
@@ -200,6 +203,29 @@ pub(crate) struct NoteResponse {
     pub(crate) team_path: Option<String>,
     #[serde(default)]
     pub(crate) folder_paths: Vec<FolderPathResponse>,
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "finite in-range OpenAPI double milliseconds are deliberately rounded to integer milliseconds"
+)]
+fn deserialize_optional_millis<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    value
+        .map(|value| {
+            if !value.is_finite()
+                || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value)
+            {
+                return Err(de::Error::custom(
+                    "timestamp must be a finite i64 millisecond value",
+                ));
+            }
+            Ok(value.round() as i64)
+        })
+        .transpose()
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -307,6 +333,33 @@ mod tests {
         CommentPermission, CreateNoteRequest, NotePermission, NoteResponse, PayloadError,
         ProfileResponse, SuggestEditPermission, TeamResponse, UpdateNoteRequest,
     };
+
+    #[test]
+    fn note_timestamps_accept_integer_or_double_milliseconds() {
+        let note: super::NoteResponse = serde_json::from_value(json!({
+            "id": "note",
+            "title": "Timestamp",
+            "createdAt": 1_710_000_000_000.0,
+            "lastChangedAt": 1_710_000_000_001_i64,
+            "lastVisit": null
+        }))
+        .expect("OpenAPI double timestamps should deserialize");
+        assert_eq!(note.created_at, Some(1_710_000_000_000));
+        assert_eq!(note.last_changed_at, Some(1_710_000_000_001));
+        assert_eq!(note.last_visit, None);
+    }
+
+    #[test]
+    fn profile_accepts_an_absent_or_null_email() {
+        for value in [
+            json!({"id":"user","name":"User","userPath":"user"}),
+            json!({"id":"user","name":"User","userPath":"user","email":null}),
+        ] {
+            let profile: ProfileResponse =
+                serde_json::from_value(value).expect("email is optional in the current API model");
+            assert_eq!(profile.email, None);
+        }
+    }
 
     #[test]
     fn absent_create_fields_do_not_override_account_defaults() {

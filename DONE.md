@@ -127,15 +127,18 @@
   `{"history": [...]}` response, as `py-hackmd-mcp` does.
 - [x] Add folder tools: `hackmd_list_folders`, `hackmd_get_folder`,
   `hackmd_create_folder`, `hackmd_update_folder`, `hackmd_delete_folder`, and
-  `hackmd_set_folder_order`, all workspace-aware. Folder create/update carry
-  `name`, `description`, `icon`, `color`, and `parent_folder_id`.
+  `hackmd_set_folder_order`, all workspace-aware except that HackMD exposes
+  folder metadata PATCH only for teams. Folder create carries `name`,
+  `description`, `icon`, `color`, and `parent_folder_id`; team update carries
+  the metadata fields.
 - [x] Omit `parentFolderId` when creating a root folder; do not send `null`,
-  which POST rejects. On folder update, `null` clears `parentFolderId`,
-  `description`, `icon`, and `color`, represented with absent/null/value input
-  states. Confirm a requested team path exists before creating content or
-  folders in it.
-- [x] Before moving a folder, reject self/descendant moves by walking the
-  folder parent chain. Before deleting a non-empty folder, return its child
+  which POST rejects. On folder update, absent/null/value states clear
+  `description`, `icon`, and `color`; reject every update-time
+  `parentFolderId` because guarded personal and team probes proved moves are
+  silent no-ops. Confirm a requested team path exists before creating content
+  or folders in it.
+- [x] Reject unsupported folder moves before network I/O. Before deleting a
+  non-empty folder, return its child
   count without changing state; delete only when the same request supplies
   `confirm: true`.
 - [x] Implement `hackmd_set_folder_order` as GET `folder-order`, replace only
@@ -144,16 +147,23 @@
 - [x] Treat HackMD folder and note-move operations as asynchronous where
   applicable: read back after accepted PATCH requests, and verify safe body
   edits match the requested content.
-- [x] Create a note in a folder as POST followed by PATCH and read-back. Keep
-  the read-back regardless of whether a future live test permits dropping the
-  compatibility PATCH.
+- [x] Create a note in a folder by sending `parentFolderId` on POST and reading
+  it back. A guarded live probe confirmed current personal POST placement; issue
+  the compatibility PATCH and second readback only when the first readback
+  shows that an older deployment dropped the field.
 - [x] Add `hackmd_upload_note_image` with `workspace`, `note_ref`, and an
   absolute `image_path`; stream multipart field `image`, require confirmation
   above 5 MiB, refuse above 10 MiB, map 413 to a resize hint, and return only
-  `data.link`. Reject team uploads until a live test proves a supported route.
+  `data.link`. A guarded team probe confirmed the inferred team route returns
+  404, so reject team uploads with an explicit unsupported error.
 - [x] Add fixture tests for known quirks: `202` readbacks, POST-then-PATCH folder
   assignment, folder-path normalization, order-map merge preservation, move
-  cycle rejection, root-folder create omission, and folder IDs containing `/`.
+  move rejection, root-folder create omission, and folder IDs containing `/`.
+- [x] Add personal `hackmd_list_trash` (`GET /trash`) and
+  `hackmd_restore_note` (`PUT /trash/{note_id}/restore`) with slim pagination,
+  non-destructive/idempotent restore annotations, encoded IDs, input guards,
+  and empty/accepted response coverage. A guarded live run confirmed DELETE
+  moves personal notes to trash and restore makes them readable again.
 
 ## P2.5 — local Markdown sync
 
@@ -197,6 +207,13 @@
   and path validation.
 
 ## P3 — efficiency and reliability
+
+- [x] Add `tests/live-smoke.rs`, disabled by default and gated by
+  `HACKMD_RUN_LIVE_TESTS=1` plus a dedicated token. Its panic-safe cleanup
+  covers personal profile, note create/read/edit/no-op, nested folders and
+  order, delete/trash/restore, plus team metadata PATCH, unsupported folder
+  moves, and the absent team image route. Both guarded workflows passed against
+  HackMD on 2026-08-29.
 
 - [x] Reuse one `reqwest::Client` with distinct 30-second request and 10-second
   connect timeouts. Retry only GETs and explicitly idempotent PATCHes after

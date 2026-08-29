@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use rmcp::schemars;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -90,7 +90,7 @@ pub(crate) struct UpdateFolderInput {
     #[serde(default, deserialize_with = "deserialize_nullable_string")]
     #[schemars(with = "Option<String>")]
     color: NullableString,
-    /// New parent, null for root, or omit to preserve.
+    /// Reserved for API compatibility; omit because `HackMD` ignores folder moves.
     #[serde(default, deserialize_with = "deserialize_nullable_string")]
     #[schemars(with = "Option<String>")]
     parent_folder_id: NullableString,
@@ -169,14 +169,16 @@ pub(crate) enum FolderError {
     EmptyName,
     #[error("folder {folder_id:?} does not exist in the selected workspace")]
     NotFound { folder_id: String },
-    #[error("folder {folder_id:?} cannot be moved into itself or one of its descendants")]
-    MoveCycle { folder_id: String },
-    #[error("folder hierarchy contains a pre-existing parent cycle at {folder_id:?}")]
-    InvalidHierarchy { folder_id: String },
     #[error("folder_ids contains duplicate folder ID {folder_id:?}")]
     DuplicateOrderId { folder_id: String },
     #[error("limit must be between 1 and 100")]
     InvalidLimit,
+    #[error("HackMD accepted the folder update for {folder_id}, but read-back did not match")]
+    ReadbackMismatch { folder_id: String },
+    #[error("personal folder updates are unsupported: HackMD exposes PATCH only for team folders")]
+    UnsupportedPersonalUpdate,
+    #[error("folder moves are unsupported: HackMD accepts parent_folder_id but ignores it")]
+    UnsupportedFolderMove,
     #[error(transparent)]
     Payload(#[from] PayloadError),
     #[error(transparent)]
@@ -293,7 +295,13 @@ pub(crate) async fn update_folder(
     {
         return Err(FolderError::EmptyName);
     }
+    if matches!(input.workspace, Workspace::Personal) {
+        return Err(FolderError::UnsupportedPersonalUpdate);
+    }
     let parent_folder_id = into_patch_field(input.parent_folder_id);
+    if parent_folder_id.is_some() {
+        return Err(FolderError::UnsupportedFolderMove);
+    }
     let payload = UpdateFolderRequest {
         name: input.name,
         description: into_patch_field(input.description),
@@ -302,20 +310,46 @@ pub(crate) async fn update_folder(
         parent_folder_id: parent_folder_id.clone(),
     };
     payload.validate()?;
-    if let Some(Some(parent_id)) = parent_folder_id {
-        let folders = client.list_folders(&input.workspace).await?;
-        validate_move(&folders, &input.folder_id, &parent_id)?;
-    }
     client
         .update_folder(&input.workspace, &input.folder_id, &payload)
         .await?;
-    let folder = client
-        .get_folder(&input.workspace, &input.folder_id)
-        .await?;
+    let mut folder = None;
+    for attempt in 0..10 {
+        let candidate = client
+            .get_folder(&input.workspace, &input.folder_id)
+            .await?;
+        if folder_matches_update(&candidate, &payload) {
+            folder = Some(candidate);
+            break;
+        }
+        if attempt < 9 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+    let folder = folder.ok_or_else(|| FolderError::ReadbackMismatch {
+        folder_id: input.folder_id.clone(),
+    })?;
     Ok(FolderOutput {
         workspace: input.workspace,
         folder,
     })
+}
+
+fn folder_matches_update(folder: &FolderResponse, update: &UpdateFolderRequest) -> bool {
+    update.name.as_ref().is_none_or(|name| folder.name == *name)
+        && update
+            .description
+            .as_ref()
+            .is_none_or(|description| folder.description == *description)
+        && update.icon.as_ref().is_none_or(|icon| folder.icon == *icon)
+        && update
+            .color
+            .as_ref()
+            .is_none_or(|color| folder.color == *color)
+        && update
+            .parent_folder_id
+            .as_ref()
+            .is_none_or(|parent| folder.parent_folder_id == *parent)
 }
 
 pub(crate) async fn delete_folder(
@@ -364,43 +398,6 @@ fn into_patch_field(value: NullableString) -> Option<Option<String>> {
     }
 }
 
-fn validate_move(
-    folders: &[FolderResponse],
-    folder_id: &str,
-    parent_id: &str,
-) -> Result<(), FolderError> {
-    let parents = folders
-        .iter()
-        .map(|folder| (folder.id.as_str(), folder.parent_folder_id.as_deref()))
-        .collect::<HashMap<_, _>>();
-    if !parents.contains_key(folder_id) {
-        return Err(FolderError::NotFound {
-            folder_id: folder_id.to_owned(),
-        });
-    }
-    if !parents.contains_key(parent_id) {
-        return Err(FolderError::NotFound {
-            folder_id: parent_id.to_owned(),
-        });
-    }
-    let mut current = Some(parent_id);
-    let mut seen = HashSet::new();
-    while let Some(id) = current {
-        if id == folder_id {
-            return Err(FolderError::MoveCycle {
-                folder_id: folder_id.to_owned(),
-            });
-        }
-        if !seen.insert(id) {
-            return Err(FolderError::InvalidHierarchy {
-                folder_id: id.to_owned(),
-            });
-        }
-        current = parents.get(id).copied().flatten();
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -408,9 +405,9 @@ mod tests {
     use super::{
         CreateFolderInput, DeleteFolderInput, FolderError, FolderWorkspaceInput, NullableString,
         SetFolderOrderInput, UpdateFolderInput, create_folder, delete_folder, list_folders,
-        set_folder_order, update_folder, validate_move,
+        set_folder_order, update_folder,
     };
-    use crate::{client::HackmdClient, config::Config, dto::FolderResponse, models::Workspace};
+    use crate::{client::HackmdClient, config::Config, models::Workspace};
 
     fn fixture_client(server: &crate::test_support::SequenceServer) -> HackmdClient {
         HackmdClient::new(Config::for_loopback_test(
@@ -418,15 +415,6 @@ mod tests {
             Some("fixture-token"),
         ))
         .expect("fixture client should build")
-    }
-
-    fn folder(id: &str, parent: Option<&str>) -> FolderResponse {
-        serde_json::from_value(json!({
-            "id": id,
-            "name": id,
-            "parentFolderId": parent
-        }))
-        .expect("folder fixture should deserialize")
     }
 
     #[test]
@@ -446,28 +434,6 @@ mod tests {
         }))
         .expect("value should deserialize");
         assert!(matches!(set.color, NullableString::Set(Some(value)) if value == "#fff"));
-    }
-
-    #[test]
-    fn move_validation_rejects_self_descendant_and_invalid_existing_cycle() {
-        let tree = [folder("root", None), folder("child", Some("root"))];
-        assert!(matches!(
-            validate_move(&tree, "root", "root"),
-            Err(FolderError::MoveCycle { .. })
-        ));
-        assert!(matches!(
-            validate_move(&tree, "root", "child"),
-            Err(FolderError::MoveCycle { .. })
-        ));
-        let cyclic = [
-            folder("a", Some("b")),
-            folder("b", Some("a")),
-            folder("c", None),
-        ];
-        assert!(matches!(
-            validate_move(&cyclic, "c", "a"),
-            Err(FolderError::InvalidHierarchy { .. })
-        ));
     }
 
     #[tokio::test]
@@ -521,24 +487,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_clears_fields_then_reads_encoded_folder_back() {
+    async fn update_clears_nullable_metadata_then_reads_encoded_folder_back() {
         let fixture = crate::test_support::SequenceServer::spawn([
             (202, ""),
             (200, r#"{"id":"folder/id","name":"Moved"}"#),
         ]);
         let input = serde_json::from_value(json!({
+            "workspace": {"kind": "team", "team_path": "team/path"},
             "folder_id": "folder/id",
-            "description": null,
-            "parent_folder_id": null
+            "description": null
         }))
         .expect("tri-state update should deserialize");
         update_folder(&fixture_client(&fixture), input)
             .await
             .expect("folder update should read back");
         let requests = fixture.finish();
-        assert!(requests[0].starts_with("PATCH /v1/folders/folder%2Fid HTTP/1.1\r\n"));
-        assert!(requests[0].ends_with(r#"{"description":null,"parentFolderId":null}"#));
-        assert!(requests[1].starts_with("GET /v1/folders/folder%2Fid HTTP/1.1\r\n"));
+        assert!(
+            requests[0].starts_with("PATCH /v1/teams/team%2Fpath/folders/folder%2Fid HTTP/1.1\r\n")
+        );
+        assert!(requests[0].ends_with(r#"{"description":null}"#));
+        assert!(
+            requests[1].starts_with("GET /v1/teams/team%2Fpath/folders/folder%2Fid HTTP/1.1\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_polls_until_async_change_is_visible() {
+        let fixture = crate::test_support::SequenceServer::spawn([
+            (202, ""),
+            (200, r#"{"id":"folder","name":"Old"}"#),
+            (200, r#"{"id":"folder","name":"New"}"#),
+        ]);
+        let input = serde_json::from_value(json!({
+            "workspace": {"kind": "team", "team_path": "team"},
+            "folder_id": "folder",
+            "name": "New"
+        }))
+        .expect("folder update should deserialize");
+        let output = update_folder(&fixture_client(&fixture), input)
+            .await
+            .expect("eventual folder update should succeed");
+        assert_eq!(output.folder.name, "New");
+        assert_eq!(fixture.finish().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn personal_update_is_rejected_before_network_after_live_no_op() {
+        let input = serde_json::from_value(json!({
+            "folder_id": "folder",
+            "parent_folder_id": null
+        }))
+        .expect("root move should deserialize");
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        assert!(matches!(
+            update_folder(&client, input).await,
+            Err(FolderError::UnsupportedPersonalUpdate)
+        ));
+    }
+
+    #[tokio::test]
+    async fn team_move_is_rejected_before_network_after_live_no_op() {
+        let input = serde_json::from_value(json!({
+            "workspace": {"kind": "team", "team_path": "team"},
+            "folder_id": "folder",
+            "parent_folder_id": "destination"
+        }))
+        .expect("folder move should deserialize");
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        assert!(matches!(
+            update_folder(&client, input).await,
+            Err(FolderError::UnsupportedFolderMove)
+        ));
     }
 
     #[tokio::test]

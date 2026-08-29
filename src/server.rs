@@ -23,6 +23,7 @@ use crate::pull_note::PullNoteInput;
 use crate::push_note::PushNoteInput;
 use crate::snapshot::SaveRemoteSnapshotInput;
 use crate::tool_result;
+use crate::trash::{ListTrashInput, RestoreNoteInput};
 
 /// MCP server whose handlers share one configured `HackMD` client.
 #[derive(Debug, Clone)]
@@ -151,7 +152,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_create_note",
-        description = "Create a HackMD note in a personal or team workspace. Folder placement is completed with a follow-up PATCH because HackMD ignores parentFolderId during creation.",
+        description = "Create a HackMD note in a personal or team workspace. Folder placement is read back after POST; a compatibility PATCH runs only if the API dropped parentFolderId.",
         annotations(
             title = "Create HackMD Note",
             read_only_hint = false,
@@ -203,7 +204,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_delete_note",
-        description = "Delete a HackMD note from a personal or team workspace. This is destructive and may move the note to trash depending on HackMD workspace behavior.",
+        description = "Delete a HackMD note. Personal deletion moves it to recoverable trash; team restore is not exposed. This remains destructive.",
         annotations(
             title = "Delete HackMD Note",
             read_only_hint = false,
@@ -224,6 +225,57 @@ impl HackmdServer {
             Ok(Err(resolution)) => tool_result::success(
                 "The note reference did not resolve uniquely",
                 serde_json::json!({"resolution": resolution}),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        name = "hackmd_list_trash",
+        description = "List trashed personal HackMD notes with slim metadata and client-side pagination.",
+        annotations(
+            title = "List Trashed HackMD Notes",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn list_trash(
+        &self,
+        Parameters(input): Parameters<ListTrashInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::trash::list_trash(&self.client, input).await {
+            Ok(output) => tool_result::success(
+                format!(
+                    "Found {} trashed HackMD note(s); returned {}",
+                    output.total, output.count
+                ),
+                serde_json::to_value(output).expect("trash-list output should serialize"),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        name = "hackmd_restore_note",
+        description = "Restore a personal HackMD note from trash by internal note ID.",
+        annotations(
+            title = "Restore Trashed HackMD Note",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn restore_note(
+        &self,
+        Parameters(input): Parameters<RestoreNoteInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::trash::restore_note(&self.client, input).await {
+            Ok(output) => tool_result::success(
+                format!("Restored HackMD note {}", output.note_id),
+                serde_json::json!({"result": output}),
             ),
             Err(error) => tool_result::error(error.to_string()),
         }
@@ -365,7 +417,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_update_folder",
-        description = "Update folder metadata or move a folder after rejecting self and descendant cycles; reads the folder back after PATCH.",
+        description = "Update team folder metadata and read back until PATCH is visible. Personal folder PATCH and all folder moves are unsupported by HackMD.",
         annotations(
             title = "Update HackMD Folder",
             read_only_hint = false,
@@ -640,7 +692,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 20] = [
+    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 22] = [
         ("hackmd_get_me", true, false, true),
         ("hackmd_list_teams", true, false, true),
         ("hackmd_list_notes", true, false, true),
@@ -648,6 +700,8 @@ mod tests {
         ("hackmd_create_note", false, false, false),
         ("hackmd_update_note", false, true, true),
         ("hackmd_delete_note", false, true, true),
+        ("hackmd_list_trash", true, false, true),
+        ("hackmd_restore_note", false, false, true),
         ("hackmd_edit_note", false, false, false),
         ("hackmd_get_history", true, false, true),
         ("hackmd_list_folders", true, false, true),
@@ -717,7 +771,7 @@ mod tests {
     fn tools_have_generated_schemas_and_exact_annotations() {
         let tools = HackmdServer::tool_router().list_all();
 
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 22);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = tools
                 .iter()
@@ -753,6 +807,18 @@ mod tests {
         assert_eq!(properties["offset"]["default"], 0);
         assert_eq!(properties["sort"]["default"], "last_changed_desc");
         assert!(properties.get("folder_id").is_none());
+
+        let trash = tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_list_trash")
+            .expect("trash list should exist");
+        assert_eq!(trash.input_schema["properties"]["limit"]["default"], 20);
+        assert_eq!(trash.input_schema["properties"]["limit"]["maximum"], 100);
+        let restore = tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_restore_note")
+            .expect("restore should exist");
+        assert_eq!(restore.input_schema["required"], json!(["note_id"]));
 
         let get_note = tools
             .iter()
@@ -1004,7 +1070,7 @@ mod tests {
             .list_tools(None)
             .await
             .expect("tools/list should succeed");
-        assert_eq!(listed.tools.len(), 20);
+        assert_eq!(listed.tools.len(), 22);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = listed
                 .tools

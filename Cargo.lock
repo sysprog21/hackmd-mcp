@@ -520,6 +520,7 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "fastrand",
+ "futures-util",
  "httpdate",
  "opentelemetry",
  "opentelemetry-otlp",
