@@ -4,5 +4,4 @@
 /// tasks. Keeping this type private prevents the transport layer from becoming
 /// part of the crate's public API.
 #[derive(Debug, Default)]
-#[allow(dead_code, reason = "constructed by the following server startup task")]
 pub(crate) struct HackmdClient;

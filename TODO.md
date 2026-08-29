@@ -180,9 +180,6 @@ test (see P3) for each and record the answer here.
 
 ## P0 — RMCP 3.x foundation
 
-- [ ] Run the local server with `HackmdServer::serve(rmcp::transport::stdio())`
-  then `waiting().await`; reserve stdout for the transport and write logs only
-  to stderr.
 - [ ] Add `Config` for `HACKMD_API_TOKEN`, optional
   `HACKMD_API_URL` (default `https://api.hackmd.io/v1`), a 30-second request
   timeout, a shorter connect timeout, and retry configuration (at most three

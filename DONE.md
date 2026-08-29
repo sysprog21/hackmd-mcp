@@ -23,3 +23,6 @@
   (`{"kind":"personal"}` / `{"kind":"team","team_path":"x"}`) defaulting to
   personal, as the Rust proxy does. It keeps one tool family for both
   workspaces and makes the route choice a single match.
+- [x] Run the local server with `HackmdServer::serve(rmcp::transport::stdio())`
+  then `waiting().await`; reserve stdout for the transport and write logs only
+  to stderr.

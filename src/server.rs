@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rmcp::tool_router;
+use rmcp::{ServiceExt, tool_router};
 use rmcp::{handler::server::wrapper::Parameters, schemars, tool};
 use serde::Deserialize;
 
@@ -9,21 +9,27 @@ use crate::models::Workspace;
 
 /// MCP server whose handlers share one configured `HackMD` client.
 #[derive(Debug, Clone)]
-#[allow(dead_code, reason = "constructed by the following server startup task")]
 pub(crate) struct HackmdServer {
     client: Arc<HackmdClient>,
 }
 
 impl HackmdServer {
-    #[allow(dead_code, reason = "called by the following server startup task")]
     pub(crate) fn new(client: Arc<HackmdClient>) -> Self {
         Self { client }
     }
 }
 
-// Real API tools are introduced by their P1 tasks. This internal probe is not
-// reachable by users yet because stdio serving is added by the following task;
-// the first real tool will replace it before the server becomes functional.
+pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
+    HackmdServer::new(Arc::new(HackmdClient))
+        .serve(rmcp::transport::stdio())
+        .await?
+        .waiting()
+        .await?;
+    Ok(())
+}
+
+// Real API tools are introduced by their P1 tasks. This clearly named internal
+// probe validates the production router until the first real tool replaces it.
 #[tool_router(server_handler)]
 impl HackmdServer {
     #[tool(

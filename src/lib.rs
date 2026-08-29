@@ -7,6 +7,20 @@ mod server;
 /// The package version exposed by the server binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Runs the MCP server over standard input and output until the client closes
+/// the transport.
+///
+/// Standard output is owned exclusively by the MCP transport. Operational
+/// diagnostics must use standard error through the tracing configuration.
+///
+/// # Errors
+///
+/// Returns an error if the stdio transport cannot start or terminates with a
+/// protocol or I/O failure.
+pub async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
+    server::run_stdio().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::VERSION;
