@@ -237,20 +237,12 @@ pub(crate) async fn delete_note(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        sync::mpsc,
-        thread,
-        time::Duration,
-    };
-
     use serde_json::json;
 
     use super::{
         CreateNoteInput, CrudError, ParentFolderUpdate, UpdateNoteInput, create_note, update_note,
     };
-    use crate::{client::HackmdClient, config::Config};
+    use crate::{client::HackmdClient, config::Config, test_support::SequenceServer};
 
     #[test]
     fn update_distinguishes_missing_folder_from_explicit_root() {
@@ -320,10 +312,12 @@ mod tests {
 
     #[tokio::test]
     async fn create_folder_placement_uses_post_then_patch() {
-        let (api_url, requests, thread) =
-            sequence_server([(201, r#"{"id":"new-id","title":"New"}"#), (202, "")]);
-        let client = HackmdClient::new(Config::for_loopback_test(&api_url, Some("fixture-token")))
-            .expect("fixture client should build");
+        let server = SequenceServer::spawn([(201, r#"{"id":"new-id","title":"New"}"#), (202, "")]);
+        let client = HackmdClient::new(Config::for_loopback_test(
+            &server.api_url,
+            Some("fixture-token"),
+        ))
+        .expect("fixture client should build");
         let input: CreateNoteInput = serde_json::from_value(json!({
             "title": "New",
             "parent_folder_id": "folder-id"
@@ -335,10 +329,7 @@ mod tests {
             .expect("create and placement should succeed");
         assert_eq!(output.note.id, "new-id");
         assert!(output.folder_placement_requested);
-        let requests = requests
-            .recv_timeout(Duration::from_secs(2))
-            .expect("requests should be captured");
-        thread.join().expect("fixture thread should finish");
+        let requests = server.finish();
         assert!(requests[0].starts_with("POST /v1/notes HTTP/1.1\r\n"));
         assert!(requests[0].ends_with(r#"{"title":"New"}"#));
         assert!(!requests[0].contains("parentFolderId"));
@@ -348,12 +339,15 @@ mod tests {
 
     #[tokio::test]
     async fn folder_placement_failure_reports_already_created_note_id() {
-        let (api_url, requests, thread) = sequence_server([
+        let server = SequenceServer::spawn([
             (201, r#"{"id":"recoverable-id","title":"New"}"#),
             (500, r#"{"error":"fixture"}"#),
         ]);
-        let client = HackmdClient::new(Config::for_loopback_test(&api_url, Some("fixture-token")))
-            .expect("fixture client should build");
+        let client = HackmdClient::new(Config::for_loopback_test(
+            &server.api_url,
+            Some("fixture-token"),
+        ))
+        .expect("fixture client should build");
         let input: CreateNoteInput = serde_json::from_value(json!({
             "parent_folder_id": "folder-id"
         }))
@@ -362,65 +356,10 @@ mod tests {
             .await
             .expect_err("placement failure should be reported")
             .to_string();
-        let _captured = requests
-            .recv_timeout(Duration::from_secs(2))
-            .expect("requests should be captured");
-        thread.join().expect("fixture thread should finish");
+        let _captured = server.finish();
         assert!(
             message.starts_with("note recoverable-id was created, but folder placement failed:")
         );
         assert!(message.contains("PATCH /v1/notes/recoverable-id"));
-    }
-
-    fn sequence_server<const N: usize>(
-        responses: [(u16, &'static str); N],
-    ) -> (String, mpsc::Receiver<Vec<String>>, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture should bind");
-        let address = listener.local_addr().expect("fixture address should exist");
-        let (sender, receiver) = mpsc::channel();
-        let thread = thread::spawn(move || {
-            let mut requests = Vec::with_capacity(N);
-            for (status, body) in responses {
-                let (mut stream, _) = listener.accept().expect("request should connect");
-                requests.push(read_request(&mut stream));
-                let response = format!(
-                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("response should write");
-            }
-            sender.send(requests).expect("requests should send");
-        });
-        (format!("http://{address}/v1"), receiver, thread)
-    }
-
-    fn read_request(stream: &mut TcpStream) -> String {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("read timeout should set");
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let count = stream.read(&mut buffer).expect("request should read");
-            request.extend_from_slice(&buffer[..count]);
-            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
-                continue;
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())
-                        .flatten()
-                })
-                .unwrap_or(0);
-            if request.len() >= header_end + 4 + length {
-                return String::from_utf8(request).expect("fixture request should be UTF-8");
-            }
-        }
     }
 }

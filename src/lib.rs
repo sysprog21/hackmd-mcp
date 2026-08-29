@@ -4,13 +4,18 @@ mod client;
 mod config;
 mod crud;
 mod dto;
+mod edit_note;
 mod get_note;
 mod list_notes;
 mod models;
 mod note_ref;
+mod patch;
 mod server;
 mod state;
 mod tool_result;
+
+#[cfg(test)]
+mod test_support;
 
 /// The package version exposed by the server binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

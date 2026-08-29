@@ -64,12 +64,7 @@ pub(crate) async fn get_note(
 }
 
 fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> NoteDetail {
-    let patch_path = match &reference.workspace {
-        Workspace::Personal => format!("notes/{}.md", reference.note_id),
-        Workspace::Team { team_path } => {
-            format!("teams/{team_path}/notes/{}.md", reference.note_id)
-        }
-    };
+    let patch_path = patch_path(&reference.workspace, &reference.note_id);
     NoteDetail {
         id: note.id,
         short_id: note.short_id,
@@ -93,6 +88,13 @@ fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> NoteDetail 
         read_permission: note.read_permission,
         write_permission: note.write_permission,
         comment_permission: note.comment_permission,
+    }
+}
+
+pub(crate) fn patch_path(workspace: &Workspace, note_id: &str) -> String {
+    match workspace {
+        Workspace::Personal => format!("notes/{note_id}.md"),
+        Workspace::Team { team_path } => format!("teams/{team_path}/notes/{note_id}.md"),
     }
 }
 

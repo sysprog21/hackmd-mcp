@@ -105,3 +105,13 @@
   Assert the generated `readOnlyHint`, `destructiveHint`, and `idempotentHint`
   for every tool in protocol tests, the way the Rust proxy asserts them in its
   tool-list test.
+- [x] Add `hackmd_edit_note` as the default body-edit tool: GET current body,
+  accept a Codex-style patch envelope with exactly one `*** Update File:` target
+  matching `patch_path`, and apply it only when every hunk context matches
+  exactly one location. Reject ambiguous context, missing context, unsupported
+  add/delete/move operations, malformed hunk lines, and a wrong target with
+  distinct errors, and return a tool error without PATCH. Preserve the body's
+  original trailing-newline state. PATCH only if content changed and report
+  `changed: false` for a no-op. Keep `hackmd_update_note` for metadata and
+  explicit full replacement, and say so in both tool descriptions so agents pick
+  the patch tool by default.

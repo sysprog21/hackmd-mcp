@@ -8,6 +8,7 @@ use crate::client::HackmdClient;
 use crate::config::Config;
 use crate::crud::{CreateNoteInput, DeleteNoteInput, UpdateNoteInput};
 use crate::dto::{ProfileResponse, TeamResponse};
+use crate::edit_note::EditNoteInput;
 use crate::get_note::GetNoteInput;
 use crate::list_notes::ListNotesInput;
 use crate::tool_result;
@@ -216,6 +217,38 @@ impl HackmdServer {
             Err(error) => tool_result::error(error.to_string()),
         }
     }
+
+    #[tool(
+        name = "hackmd_edit_note",
+        description = "Default tool for normal HackMD body edits. Applies one strict Codex patch to the current content only when every hunk context is unique; prefer this over hackmd_update_note for body changes.",
+        annotations(
+            title = "Edit HackMD Note Safely",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn edit_note(
+        &self,
+        Parameters(input): Parameters<EditNoteInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::edit_note::edit_note(&self.client, input).await {
+            Ok(Ok(output)) => {
+                let summary = if output.changed {
+                    format!("Edited HackMD note {}", output.note_id)
+                } else {
+                    format!("HackMD note {} is unchanged", output.note_id)
+                };
+                tool_result::success(summary, serde_json::json!({"result": output}))
+            }
+            Ok(Err(resolution)) => tool_result::success(
+                "The note reference did not resolve uniquely",
+                serde_json::json!({"resolution": resolution}),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
 }
 
 fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
@@ -261,7 +294,7 @@ mod tests {
     fn tools_have_generated_schemas_and_exact_annotations() {
         let tools = HackmdServer::tool_router().list_all();
 
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         let expected = [
             ("hackmd_get_me", true, false, true),
             ("hackmd_list_teams", true, false, true),
@@ -270,6 +303,7 @@ mod tests {
             ("hackmd_create_note", false, false, false),
             ("hackmd_update_note", false, true, true),
             ("hackmd_delete_note", false, true, true),
+            ("hackmd_edit_note", false, false, false),
         ];
         for (name, read_only, destructive, idempotent) in expected {
             let tool = tools
@@ -323,6 +357,7 @@ mod tests {
             "hackmd_create_note",
             "hackmd_update_note",
             "hackmd_delete_note",
+            "hackmd_edit_note",
         ] {
             let tool = tools
                 .iter()
@@ -349,6 +384,11 @@ mod tests {
         for field in ["comment_permission", "suggest_edit_permission"] {
             assert!(update.input_schema["properties"].get(field).is_some());
         }
+        let edit = tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_edit_note")
+            .expect("edit tool should exist");
+        assert_eq!(edit.input_schema["required"], json!(["note_ref", "patch"]));
     }
 
     #[tokio::test]
@@ -391,6 +431,39 @@ mod tests {
                 .text,
             "comment_permission and suggest_edit_permission are create-only; HackMD PATCH does not support changing them"
         );
+    }
+
+    #[tokio::test]
+    async fn edit_conflict_is_a_tool_error_and_never_patches() {
+        let fixture = crate::test_support::SequenceServer::spawn([(
+            200,
+            r#"{"id":"note-id","title":"Title","content":"old"}"#,
+        )]);
+        let client = HackmdClient::new(Config::for_loopback_test(
+            &fixture.api_url,
+            Some("fixture-token"),
+        ))
+        .expect("fixture client should be constructed");
+        let server = HackmdServer::new(Arc::new(client));
+        let input = serde_json::from_value(json!({
+            "note_ref": "note-id",
+            "patch": "*** Begin Patch\n*** Update File: notes/other.md\n@@\n-old\n+new\n*** End Patch"
+        }))
+        .expect("edit input should deserialize");
+        let result = server
+            .edit_note(rmcp::handler::server::wrapper::Parameters(input))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.content[0]
+                .as_text()
+                .expect("error should be text")
+                .text,
+            "patch targets notes/other.md, expected notes/note-id.md"
+        );
+        let requests = fixture.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /v1/notes/note-id HTTP/1.1\r\n"));
     }
 
     #[test]
