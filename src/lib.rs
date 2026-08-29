@@ -2,6 +2,7 @@
 
 mod client;
 mod config;
+mod dto;
 mod models;
 mod server;
 mod state;

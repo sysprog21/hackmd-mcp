@@ -52,3 +52,7 @@
   errors. Include request method/path and status, never the token. Model the
   hint text on `py-hackmd-mcp`'s `_ERROR_HINTS`: name the fix, not just the
   code, and truncate an unrecognized 4xx body to about 300 characters.
+- [x] Use typed request/response DTOs with `serde` rename rules and permission
+  enums. Reject empty PATCH bodies. Build payloads from explicitly supplied
+  fields only, and never default a permission field. Validate the
+  read/write permission ordering before sending.
