@@ -1,4 +1,4 @@
-use std::{fmt, time::Duration};
+use std::{collections::HashMap, fmt, path::Path, time::Duration};
 
 use thiserror::Error;
 use url::Url;
@@ -9,6 +9,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRIES: u8 = 3;
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+const SUPPORTED_ENV_KEYS: [&str; 3] =
+    ["HACKMD_API_TOKEN", "HACKMD_API_URL", "HACKMD_MCP_STATE_DIR"];
 
 /// Application configuration loaded from the local process environment.
 #[derive(Debug)]
@@ -26,7 +28,11 @@ pub(crate) struct Config {
 
 impl Config {
     pub(crate) fn from_env() -> Result<Self, ConfigError> {
-        Self::from_getter(|key| std::env::var(key).ok())
+        let dotenv = std::env::current_dir()
+            .ok()
+            .map(|directory| load_dotenv(&directory.join(".env")))
+            .unwrap_or_default();
+        Self::from_getter(|key| std::env::var(key).ok().or_else(|| dotenv.get(key).cloned()))
     }
 
     fn from_getter(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self, ConfigError> {
@@ -52,6 +58,44 @@ impl Config {
     pub(crate) fn for_tests() -> Self {
         Self::from_getter(|_| None).expect("hard-coded defaults must remain valid")
     }
+}
+
+fn load_dotenv(path: &Path) -> HashMap<String, String> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+
+    contents.lines().filter_map(parse_dotenv_line).collect()
+}
+
+fn parse_dotenv_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+
+    let (key, raw_value) = line.split_once('=')?;
+    let key = key.trim();
+    if !SUPPORTED_ENV_KEYS.contains(&key) {
+        return None;
+    }
+
+    parse_dotenv_value(raw_value).map(|value| (key.to_owned(), value))
+}
+
+fn parse_dotenv_value(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if let Some(quoted) = value.strip_prefix('"') {
+        return quoted.strip_suffix('"').map(str::to_owned);
+    }
+    if let Some(quoted) = value.strip_prefix('\'') {
+        return quoted.strip_suffix('\'').map(str::to_owned);
+    }
+
+    let value = value
+        .split_once(" #")
+        .map_or(value, |(before_comment, _)| before_comment);
+    Some(value.trim_end().to_owned())
 }
 
 /// Retry limits used by operations that are safe to retry.
@@ -88,9 +132,9 @@ pub(crate) enum ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, time::Duration};
+    use std::{collections::HashMap, fs, time::Duration};
 
-    use super::{Config, DEFAULT_API_URL};
+    use super::{Config, DEFAULT_API_URL, load_dotenv, parse_dotenv_line};
 
     fn config_from(entries: &[(&str, &str)]) -> Result<Config, super::ConfigError> {
         let values: HashMap<&str, &str> = entries.iter().copied().collect();
@@ -148,5 +192,59 @@ mod tests {
 
         assert_eq!(error.to_string(), "HACKMD_API_URL must be a valid URL");
         assert!(!error.to_string().contains(invalid));
+    }
+
+    #[test]
+    fn dotenv_parser_accepts_common_forms_and_only_supported_keys() {
+        assert_eq!(
+            parse_dotenv_line("HACKMD_API_URL=https://example.test/v1 # local endpoint"),
+            Some((
+                "HACKMD_API_URL".to_owned(),
+                "https://example.test/v1".to_owned()
+            ))
+        );
+        assert_eq!(
+            parse_dotenv_line("export HACKMD_API_TOKEN='quoted token'"),
+            Some(("HACKMD_API_TOKEN".to_owned(), "quoted token".to_owned()))
+        );
+        assert_eq!(parse_dotenv_line("UNRELATED_SECRET=ignore-me"), None);
+        assert_eq!(parse_dotenv_line("# HACKMD_API_TOKEN=commented"), None);
+        assert_eq!(parse_dotenv_line("malformed"), None);
+    }
+
+    #[test]
+    fn dotenv_file_is_a_fallback_to_inherited_values() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join(".env");
+        fs::write(
+            &path,
+            "HACKMD_API_TOKEN=dotenv-token\nHACKMD_API_URL=https://dotenv.example/v1\n",
+        )
+        .expect("dotenv fixture should be written");
+        let dotenv = load_dotenv(&path);
+        let inherited = HashMap::from([(
+            "HACKMD_API_URL".to_owned(),
+            "https://inherited.example/v1".to_owned(),
+        )]);
+        let config = Config::from_getter(|key| {
+            inherited
+                .get(key)
+                .cloned()
+                .or_else(|| dotenv.get(key).cloned())
+        })
+        .expect("merged configuration should be valid");
+
+        assert!(config.has_api_token());
+        assert_eq!(config.api_url.as_str(), "https://inherited.example/v1");
+    }
+
+    #[test]
+    fn missing_or_non_utf8_dotenv_is_quietly_ignored() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        assert!(load_dotenv(&directory.path().join("missing.env")).is_empty());
+
+        let path = directory.path().join("non-utf8.env");
+        fs::write(&path, [0xff, 0xfe]).expect("dotenv fixture should be written");
+        assert!(load_dotenv(&path).is_empty());
     }
 }

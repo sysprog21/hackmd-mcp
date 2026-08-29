@@ -180,10 +180,6 @@ test (see P3) for each and record the answer here.
 
 ## P0 — RMCP 3.x foundation
 
-- [ ] Load a working-directory `.env` only as a quiet local convenience: never
-  print dotenv diagnostics to stdout, let inherited environment variables take
-  precedence, and read only the keys this server defines, the way
-  `hackmd-mcp-server` allowlists its `SUPPORTED_ENV_KEYS`.
 - [ ] Add a local-only `HACKMD_MCP_STATE_DIR`, defaulting to the platform state
   directory plus `hackmd-mcp` via `directories`. Store one JSON sidecar and a
   private baseline file per tracked note: internal ID, workspace, local path,

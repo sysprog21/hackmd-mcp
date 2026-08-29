@@ -32,3 +32,7 @@
   retries; 500 ms initial, 5-second maximum backoff). Defer token validation
   until a tool call so MCP startup stays usable and reports a helpful
   missing-token error; warn once on stderr at startup when the token is absent.
+- [x] Load a working-directory `.env` only as a quiet local convenience: never
+  print dotenv diagnostics to stdout, let inherited environment variables take
+  precedence, and read only the keys this server defines, the way
+  `hackmd-mcp-server` allowlists its `SUPPORTED_ENV_KEYS`.
