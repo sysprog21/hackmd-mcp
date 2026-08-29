@@ -193,9 +193,6 @@ test (see P3) for each and record the answer here.
 
 ## P2.5 — local Markdown sync
 
-- [ ] Require `confirm_large_file: true` before pulling or pushing bodies over
-  5 MB; refuse bodies over 50 MB. These are the thresholds the official
-  `push-to-hackmd` skill already uses, still pending a verified HackMD limit.
 - [ ] Test clean pull, safe push, unchanged local/remote, remote-only update,
   concurrent local+remote edit, overwrite confirmation, `202` read-back,
   atomic state persistence, snapshot overwrite refusal, team-slug resolution,

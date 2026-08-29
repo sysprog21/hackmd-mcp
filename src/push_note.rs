@@ -135,17 +135,18 @@ fn validate_and_read_local(input: &PushNoteInput) -> Result<String, PushNoteErro
         return Err(PushNoteError::InvalidLocalFile);
     }
     let local = fs::read_to_string(&input.local_path).map_err(PushNoteError::LocalIo)?;
-    if local.len() > MAX_BYTES {
-        return Err(PushNoteError::TooLarge {
-            size_bytes: local.len(),
-        });
-    }
-    if local.len() > WARNING_BYTES && !input.confirm_large_file {
-        return Err(PushNoteError::LargeFileConfirmationRequired {
-            size_bytes: local.len(),
-        });
-    }
+    validate_body_size(local.len(), input.confirm_large_file)?;
     Ok(local)
+}
+
+fn validate_body_size(size_bytes: usize, confirmed: bool) -> Result<(), PushNoteError> {
+    if size_bytes > MAX_BYTES {
+        return Err(PushNoteError::TooLarge { size_bytes });
+    }
+    if size_bytes > WARNING_BYTES && !confirmed {
+        return Err(PushNoteError::LargeFileConfirmationRequired { size_bytes });
+    }
+    Ok(())
 }
 
 async fn push_resolved(
@@ -323,7 +324,10 @@ fn persist_advanced_state(
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{PushNoteError, PushNoteInput, PushStatus, PushStrategy, conflict_diff, push_note};
+    use super::{
+        MAX_BYTES, PushNoteError, PushNoteInput, PushStatus, PushStrategy, WARNING_BYTES,
+        conflict_diff, push_note, validate_body_size,
+    };
     use crate::{
         client::HackmdClient,
         config::Config,
@@ -515,5 +519,20 @@ mod tests {
         let requests = fixture.finish();
         assert!(requests[1].starts_with("PATCH /v1/notes/note-id HTTP/1.1\r\n"));
         assert!(requests[2].starts_with("GET /v1/notes/note-id HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn push_body_limits_have_exact_boundaries() {
+        assert!(validate_body_size(WARNING_BYTES, false).is_ok());
+        assert!(matches!(
+            validate_body_size(WARNING_BYTES + 1, false),
+            Err(PushNoteError::LargeFileConfirmationRequired { .. })
+        ));
+        assert!(validate_body_size(WARNING_BYTES + 1, true).is_ok());
+        assert!(validate_body_size(MAX_BYTES, true).is_ok());
+        assert!(matches!(
+            validate_body_size(MAX_BYTES + 1, true),
+            Err(PushNoteError::TooLarge { .. })
+        ));
     }
 }

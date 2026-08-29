@@ -91,12 +91,7 @@ pub(crate) async fn pull_note(
             note_id: note.note_id.clone(),
         })?;
     let size_bytes = body.len();
-    if size_bytes > MAX_BYTES {
-        return Err(PullNoteError::TooLarge { size_bytes });
-    }
-    if size_bytes > WARNING_BYTES && !input.confirm_large_file {
-        return Err(PullNoteError::ConfirmationRequired { size_bytes });
-    }
+    validate_body_size(size_bytes, input.confirm_large_file)?;
     let destination = prepare_destination(
         &destination,
         input.create_parent_dirs,
@@ -122,6 +117,16 @@ pub(crate) async fn pull_note(
         local_path: destination,
         bytes: size_bytes,
     }))
+}
+
+fn validate_body_size(size_bytes: usize, confirmed: bool) -> Result<(), PullNoteError> {
+    if size_bytes > MAX_BYTES {
+        return Err(PullNoteError::TooLarge { size_bytes });
+    }
+    if size_bytes > WARNING_BYTES && !confirmed {
+        return Err(PullNoteError::ConfirmationRequired { size_bytes });
+    }
+    Ok(())
 }
 
 fn validate_destination(input: &PullNoteInput) -> Result<PathBuf, PullNoteError> {
@@ -198,7 +203,9 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{PullNoteError, PullNoteInput, pull_note};
+    use super::{
+        MAX_BYTES, PullNoteError, PullNoteInput, WARNING_BYTES, pull_note, validate_body_size,
+    };
     use crate::{client::HackmdClient, config::Config, models::Workspace};
 
     #[tokio::test]
@@ -347,5 +354,20 @@ mod tests {
                 .expect("parent should exist lexically")
                 .exists()
         );
+    }
+
+    #[test]
+    fn pull_body_limits_have_exact_boundaries() {
+        assert!(validate_body_size(WARNING_BYTES, false).is_ok());
+        assert!(matches!(
+            validate_body_size(WARNING_BYTES + 1, false),
+            Err(PullNoteError::ConfirmationRequired { .. })
+        ));
+        assert!(validate_body_size(WARNING_BYTES + 1, true).is_ok());
+        assert!(validate_body_size(MAX_BYTES, true).is_ok());
+        assert!(matches!(
+            validate_body_size(MAX_BYTES + 1, true),
+            Err(PullNoteError::TooLarge { .. })
+        ));
     }
 }

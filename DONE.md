@@ -187,3 +187,6 @@
   baseline→remote unified diffs, absolute local/baseline paths,
   `merge_required: true`, snapshot instructions, and the existing absolute
   `*.remote.md` path when present. Never silently reapply an agent edit.
+- [x] Require `confirm_large_file: true` before pulling or pushing bodies over
+  5 MiB and refuse bodies over 50 MiB, with exact boundary tests matching the
+  external `push-to-hackmd` policy pending a verified HackMD limit.
