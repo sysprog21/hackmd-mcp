@@ -1,5 +1,11 @@
-use std::{collections::HashMap, fmt, path::Path, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
+use directories::BaseDirs;
 use thiserror::Error;
 use url::Url;
 
@@ -24,6 +30,7 @@ pub(crate) struct Config {
     connect_timeout: Duration,
     #[allow(dead_code, reason = "consumed by the following HTTP client task")]
     retry: RetryConfig,
+    state_dir: PathBuf,
 }
 
 impl Config {
@@ -40,6 +47,9 @@ impl Config {
             .filter(|token| !token.trim().is_empty())
             .map(SecretToken);
         let api_url = get("HACKMD_API_URL").unwrap_or_else(|| DEFAULT_API_URL.to_owned());
+        let state_dir = get("HACKMD_MCP_STATE_DIR")
+            .filter(|path| !path.trim().is_empty())
+            .map_or_else(default_state_dir, |path| Ok(PathBuf::from(path)))?;
 
         Ok(Self {
             api_token,
@@ -47,6 +57,7 @@ impl Config {
             request_timeout: REQUEST_TIMEOUT,
             connect_timeout: CONNECT_TIMEOUT,
             retry: RetryConfig::default(),
+            state_dir,
         })
     }
 
@@ -54,10 +65,21 @@ impl Config {
         self.api_token.is_some()
     }
 
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
         Self::from_getter(|_| None).expect("hard-coded defaults must remain valid")
     }
+}
+
+fn default_state_dir() -> Result<PathBuf, ConfigError> {
+    BaseDirs::new()
+        .and_then(|directories| directories.state_dir().map(Path::to_path_buf))
+        .map(|state_dir| state_dir.join("hackmd-mcp"))
+        .ok_or(ConfigError::StateDirectoryUnavailable)
 }
 
 fn load_dotenv(path: &Path) -> HashMap<String, String> {
@@ -128,6 +150,8 @@ impl fmt::Debug for SecretToken {
 pub(crate) enum ConfigError {
     #[error("HACKMD_API_URL must be a valid URL")]
     InvalidApiUrl(#[source] url::ParseError),
+    #[error("platform state directory is unavailable; set HACKMD_MCP_STATE_DIR")]
+    StateDirectoryUnavailable,
 }
 
 #[cfg(test)]
@@ -152,6 +176,7 @@ mod tests {
         assert_eq!(config.retry.max_retries, 3);
         assert_eq!(config.retry.initial_backoff, Duration::from_millis(500));
         assert_eq!(config.retry.max_backoff, Duration::from_secs(5));
+        assert!(config.state_dir.ends_with("hackmd-mcp"));
     }
 
     #[test]
@@ -159,11 +184,16 @@ mod tests {
         let config = config_from(&[
             ("HACKMD_API_TOKEN", "test-secret"),
             ("HACKMD_API_URL", "https://example.test/custom"),
+            ("HACKMD_MCP_STATE_DIR", "/tmp/hackmd-mcp-test-state"),
         ])
         .expect("overrides should be valid");
 
         assert!(config.has_api_token());
         assert_eq!(config.api_url.as_str(), "https://example.test/custom");
+        assert_eq!(
+            config.state_dir,
+            std::path::Path::new("/tmp/hackmd-mcp-test-state")
+        );
     }
 
     #[test]
@@ -172,6 +202,14 @@ mod tests {
             .expect("an empty token should not prevent startup");
 
         assert!(!config.has_api_token());
+    }
+
+    #[test]
+    fn empty_state_directory_override_uses_the_platform_default() {
+        let config = config_from(&[("HACKMD_MCP_STATE_DIR", "  ")])
+            .expect("an empty state override should use the safe default");
+
+        assert!(config.state_dir.ends_with("hackmd-mcp"));
     }
 
     #[test]

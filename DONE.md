@@ -36,3 +36,8 @@
   print dotenv diagnostics to stdout, let inherited environment variables take
   precedence, and read only the keys this server defines, the way
   `hackmd-mcp-server` allowlists its `SUPPORTED_ENV_KEYS`.
+- [x] Add a local-only `HACKMD_MCP_STATE_DIR`, defaulting to the platform state
+  directory plus `hackmd-mcp` via `directories`. Store one JSON sidecar and a
+  private baseline file per tracked note: internal ID, workspace, local path,
+  baseline body hash, last observed remote timestamp, and local file identity.
+  Create state only through pull/push; never store API tokens.

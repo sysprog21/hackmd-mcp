@@ -6,11 +6,16 @@ use std::{
     time::Duration,
 };
 
-fn spawn_server(token: Option<&str>, current_dir: Option<&Path>) -> Child {
+fn spawn_server(
+    token: Option<&str>,
+    current_dir: Option<&Path>,
+    state_dir: Option<&Path>,
+) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hackmd-mcp"));
     command
         .env_remove("HACKMD_API_TOKEN")
         .env_remove("HACKMD_API_URL")
+        .env_remove("HACKMD_MCP_STATE_DIR")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -19,6 +24,9 @@ fn spawn_server(token: Option<&str>, current_dir: Option<&Path>) -> Child {
     }
     if let Some(current_dir) = current_dir {
         command.current_dir(current_dir);
+    }
+    if let Some(state_dir) = state_dir {
+        command.env("HACKMD_MCP_STATE_DIR", state_dir);
     }
     command.spawn().expect("server binary should start")
 }
@@ -42,7 +50,7 @@ fn assert_waiting_then_stop(mut child: Child) -> Output {
 
 #[test]
 fn server_waits_for_input_without_writing_transport_noise() {
-    let output = assert_waiting_then_stop(spawn_server(None, None));
+    let output = assert_waiting_then_stop(spawn_server(None, None, None));
     assert!(output.stdout.is_empty(), "stdout is reserved for MCP");
     let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
     assert!(stderr.contains("HACKMD_API_TOKEN is not set"));
@@ -52,7 +60,7 @@ fn server_waits_for_input_without_writing_transport_noise() {
 fn token_is_not_validated_or_logged_during_startup() {
     const SENTINEL_TOKEN: &str = "startup-only-secret-sentinel";
 
-    let output = assert_waiting_then_stop(spawn_server(Some(SENTINEL_TOKEN), None));
+    let output = assert_waiting_then_stop(spawn_server(Some(SENTINEL_TOKEN), None, None));
     assert!(output.stdout.is_empty(), "stdout is reserved for MCP");
     let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
     assert!(!stderr.contains(SENTINEL_TOKEN));
@@ -69,9 +77,19 @@ fn token_loads_from_the_working_directory_dotenv_without_leaking() {
     )
     .expect("dotenv fixture should be written");
 
-    let output = assert_waiting_then_stop(spawn_server(None, Some(directory.path())));
+    let output = assert_waiting_then_stop(spawn_server(None, Some(directory.path()), None));
     assert!(output.stdout.is_empty(), "stdout is reserved for MCP");
     let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
     assert!(!stderr.contains(DOTENV_TOKEN));
     assert!(!stderr.contains("HACKMD_API_TOKEN is not set"));
+}
+
+#[test]
+fn startup_does_not_create_the_configured_state_directory() {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let state_dir = directory.path().join("state-must-not-exist");
+
+    let _output = assert_waiting_then_stop(spawn_server(None, None, Some(&state_dir)));
+
+    assert!(!state_dir.exists());
 }

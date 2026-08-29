@@ -180,11 +180,6 @@ test (see P3) for each and record the answer here.
 
 ## P0 — RMCP 3.x foundation
 
-- [ ] Add a local-only `HACKMD_MCP_STATE_DIR`, defaulting to the platform state
-  directory plus `hackmd-mcp` via `directories`. Store one JSON sidecar and a
-  private baseline file per tracked note: internal ID, workspace, local path,
-  baseline body hash, last observed remote timestamp, and local file identity.
-  Create state only through pull/push; never store API tokens.
 - [ ] Reject non-HTTPS `HACKMD_API_URL` overrides in normal operation. Permit
   loopback HTTP only through a test-only config constructor; defer
   request-supplied URL allowlisting to the remote-HTTP task. `hackmd-mcp` added
