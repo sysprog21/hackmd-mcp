@@ -1,10 +1,14 @@
 use std::{
+    fmt::Write as _,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::mpsc::{self, Receiver},
     thread::{self, JoinHandle},
     time::Duration,
 };
+
+type FixtureHeaders = &'static [(&'static str, &'static str)];
+type FixtureResponse = (u16, &'static str, FixtureHeaders);
 
 pub(crate) struct SequenceServer {
     pub(crate) api_url: String,
@@ -14,16 +18,29 @@ pub(crate) struct SequenceServer {
 
 impl SequenceServer {
     pub(crate) fn spawn<const N: usize>(responses: [(u16, &'static str); N]) -> Self {
+        const EMPTY_HEADERS: &[(&str, &str)] = &[];
+        Self::spawn_with_headers(responses.map(|(status, body)| (status, body, EMPTY_HEADERS)))
+    }
+
+    pub(crate) fn spawn_with_headers<const N: usize>(responses: [FixtureResponse; N]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("fixture should bind");
         let address = listener.local_addr().expect("fixture address should exist");
         let (sender, requests) = mpsc::channel();
         let thread = thread::spawn(move || {
             let mut captured = Vec::with_capacity(N);
-            for (status, body) in responses {
+            for (status, body, headers) in responses {
                 let (mut stream, _) = listener.accept().expect("request should connect");
                 captured.push(read_request(&mut stream));
+                let extra_headers =
+                    headers
+                        .iter()
+                        .fold(String::new(), |mut output, (name, value)| {
+                            write!(output, "{name}: {value}\r\n")
+                                .expect("writing headers to String cannot fail");
+                            output
+                        });
                 let response = format!(
-                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream

@@ -196,11 +196,6 @@ test (see P3) for each and record the answer here.
 
 ## P3 — efficiency and reliability
 
-- [ ] Reuse one `reqwest::Client`; apply the 30-second request timeout and a
-  short connect timeout; retry only safe GETs plus explicitly idempotent
-  PATCHes on transient network/5xx/429 errors, at most three times with
-  500 ms–5 s exponential backoff and full jitter. Honor `Retry-After`; never
-  retry create/delete automatically.
 - [ ] When a request is retried, include bounded structured retry metadata in
   the successful or final-error tool result (`attempts`, total waited seconds,
   and whether `429` occurred). Do not emit progress noise for an unretried

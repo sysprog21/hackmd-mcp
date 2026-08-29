@@ -97,6 +97,10 @@ impl Config {
         &self.state_dir
     }
 
+    pub(crate) const fn retry(&self) -> RetryConfig {
+        self.retry
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
         Self::from_getter(|_| None).expect("hard-coded defaults must remain valid")
@@ -138,7 +142,32 @@ impl Config {
     ) -> Self {
         let mut config = Self::for_loopback_test(api_url, Some(token));
         config.request_timeout = request_timeout;
+        config.retry.max_retries = 0;
         config
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_loopback_test_with_retry(
+        api_url: &str,
+        token: &str,
+        retry: RetryConfig,
+    ) -> Self {
+        let mut config = Self::for_loopback_test(api_url, Some(token));
+        config.retry = retry;
+        config
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_loopback_test_no_retry(api_url: &str, token: &str) -> Self {
+        Self::for_loopback_test_with_retry(
+            api_url,
+            token,
+            RetryConfig {
+                max_retries: 0,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+            },
+        )
     }
 }
 

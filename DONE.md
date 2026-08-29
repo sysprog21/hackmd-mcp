@@ -195,3 +195,11 @@
   confirmation, `202` readback, atomic state, snapshot refusal, team and
   personal scoped URL resolution, ambiguous titles, root folders, size guards,
   and path validation.
+
+## P3 — efficiency and reliability
+
+- [x] Reuse one `reqwest::Client` with distinct 30-second request and 10-second
+  connect timeouts. Retry only GETs and explicitly idempotent PATCHes after
+  transient network/5xx/429 failures, at most three retries with capped
+  500 ms–5 s exponential full jitter and `Retry-After`; never retry
+  create/delete automatically.

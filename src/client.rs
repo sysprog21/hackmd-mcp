@@ -2,7 +2,10 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::{
+    path::Path,
+    time::{Duration, SystemTime},
+};
 use thiserror::Error;
 use url::Url;
 
@@ -167,7 +170,7 @@ impl HackmdClient {
             Workspace::Team { team_path } => vec!["teams", team_path, "notes", note_id],
         };
         let body = serde_json::to_value(payload).map_err(|_| HackmdError::InvalidPayload)?;
-        self.request_json(Method::PATCH, &segments, Some(&body))
+        self.request_json_idempotent(Method::PATCH, &segments, Some(&body))
             .await
     }
 
@@ -248,7 +251,7 @@ impl HackmdClient {
             Workspace::Team { team_path } => vec!["teams", team_path, "folders", folder_id],
         };
         let body = serde_json::to_value(payload).map_err(|_| HackmdError::InvalidPayload)?;
-        self.request_json(Method::PATCH, &segments, Some(&body))
+        self.request_json_idempotent(Method::PATCH, &segments, Some(&body))
             .await
     }
 
@@ -356,6 +359,28 @@ impl HackmdClient {
         path_segments: &[&str],
         body: Option<&Value>,
     ) -> Result<Option<T>, HackmdError> {
+        let retryable = method == Method::GET;
+        self.request_json_with_retry(method, path_segments, body, retryable)
+            .await
+    }
+
+    async fn request_json_idempotent<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path_segments: &[&str],
+        body: Option<&Value>,
+    ) -> Result<Option<T>, HackmdError> {
+        self.request_json_with_retry(method, path_segments, body, true)
+            .await
+    }
+
+    async fn request_json_with_retry<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path_segments: &[&str],
+        body: Option<&Value>,
+        retryable: bool,
+    ) -> Result<Option<T>, HackmdError> {
         let url = self.url_for_segments(path_segments)?;
         let path = url.path().to_owned();
         let method_text = method.as_str().to_owned();
@@ -366,20 +391,50 @@ impl HackmdClient {
                 method: method_text.clone(),
                 path: path.clone(),
             })?;
-        let mut request = self.http.request(method, url).bearer_auth(token);
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|error| request_error(&error, method_text.clone(), path.clone()))?;
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| request_error(&error, method_text.clone(), path.clone()))?;
+        let retry = self.config.retry();
+        let mut retries = 0_u8;
+        let (status, bytes) = loop {
+            let mut request = self
+                .http
+                .request(method.clone(), url.clone())
+                .bearer_auth(token);
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(_) if retryable && retries < retry.max_retries => {
+                    sleep_before_retry(retries, None, retry).await;
+                    retries += 1;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(request_error(&error, method_text.clone(), path.clone()));
+                }
+            };
+            let status = response.status();
+            let retry_after = retry_after(response.headers());
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(_) if retryable && retries < retry.max_retries => {
+                    sleep_before_retry(retries, None, retry).await;
+                    retries += 1;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(request_error(&error, method_text.clone(), path.clone()));
+                }
+            };
+            if retryable
+                && retries < retry.max_retries
+                && (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+            {
+                sleep_before_retry(retries, retry_after, retry).await;
+                retries += 1;
+                continue;
+            }
+            break (status, bytes);
+        };
 
         if !status.is_success() {
             return Err(map_status_error(status, method_text, path, &bytes, token));
@@ -407,6 +462,34 @@ impl HackmdClient {
         drop(segments);
         Ok(url)
     }
+}
+
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let target = httpdate::parse_http_date(value).ok()?;
+    target.duration_since(SystemTime::now()).ok()
+}
+
+async fn sleep_before_retry(
+    retry_index: u8,
+    retry_after: Option<Duration>,
+    config: crate::config::RetryConfig,
+) {
+    let exponential = config
+        .initial_backoff
+        .saturating_mul(2_u32.saturating_pow(u32::from(retry_index)))
+        .min(config.max_backoff);
+    let delay = retry_after.map_or_else(
+        || {
+            let max_nanos = u64::try_from(exponential.as_nanos()).unwrap_or(u64::MAX);
+            Duration::from_nanos(fastrand::u64(0..=max_nanos))
+        },
+        |duration| duration.min(config.max_backoff),
+    );
+    tokio::time::sleep(delay).await;
 }
 
 fn request_error(error: &reqwest::Error, method: String, path: String) -> HackmdError {
@@ -635,6 +718,11 @@ mod tests {
             .expect("fixture client should build")
     }
 
+    fn fixture_client_no_retry(server: &FixtureServer, token: &str) -> HackmdClient {
+        HackmdClient::new(Config::for_loopback_test_no_retry(&server.api_url, token))
+            .expect("fixture client should build")
+    }
+
     #[tokio::test]
     async fn encodes_each_path_segment_and_attaches_bearer_auth() {
         const TOKEN: &str = "fixture-bearer-token";
@@ -701,7 +789,7 @@ mod tests {
     async fn accepts_empty_202_and_204_responses() {
         for status in [202, 204] {
             let server = FixtureServer::spawn(status, "");
-            let client = fixture_client(&server, "fixture-token");
+            let client = fixture_client_no_retry(&server, "fixture-token");
             let response = client
                 .request_json::<Value>(Method::PATCH, &["notes", "id"], None)
                 .await
@@ -782,7 +870,7 @@ mod tests {
         ];
         for (status, expected) in cases {
             let server = FixtureServer::spawn(status, r#"{"error":"fixture"}"#);
-            let client = fixture_client(&server, "fixture-token");
+            let client = fixture_client_no_retry(&server, "fixture-token");
             let error = client
                 .request_json::<Value>(Method::GET, &["notes", "id"], None)
                 .await
@@ -838,9 +926,9 @@ mod tests {
             .local_addr()
             .expect("temporary address should be available");
         drop(listener);
-        let network_client = HackmdClient::new(Config::for_loopback_test(
+        let network_client = HackmdClient::new(Config::for_loopback_test_no_retry(
             &format!("http://{address}/v1"),
-            Some("fixture-token"),
+            "fixture-token",
         ))
         .expect("network fixture client should build");
         assert!(matches!(
@@ -912,6 +1000,70 @@ mod tests {
                 .finish()
                 .starts_with("GET /v1/teams HTTP/1.1\r\n")
         );
+    }
+
+    #[tokio::test]
+    async fn retries_only_gets_and_explicitly_idempotent_patches() {
+        const RETRY_AFTER: &[(&str, &str)] = &[("Retry-After", "0")];
+        let get_server = crate::test_support::SequenceServer::spawn_with_headers([
+            (500, r#"{"error":"transient"}"#, &[]),
+            (429, r#"{"error":"rate"}"#, RETRY_AFTER),
+            (200, r#"{"ok":true}"#, &[]),
+        ]);
+        let retry = crate::config::RetryConfig {
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+        };
+        let get_client = HackmdClient::new(Config::for_loopback_test_with_retry(
+            &get_server.api_url,
+            "fixture-token",
+            retry,
+        ))
+        .expect("retry client should build");
+        let response = get_client
+            .request_json::<Value>(Method::GET, &["retry"], None)
+            .await
+            .expect("GET should recover")
+            .expect("GET should return JSON");
+        assert_eq!(response, json!({"ok": true}));
+        assert_eq!(get_server.finish().len(), 3);
+
+        let patch_server = crate::test_support::SequenceServer::spawn([
+            (500, r#"{"error":"transient"}"#),
+            (202, ""),
+        ]);
+        let patch_client = HackmdClient::new(Config::for_loopback_test_with_retry(
+            &patch_server.api_url,
+            "fixture-token",
+            retry,
+        ))
+        .expect("retry client should build");
+        patch_client
+            .request_json_idempotent::<Value>(
+                Method::PATCH,
+                &["notes", "id"],
+                Some(&json!({"title": "same replacement"})),
+            )
+            .await
+            .expect("idempotent PATCH should recover");
+        assert_eq!(patch_server.finish().len(), 2);
+
+        let post_server =
+            crate::test_support::SequenceServer::spawn([(500, r#"{"error":"do not retry"}"#)]);
+        let post_client = HackmdClient::new(Config::for_loopback_test_with_retry(
+            &post_server.api_url,
+            "fixture-token",
+            retry,
+        ))
+        .expect("retry client should build");
+        assert!(matches!(
+            post_client
+                .request_json::<Value>(Method::POST, &["notes"], Some(&json!({})))
+                .await,
+            Err(HackmdError::Upstream { .. })
+        ));
+        assert_eq!(post_server.finish().len(), 1);
     }
 
     #[test]
