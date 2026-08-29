@@ -190,10 +190,6 @@ test (see P3) for each and record the answer here.
   pagination as note lists. Mark restore non-destructive/idempotent; keep delete
   destructive. Describe delete according to whichever behavior the live test in
   "Contradictions" confirms. Mock both routes and their empty/accepted responses.
-- [ ] Add tests for all known quirks: `202` updates, POST folder assignment,
-  folder-path normalization, order-map merge preserving unrelated keys,
-  move-cycle rejection, root-folder creation omitting `parentFolderId`, and
-  folder names containing `/`.
 
 ## P2.5 — local Markdown sync
 

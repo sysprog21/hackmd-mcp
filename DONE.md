@@ -151,3 +151,6 @@
   absolute `image_path`; stream multipart field `image`, require confirmation
   above 5 MiB, refuse above 10 MiB, map 413 to a resize hint, and return only
   `data.link`. Reject team uploads until a live test proves a supported route.
+- [x] Add fixture tests for known quirks: `202` readbacks, POST-then-PATCH folder
+  assignment, folder-path normalization, order-map merge preservation, move
+  cycle rejection, root-folder create omission, and folder IDs containing `/`.
