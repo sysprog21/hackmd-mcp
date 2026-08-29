@@ -1,6 +1,7 @@
 //! A local-first MCP server for the `HackMD` API.
 
 mod client;
+mod models;
 mod server;
 
 /// The package version exposed by the server binary.

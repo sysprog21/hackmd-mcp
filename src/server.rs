@@ -5,6 +5,7 @@ use rmcp::{handler::server::wrapper::Parameters, schemars, tool};
 use serde::Deserialize;
 
 use crate::client::HackmdClient;
+use crate::models::Workspace;
 
 /// MCP server whose handlers share one configured `HackMD` client.
 #[derive(Debug, Clone)]
@@ -31,23 +32,33 @@ impl HackmdServer {
     )]
     fn schema_probe(
         &self,
-        Parameters(SchemaProbeInput { note_ref }): Parameters<SchemaProbeInput>,
+        Parameters(SchemaProbeInput {
+            workspace,
+            note_ref,
+        }): Parameters<SchemaProbeInput>,
     ) -> String {
-        format!("{note_ref}:{}", Arc::strong_count(&self.client))
+        format!(
+            "{workspace:?}:{note_ref}:{}",
+            Arc::strong_count(&self.client)
+        )
     }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[allow(dead_code, reason = "constructed by RMCP's generated schema decoder")]
 struct SchemaProbeInput {
+    /// Personal account or team workspace; defaults to personal.
+    #[serde(default)]
+    workspace: Workspace,
     /// Internal note ID or `HackMD` note URL.
     note_ref: String,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::HackmdServer;
+    use super::{HackmdServer, SchemaProbeInput};
     use crate::client::HackmdClient;
+    use crate::models::Workspace;
     use rmcp::ServerHandler;
     use std::sync::Arc;
 
@@ -71,7 +82,24 @@ mod tests {
             tools[0].input_schema["properties"]["note_ref"]["description"],
             "Internal note ID or `HackMD` note URL."
         );
-        assert_eq!(tools[0].input_schema["required"][0], "note_ref");
+        assert_eq!(
+            tools[0].input_schema["required"],
+            serde_json::json!(["note_ref"])
+        );
+        assert_eq!(
+            tools[0].input_schema["properties"]["workspace"]["default"]["kind"],
+            "personal"
+        );
+    }
+
+    #[test]
+    fn typed_input_defaults_an_omitted_workspace_to_personal() {
+        let input: SchemaProbeInput = serde_json::from_value(serde_json::json!({
+            "note_ref": "internal-id"
+        }))
+        .expect("workspace should be optional");
+
+        assert_eq!(input.workspace, Workspace::Personal);
     }
 
     #[test]

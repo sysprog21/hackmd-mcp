@@ -180,10 +180,6 @@ test (see P3) for each and record the answer here.
 
 ## P0 — RMCP 3.x foundation
 
-- [ ] Model `workspace` as an internally tagged enum
-  (`{"kind":"personal"}` / `{"kind":"team","team_path":"x"}`) defaulting to
-  personal, as the Rust proxy does. It keeps one tool family for both
-  workspaces and makes the route choice a single match.
 - [ ] Run the local server with `HackmdServer::serve(rmcp::transport::stdio())`
   then `waiting().await`; reserve stdout for the transport and write logs only
   to stderr.
