@@ -10,6 +10,7 @@ use crate::crud::{CreateNoteInput, DeleteNoteInput, UpdateNoteInput};
 use crate::dto::{ProfileResponse, TeamResponse};
 use crate::edit_note::EditNoteInput;
 use crate::get_note::GetNoteInput;
+use crate::history::HistoryInput;
 use crate::list_notes::ListNotesInput;
 use crate::tool_result;
 
@@ -249,6 +250,33 @@ impl HackmdServer {
             Err(error) => tool_result::error(error.to_string()),
         }
     }
+
+    #[tool(
+        name = "hackmd_get_history",
+        description = "Get recently viewed HackMD notes in API history order with slim metadata and client-side pagination.",
+        annotations(
+            title = "Get HackMD Browse History",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn get_history(
+        &self,
+        Parameters(input): Parameters<HistoryInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::history::get_history(&self.client, input).await {
+            Ok(output) => tool_result::success(
+                format!(
+                    "Found {} HackMD history item(s); returned {}",
+                    output.total, output.count
+                ),
+                serde_json::to_value(output).expect("history output should serialize"),
+            ),
+            Err(error) => tool_result::error(error.to_string()),
+        }
+    }
 }
 
 fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
@@ -278,7 +306,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 8] = [
+    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 9] = [
         ("hackmd_get_me", true, false, true),
         ("hackmd_list_teams", true, false, true),
         ("hackmd_list_notes", true, false, true),
@@ -287,6 +315,7 @@ mod tests {
         ("hackmd_update_note", false, true, true),
         ("hackmd_delete_note", false, true, true),
         ("hackmd_edit_note", false, false, false),
+        ("hackmd_get_history", true, false, true),
     ];
 
     async fn protocol_client(
@@ -343,7 +372,7 @@ mod tests {
     fn tools_have_generated_schemas_and_exact_annotations() {
         let tools = HackmdServer::tool_router().list_all();
 
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = tools
                 .iter()
@@ -568,7 +597,7 @@ mod tests {
             .list_tools(None)
             .await
             .expect("tools/list should succeed");
-        assert_eq!(listed.tools.len(), 8);
+        assert_eq!(listed.tools.len(), 9);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = listed
                 .tools
@@ -608,6 +637,13 @@ mod tests {
                 .get("comment_permission")
                 .is_some()
         );
+        let history = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_get_history")
+            .expect("history tool should be listed");
+        assert_eq!(history.input_schema["properties"]["limit"]["default"], 20);
+        assert_eq!(history.input_schema["properties"]["limit"]["maximum"], 100);
         stop_protocol(client, server_task).await;
     }
 

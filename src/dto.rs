@@ -184,6 +184,8 @@ pub(crate) struct NoteResponse {
     pub(crate) publish_link: Option<String>,
     pub(crate) created_at: Option<i64>,
     pub(crate) last_changed_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_visit: Option<i64>,
     pub(crate) read_permission: Option<NotePermission>,
     pub(crate) write_permission: Option<NotePermission>,
     pub(crate) comment_permission: Option<CommentPermission>,
@@ -196,6 +198,21 @@ pub(crate) struct NoteResponse {
     pub(crate) team_path: Option<String>,
     #[serde(default)]
     pub(crate) folder_paths: Vec<FolderPathResponse>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum HistoryResponse {
+    Bare(Vec<NoteResponse>),
+    Wrapped { history: Vec<NoteResponse> },
+}
+
+impl HistoryResponse {
+    pub(crate) fn into_notes(self) -> Vec<NoteResponse> {
+        match self {
+            Self::Bare(notes) | Self::Wrapped { history: notes } => notes,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]

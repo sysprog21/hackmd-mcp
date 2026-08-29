@@ -6,7 +6,10 @@ use url::Url;
 
 use crate::{
     config::Config,
-    dto::{CreateNoteRequest, NoteResponse, ProfileResponse, TeamResponse, UpdateNoteRequest},
+    dto::{
+        CreateNoteRequest, HistoryResponse, NoteResponse, ProfileResponse, TeamResponse,
+        UpdateNoteRequest,
+    },
     models::Workspace,
     state::StateStore,
 };
@@ -53,6 +56,17 @@ impl HackmdClient {
         let path = self.url_for_segments(&["teams"])?.path().to_owned();
         self.request_json(Method::GET, &["teams"], None)
             .await?
+            .ok_or_else(|| HackmdError::EmptyResponse {
+                method: "GET".to_owned(),
+                path,
+            })
+    }
+
+    pub(crate) async fn get_history(&self) -> Result<Vec<NoteResponse>, HackmdError> {
+        let path = self.url_for_segments(&["history"])?.path().to_owned();
+        self.request_json::<HistoryResponse>(Method::GET, &["history"], None)
+            .await?
+            .map(HistoryResponse::into_notes)
             .ok_or_else(|| HackmdError::EmptyResponse {
                 method: "GET".to_owned(),
                 path,

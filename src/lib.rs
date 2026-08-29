@@ -6,6 +6,7 @@ mod crud;
 mod dto;
 mod edit_note;
 mod get_note;
+mod history;
 mod list_notes;
 mod models;
 mod note_ref;

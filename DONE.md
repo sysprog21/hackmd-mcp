@@ -119,3 +119,9 @@
   protocol tests. Assert generated schemas, tool annotations, `tools/list`,
   tool calls, workspace routes, pagination/search, no-op edits, and patch
   conflicts without parsing stdio by hand.
+
+## P2 — complete daily HackMD workflow
+
+- [x] Add `hackmd_get_history` (`GET /history`) with the same slim, client-side
+  pagination as note lists. Tolerate both a bare array and a wrapped
+  `{"history": [...]}` response, as `py-hackmd-mcp` does.

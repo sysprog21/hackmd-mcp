@@ -6,8 +6,8 @@ use thiserror::Error;
 
 use crate::{client::HackmdClient, dto::NoteResponse, models::Workspace};
 
-const DEFAULT_LIMIT: usize = 20;
-const MAX_LIMIT: usize = 100;
+pub(crate) const DEFAULT_LIMIT: usize = 20;
+pub(crate) const MAX_LIMIT: usize = 100;
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -75,6 +75,8 @@ pub(crate) struct NoteSummary {
     pub(crate) workspace: Workspace,
     pub(crate) created_at: Option<i64>,
     pub(crate) last_changed_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_visit: Option<i64>,
     pub(crate) publish_link: Option<String>,
     pub(crate) permalink: Option<String>,
     pub(crate) read_permission: Option<crate::dto::NotePermission>,
@@ -123,36 +125,49 @@ fn filter_sort_page(notes: Vec<NoteResponse>, input: &ListNotesInput) -> ListNot
                         .any(|candidate| normalize(candidate) == *required)
                 })
         })
-        .map(|note| NoteSummary {
-            id: note.id,
-            short_id: note.short_id,
-            title: note.title,
-            description: note.description,
-            tags: note.tags,
-            workspace: input.workspace.clone(),
-            created_at: note.created_at,
-            last_changed_at: note.last_changed_at,
-            publish_link: note.publish_link,
-            permalink: note.permalink,
-            read_permission: note.read_permission,
-            write_permission: note.write_permission,
-        })
+        .map(|note| note_summary(note, input.workspace.clone()))
         .collect::<Vec<_>>();
     notes.sort_by(|left, right| compare_notes(left, right, input.sort));
 
+    page_summaries(notes, input.offset, input.limit)
+}
+
+pub(crate) fn note_summary(note: NoteResponse, workspace: Workspace) -> NoteSummary {
+    NoteSummary {
+        id: note.id,
+        short_id: note.short_id,
+        title: note.title,
+        description: note.description,
+        tags: note.tags,
+        workspace,
+        created_at: note.created_at,
+        last_changed_at: note.last_changed_at,
+        last_visit: note.last_visit,
+        publish_link: note.publish_link,
+        permalink: note.permalink,
+        read_permission: note.read_permission,
+        write_permission: note.write_permission,
+    }
+}
+
+pub(crate) fn page_summaries(
+    notes: Vec<NoteSummary>,
+    offset: usize,
+    limit: usize,
+) -> ListNotesOutput {
     let total = notes.len();
     let notes = notes
         .into_iter()
-        .skip(input.offset)
-        .take(input.limit)
+        .skip(offset)
+        .take(limit)
         .collect::<Vec<_>>();
     let count = notes.len();
-    let end = input.offset.saturating_add(count);
+    let end = offset.saturating_add(count);
     let has_more = end < total;
     ListNotesOutput {
         total,
         count,
-        offset: input.offset,
+        offset,
         has_more,
         next_offset: has_more.then_some(end),
         notes,

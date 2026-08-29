@@ -185,9 +185,6 @@ test (see P3) for each and record the answer here.
 
 ## P2 — complete daily HackMD workflow
 
-- [ ] Add `hackmd_get_history` (`GET /history`) with the same slim, client-side
-  pagination as note lists. Tolerate both a bare array and a wrapped
-  `{"history": [...]}` response, as `py-hackmd-mcp` does.
 - [ ] Add personal `hackmd_list_trash` (`GET /trash`) and
   `hackmd_restore_note` (`PUT /trash/{note_id}/restore`) with the same slim
   pagination as note lists. Mark restore non-destructive/idempotent; keep delete
