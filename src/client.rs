@@ -45,6 +45,10 @@ impl HackmdClient {
         self.config.has_api_token()
     }
 
+    pub(crate) fn state(&self) -> &StateStore {
+        &self.state
+    }
+
     pub(crate) async fn get_me(&self) -> Result<ProfileResponse, HackmdError> {
         let path = self.url_for_segments(&["me"])?.path().to_owned();
         self.request_json(Method::GET, &["me"], None)

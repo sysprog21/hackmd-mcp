@@ -193,19 +193,6 @@ test (see P3) for each and record the answer here.
 
 ## P2.5 — local Markdown sync
 
-- [ ] Add `hackmd_pull_note` (`workspace`, `note_ref`, absolute `local_path`,
-  optional `overwrite_local: false`). Fetch the full note and create the local
-  Markdown file plus its sidecar only when the destination is absent or
-  overwrite was explicitly requested. Return note metadata and the path; do
-  not rewrite Markdown or inject frontmatter.
-- [ ] Write the pulled Markdown and sidecar through temporary files followed
-  by atomic rename. Record the exact pulled body (or a body hash plus a private
-  baseline file), internal note ID, workspace, and remote timestamp; write this
-  state only after both files are successfully in place.
-- [ ] Validate every local path before I/O: require an absolute path, resolve
-  symlinks where possible, and reject a directory or an existing non-Markdown
-  file unless `overwrite_local: true`. Create a missing parent only when
-  `create_parent_dirs: true` is supplied.
 - [ ] Add `hackmd_push_note` (`workspace`, `note_ref`, `local_path`,
   `strategy: "safe" | "overwrite"`). In `safe` mode, fetch remote content and
   compare it and the local file to the sidecar base:

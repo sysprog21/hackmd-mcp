@@ -79,6 +79,23 @@ impl StateStore {
     }
 }
 
+pub(crate) fn write_local_atomic(path: &Path, contents: &[u8]) -> Result<(), StateError> {
+    let parent = path.parent().ok_or(StateError::InvalidStatePath)?;
+    let existing_permissions = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    if let Some(permissions) = existing_permissions {
+        temporary.as_file().set_permissions(permissions)?;
+    }
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| StateError::Io(error.error))?;
+    Ok(())
+}
+
 struct StatePaths {
     sidecar: PathBuf,
     baseline: PathBuf,

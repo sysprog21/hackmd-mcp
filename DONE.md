@@ -154,3 +154,15 @@
 - [x] Add fixture tests for known quirks: `202` readbacks, POST-then-PATCH folder
   assignment, folder-path normalization, order-map merge preservation, move
   cycle rejection, root-folder create omission, and folder IDs containing `/`.
+
+## P2.5 — local Markdown sync
+
+- [x] Add `hackmd_pull_note` with workspace-aware note resolution and an
+  absolute local path. Write the exact remote Markdown body without rewriting
+  it or injecting frontmatter, requiring explicit overwrite for existing files.
+- [x] Persist the working Markdown, private exact baseline, and JSON sidecar via
+  temporary files and atomic renames. Record SHA-256, internal note ID,
+  workspace, remote timestamp, canonical path, and local file identity.
+- [x] Validate paths before remote access: reject relative paths, directories,
+  existing files without confirmation, and existing non-Markdown files without
+  overwrite; resolve symlinks and create parents only when explicitly enabled.

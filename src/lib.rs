@@ -13,6 +13,7 @@ mod list_notes;
 mod models;
 mod note_ref;
 mod patch;
+mod pull_note;
 mod server;
 mod state;
 mod tool_result;

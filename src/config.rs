@@ -120,6 +120,17 @@ impl Config {
     }
 
     #[cfg(test)]
+    pub(crate) fn for_loopback_test_with_state(
+        api_url: &str,
+        token: &str,
+        state_dir: &Path,
+    ) -> Self {
+        let mut config = Self::for_loopback_test(api_url, Some(token));
+        config.state_dir = state_dir.to_path_buf();
+        config
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_loopback_test_with_timeout(
         api_url: &str,
         token: &str,
