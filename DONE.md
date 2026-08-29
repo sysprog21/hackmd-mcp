@@ -56,3 +56,7 @@
   enums. Reject empty PATCH bodies. Build payloads from explicitly supplied
   fields only, and never default a permission field. Validate the
   read/write permission ordering before sending.
+- [x] Add fixture-based tests for path construction, encoded IDs/team paths,
+  payload omission, empty responses, and every error mapping. Run
+  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
+  `cargo test` locally.

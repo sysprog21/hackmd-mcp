@@ -210,6 +210,7 @@ mod tests {
 
     use super::{HackmdClient, HackmdError};
     use crate::config::Config;
+    use crate::dto::CreateNoteRequest;
 
     struct FixtureServer {
         api_url: String,
@@ -344,6 +345,26 @@ mod tests {
         let request = server.finish();
         assert!(request.starts_with("PATCH /v1/notes/id HTTP/1.1\r\n"));
         assert!(request.ends_with(r#"{"title":"hello"}"#));
+    }
+
+    #[tokio::test]
+    async fn omitted_optional_fields_remain_omitted_on_the_wire() {
+        let server = FixtureServer::spawn(204, "");
+        let client = fixture_client(&server, "fixture-token");
+        let payload = serde_json::to_value(CreateNoteRequest::default())
+            .expect("typed payload should serialize");
+
+        let response = client
+            .request_json::<Value>(Method::POST, &["notes"], Some(&payload))
+            .await
+            .expect("fixture request should succeed");
+        assert_eq!(response, None);
+        let request = server.finish();
+        assert!(request.starts_with("POST /v1/notes HTTP/1.1\r\n"));
+        assert!(request.ends_with("{}"));
+        assert!(!request.contains("readPermission"));
+        assert!(!request.contains("writePermission"));
+        assert!(!request.contains("commentPermission"));
     }
 
     #[tokio::test]

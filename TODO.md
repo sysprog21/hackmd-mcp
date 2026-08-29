@@ -180,11 +180,6 @@ test (see P3) for each and record the answer here.
 
 ## P0 — RMCP 3.x foundation
 
-- [ ] Add fixture-based tests for path construction, encoded IDs/team paths,
-  payload omission, empty responses, and every error mapping. Run
-  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and
-  `cargo test` locally.
-
 ## P1 — essential RMCP tools
 
 - [ ] Let RMCP 3.x negotiate MCP initialization and generate `tools/list` /
