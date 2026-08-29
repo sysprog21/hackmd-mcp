@@ -235,7 +235,7 @@ pub(crate) struct TeamResponse {
     pub(crate) upgraded: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SimpleUserProfileResponse {
     pub(crate) name: String,
@@ -244,7 +244,7 @@ pub(crate) struct SimpleUserProfileResponse {
     pub(crate) biography: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NoteResponse {
     pub(crate) id: String,
@@ -332,7 +332,7 @@ impl HistoryResponse {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FolderPathResponse {
     pub(crate) id: String,

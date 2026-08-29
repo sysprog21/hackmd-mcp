@@ -24,6 +24,7 @@ use crate::{
 pub(crate) struct HackmdClient {
     config: Config,
     http: reqwest::Client,
+    notes: NotesCache,
 }
 
 impl HackmdClient {
@@ -33,7 +34,12 @@ impl HackmdClient {
             .timeout(config.request_timeout())
             .build()
             .map_err(|_| HackmdError::ClientBuild)?;
-        Ok(Self { config, http })
+        let notes = NotesCache::new(config.list_cache_ttl());
+        Ok(Self {
+            config,
+            http,
+            notes,
+        })
     }
 
     pub(crate) fn has_api_token(&self) -> bool {
@@ -80,16 +86,31 @@ impl HackmdClient {
     }
 
     pub(crate) async fn restore_note(&self, note_id: &str) -> Result<Option<Value>, HackmdError> {
-        self.request_json_idempotent(Method::PUT, &["trash", note_id, "restore"], None::<&Value>)
-            .await
+        let restored = self
+            .request_json_idempotent(Method::PUT, &["trash", note_id, "restore"], None::<&Value>)
+            .await;
+        self.notes.invalidate();
+        restored
     }
 
+    /// Lists a workspace's notes, from cache when one is still fresh.
+    ///
+    /// Resolving a `hackmd.io/@owner/slug` reference lists the whole workspace,
+    /// so an agent working through URLs pays for the same list repeatedly. Any
+    /// note write clears the cache, and the window is short, but a caller that
+    /// must see another client's change immediately should not rely on this.
     pub(crate) async fn list_notes(
         &self,
         workspace: &Workspace,
     ) -> Result<Vec<NoteResponse>, HackmdError> {
-        self.get_required(&workspace_route(workspace, &["notes"]))
-            .await
+        if let Some(cached) = self.notes.get(workspace) {
+            return Ok(cached);
+        }
+        let notes: Vec<NoteResponse> = self
+            .get_required(&workspace_route(workspace, &["notes"]))
+            .await?;
+        self.notes.store(workspace, &notes);
+        Ok(notes)
     }
 
     pub(crate) async fn get_note(
@@ -107,8 +128,11 @@ impl HackmdClient {
         payload: &CreateNoteRequest,
     ) -> Result<NoteResponse, HackmdError> {
         let segments = workspace_route(workspace, &["notes"]);
-        self.request_required(Method::POST, &segments, Some(payload))
-            .await
+        let created = self
+            .request_required(Method::POST, &segments, Some(payload))
+            .await;
+        self.notes.invalidate();
+        created
     }
 
     pub(crate) async fn update_note(
@@ -118,8 +142,11 @@ impl HackmdClient {
         payload: &UpdateNoteRequest,
     ) -> Result<Option<NoteResponse>, HackmdError> {
         let segments = workspace_route(workspace, &["notes", note_id]);
-        self.request_json_idempotent(Method::PATCH, &segments, Some(payload))
-            .await
+        let updated = self
+            .request_json_idempotent(Method::PATCH, &segments, Some(payload))
+            .await;
+        self.notes.invalidate();
+        updated
     }
 
     pub(crate) async fn delete_note(
@@ -128,8 +155,11 @@ impl HackmdClient {
         note_id: &str,
     ) -> Result<Option<Value>, HackmdError> {
         let segments = workspace_route(workspace, &["notes", note_id]);
-        self.request_json(Method::DELETE, &segments, None::<&Value>)
-            .await
+        let deleted = self
+            .request_json(Method::DELETE, &segments, None::<&Value>)
+            .await;
+        self.notes.invalidate();
+        deleted
     }
 
     pub(crate) async fn list_folders(
@@ -466,6 +496,64 @@ async fn sleep_before_retry(
     tokio::time::sleep(delay).await;
 }
 
+/// A short-lived copy of a workspace's note list.
+///
+/// `HackMD` has no note-list pagination and no conditional GET, so listing is
+/// all-or-nothing and the same list backs both the list tool and every URL
+/// reference resolution. A TTL of zero disables the cache, which is what the
+/// tests use so their request counts stay meaningful.
+#[derive(Debug)]
+struct NotesCache {
+    ttl: Duration,
+    entries: std::sync::Mutex<BTreeMap<String, (tokio::time::Instant, Vec<NoteResponse>)>>,
+}
+
+impl NotesCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn get(&self, workspace: &Workspace) -> Option<Vec<NoteResponse>> {
+        if self.ttl.is_zero() {
+            return None;
+        }
+        let entries = self.entries.lock().ok()?;
+        let (stored, notes) = entries.get(&cache_key(workspace))?;
+        (stored.elapsed() < self.ttl).then(|| notes.clone())
+    }
+
+    fn store(&self, workspace: &Workspace, notes: &[NoteResponse]) {
+        if self.ttl.is_zero() {
+            return;
+        }
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(
+                cache_key(workspace),
+                (tokio::time::Instant::now(), notes.to_vec()),
+            );
+        }
+    }
+
+    /// Called after any note write. Clearing every workspace rather than one is
+    /// deliberate: a note can move between workspaces, and the map holds at
+    /// most a handful of entries.
+    fn invalidate(&self) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.clear();
+        }
+    }
+}
+
+fn cache_key(workspace: &Workspace) -> String {
+    match workspace {
+        Workspace::Personal => "personal".to_owned(),
+        Workspace::Team { team_path } => format!("team:{team_path}"),
+    }
+}
+
 /// How long a write is given to become visible, and the first pause between
 /// reads. The pause doubles so the window is covered in a handful of requests
 /// rather than ten: `HackMD` allows 100 requests per five minutes, and a
@@ -743,6 +831,72 @@ mod tests {
         fixture::{FIXTURE_TOKEN, SequenceServer},
         models::Workspace,
     };
+
+    #[tokio::test]
+    async fn a_fresh_note_list_is_reused_until_a_write_invalidates_it() {
+        const NOTES: &str = r#"[{"id":"note-id","title":"Note"}]"#;
+
+        // Two list responses for three list calls: the second call is served
+        // from cache, and only the write in between forces another fetch.
+        let server = SequenceServer::spawn([(200, NOTES), (202, ""), (200, NOTES)]);
+        let client = HackmdClient::new(Config::for_loopback_test_with_cache(&server.api_url))
+            .expect("cache-enabled client should build");
+
+        let first = client
+            .list_notes(&Workspace::Personal)
+            .await
+            .expect("first list should fetch");
+        let second = client
+            .list_notes(&Workspace::Personal)
+            .await
+            .expect("second list should come from cache");
+        assert_eq!(first, second);
+
+        client
+            .update_note(
+                &Workspace::Personal,
+                "note-id",
+                &UpdateNoteRequest {
+                    title: Some("Renamed".to_owned()),
+                    ..UpdateNoteRequest::default()
+                },
+            )
+            .await
+            .expect("write should succeed");
+        client
+            .list_notes(&Workspace::Personal)
+            .await
+            .expect("list after a write should fetch again");
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("GET /v1/notes HTTP/1.1\r\n"));
+        assert!(requests[1].starts_with("PATCH /v1/notes/note-id HTTP/1.1\r\n"));
+        assert!(requests[2].starts_with("GET /v1/notes HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn team_and_personal_lists_do_not_share_a_cache_entry() {
+        const NOTES: &str = r#"[{"id":"note-id","title":"Note"}]"#;
+        let server = SequenceServer::spawn([(200, NOTES), (200, NOTES)]);
+        let client = HackmdClient::new(Config::for_loopback_test_with_cache(&server.api_url))
+            .expect("cache-enabled client should build");
+
+        client
+            .list_notes(&Workspace::Personal)
+            .await
+            .expect("personal list should fetch");
+        client
+            .list_notes(&Workspace::Team {
+                team_path: "core".to_owned(),
+            })
+            .await
+            .expect("team list should fetch separately");
+
+        let requests = server.finish();
+        assert!(requests[0].starts_with("GET /v1/notes HTTP/1.1\r\n"));
+        assert!(requests[1].starts_with("GET /v1/teams/core/notes HTTP/1.1\r\n"));
+    }
 
     #[tokio::test]
     async fn encodes_each_path_segment_and_attaches_bearer_auth() {

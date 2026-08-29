@@ -17,6 +17,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRIES: u8 = 3;
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+/// How long a fetched note list stays usable. Short enough that a stale list is
+/// a momentary annoyance, long enough to absorb an agent resolving several note
+/// URLs in a row.
+const LIST_CACHE_TTL: Duration = Duration::from_secs(60);
 const SUPPORTED_ENV_KEYS: [&str; 4] = [
     "HACKMD_API_TOKEN",
     "HACKMD_API_URL",
@@ -34,6 +38,7 @@ pub(crate) struct Config {
     retry: RetryConfig,
     state_dir: PathBuf,
     workspace_root: Option<PathBuf>,
+    list_cache_ttl: Duration,
 }
 
 impl Config {
@@ -89,6 +94,7 @@ impl Config {
             retry: RetryConfig::default(),
             state_dir,
             workspace_root,
+            list_cache_ttl: LIST_CACHE_TTL,
         })
     }
 
@@ -126,6 +132,10 @@ impl Config {
         self.retry
     }
 
+    pub(crate) const fn list_cache_ttl(&self) -> Duration {
+        self.list_cache_ttl
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
         Self::from_getter(|_| None).expect("hard-coded defaults must remain valid")
@@ -140,12 +150,24 @@ impl Config {
 
     #[cfg(test)]
     pub(crate) fn for_loopback_test(api_url: &str, token: Option<&str>) -> Self {
-        Self::with_loopback_http_for_tests(|key| match key {
+        let mut config = Self::with_loopback_http_for_tests(|key| match key {
             "HACKMD_API_URL" => Some(api_url.to_owned()),
             "HACKMD_API_TOKEN" => token.map(str::to_owned),
             _ => None,
         })
-        .expect("loopback test URL must be valid")
+        .expect("loopback test URL must be valid");
+
+        // Off by default in tests: request-count assertions are the point of
+        // the fixtures, and a cache hit would silently swallow one.
+        config.list_cache_ttl = Duration::ZERO;
+        config
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_loopback_test_with_cache(api_url: &str) -> Self {
+        let mut config = Self::for_loopback_test(api_url, Some("fixture-token"));
+        config.list_cache_ttl = LIST_CACHE_TTL;
+        config
     }
 
     #[cfg(test)]

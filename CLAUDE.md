@@ -35,8 +35,11 @@ Three layers, each with its own error enum, converted at the boundary:
    `list`, `history`, `trash`, `image`, `patch`, `reference`); `src/sync/` covers the
    local-first sync tools and their state store (`pull`, `push`, `check`, `snapshot`,
    `state`); `folders.rs` stands alone. One tool family per file; `server.rs` only dispatches.
-3. `server.rs` declares every `#[tool]` with its RMCP annotations and converts results through
-   `reply::{success, error}`. Handler bodies stay at match-and-format length.
+3. `src/server/{account,note,folder,sync}.rs` declare the `#[tool]`s, one named router per
+   family, combined by `HackmdServer::router`. `server.rs` itself holds only the wiring:
+   construction, the `ServerHandler` impl, and the shared reply helpers. Each tool carries its
+   RMCP annotations and converts results through `reply::{success, error}`; handler bodies stay
+   at match-and-format length.
 
 Filenames carry no underscores: that is why related tools are grouped into directories rather
 than named `pull_note.rs`.
@@ -55,6 +58,9 @@ Cross-cutting pieces:
   does not match exactly, so a patch written against one note can never land on another.
 - `note::patch` implements the `*** Begin Patch` format directly. Hunk context must match exactly
   once; ambiguous or missing context is an error rather than a guess.
+- `sync::state` keeps a `by-path/<hash>` pointer from each tracked file to its sidecar, so a
+  lookup is one read rather than a scan. It is a hint only: the loader verifies what it finds
+  and falls back to scanning, which is also what keeps state from older builds loadable.
 - `sync::state` is the local sync store under `HACKMD_MCP_STATE_DIR`. Per tracked note it keeps a
   JSON sidecar plus a baseline copy of the body. State files go through `write_private_atomic`
   (0600 on unix); the user's own Markdown file goes through `write_local_atomic`, which
@@ -69,6 +75,11 @@ Cross-cutting pieces:
   summary and snapshot path) rather than overwriting. `overwrite` requires `confirm: true`.
 - `retry.rs` uses a `tokio::task_local` so client-layer retries surface in the MCP
   result `_meta.retry` without threading a counter through every signature.
+- `client::NotesCache` keeps a workspace's note list for 60 seconds and drops every entry on
+  any note write. This reverses the deferral recorded in commit `0a61e3b`: URL-based note
+  references list the whole workspace, so an agent working through links paid for the same
+  list repeatedly. Tests disable it (`Config::for_loopback_test` sets a zero TTL) so their
+  request counts stay meaningful.
 - `paging.rs` owns the limit/offset contract for every list tool: `HackMD` returns whole
   collections, so filtering, sorting, and paging all happen locally.
 - `client::poll_readback` absorbs `HackMD`'s asynchronous write visibility. Any read-back after

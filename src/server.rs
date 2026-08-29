@@ -1,7 +1,7 @@
 use std::{path::Path, sync::Arc};
 
-use rmcp::{ServiceExt, tool_router};
-use rmcp::{handler::server::wrapper::Parameters, schemars, tool};
+use rmcp::ServiceExt;
+use rmcp::schemars;
 use serde::Deserialize;
 use tracing::Instrument;
 
@@ -9,25 +9,8 @@ use crate::{
     client::HackmdClient,
     config::Config,
     dto::{ProfileResponse, TeamResponse},
-    folders::{
-        CreateFolderInput, DeleteFolderInput, FolderRefInput, FolderWorkspaceInput,
-        SetFolderOrderInput, UpdateFolderInput,
-    },
     local::LocalFiles,
-    note::{
-        crud::{CreateNoteInput, DeleteNoteInput, UpdateNoteInput},
-        edit::EditNoteInput,
-        get::GetNoteInput,
-        history::HistoryInput,
-        image::UploadNoteImageInput,
-        list::ListNotesInput,
-        trash::{ListTrashInput, RestoreNoteInput},
-    },
     reply,
-    sync::{
-        check::CheckNoteSyncInput, pull::PullNoteInput, push::PushNoteInput,
-        snapshot::SaveRemoteSnapshotInput,
-    },
 };
 
 /// MCP server whose handlers share one configured `HackMD` client.
@@ -38,9 +21,21 @@ pub(crate) struct HackmdServer {
     files: Arc<LocalFiles>,
 }
 
+mod account;
+mod folder;
+mod note;
+mod sync;
+
 impl HackmdServer {
     pub(crate) fn new(client: Arc<HackmdClient>, files: Arc<LocalFiles>) -> Self {
         Self { client, files }
+    }
+
+    /// The 22 tools, assembled from one router per family. Splitting them keeps
+    /// each file about a single part of the API; the router the transport sees
+    /// is the same either way.
+    fn router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+        Self::account_router() + Self::note_router() + Self::folder_router() + Self::sync_router()
     }
 }
 
@@ -66,569 +61,11 @@ pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[tool_router]
-impl HackmdServer {
-    #[tool(
-        name = "hackmd_get_me",
-        description = "Get the authenticated HackMD profile, including userPath for resolving personal note URLs.",
-        annotations(
-            title = "Get HackMD Profile",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn get_me(
-        &self,
-        Parameters(EmptyInput {}): Parameters<EmptyInput>,
-    ) -> rmcp::model::CallToolResult {
-        match self.client.get_me().await {
-            Ok(profile) => profile_result(&profile),
-            Err(error) => error.into(),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_list_teams",
-        description = "List teams available to the authenticated HackMD account. Use each returned path as workspace.team_path.",
-        annotations(
-            title = "List HackMD Teams",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn list_teams(
-        &self,
-        Parameters(EmptyInput {}): Parameters<EmptyInput>,
-    ) -> rmcp::model::CallToolResult {
-        match self.client.list_teams().await {
-            Ok(teams) => teams_result(&teams),
-            Err(error) => error.into(),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_list_notes",
-        description = "List personal or team HackMD notes with local metadata filtering, deterministic sorting, and pagination. This does not search note content.",
-        annotations(
-            title = "List HackMD Notes",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn list_notes(
-        &self,
-        Parameters(input): Parameters<ListNotesInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::note::list::list_notes(&self.client, input).await {
-            Ok(output) => reply::success(
-                format!(
-                    "Found {} matching HackMD note(s); returned {}",
-                    output.meta.total, output.meta.count
-                ),
-                serde_json::to_value(output).expect("list-notes output should serialize"),
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_get_note",
-        description = "Get one HackMD note with full content, normalized metadata, folder_ids, and the exact patch_path for safe edits.",
-        annotations(
-            title = "Get HackMD Note",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn get_note(
-        &self,
-        Parameters(input): Parameters<GetNoteInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::note::get::get_note(&self.client, input).await {
-            Ok(Ok(note)) => reply::success(
-                format!("Fetched HackMD note {}", note.id),
-                serde_json::json!({"note": note}),
-            ),
-            Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_create_note",
-        description = "Create a HackMD note in a personal or team workspace. Folder placement is read back after POST; a compatibility PATCH runs only if the API dropped parentFolderId.",
-        annotations(
-            title = "Create HackMD Note",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn create_note(
-        &self,
-        Parameters(input): Parameters<CreateNoteInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::note::crud::create_note(&self.client, input).await {
-            Ok(output) => reply::success(
-                format!("Created HackMD note {}", output.note.id),
-                serde_json::json!({"result": output}),
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_update_note",
-        description = "Fallback note update for metadata or an explicit full content replacement. Prefer hackmd_edit_note for normal body edits because content here overwrites the complete unversioned body.",
-        annotations(
-            title = "Update HackMD Note",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn update_note(
-        &self,
-        Parameters(input): Parameters<UpdateNoteInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::note::crud::update_note(&self.client, input).await {
-            Ok(Ok(output)) => reply::success(
-                format!("HackMD accepted the update for note {}", output.note_id),
-                serde_json::json!({"result": output}),
-            ),
-            Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_delete_note",
-        description = "Delete a HackMD note. Personal deletion moves it to recoverable trash; team restore is not exposed. This remains destructive.",
-        annotations(
-            title = "Delete HackMD Note",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn delete_note(
-        &self,
-        Parameters(input): Parameters<DeleteNoteInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::note::crud::delete_note(&self.client, input).await {
-            Ok(Ok(output)) => reply::success(
-                format!("Deleted HackMD note {}", output.note_id),
-                serde_json::json!({"result": output}),
-            ),
-            Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_list_trash",
-        description = "List trashed personal HackMD notes with slim metadata and client-side pagination.",
-        annotations(
-            title = "List Trashed HackMD Notes",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn list_trash(
-        &self,
-        Parameters(input): Parameters<ListTrashInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::note::trash::list_trash(&self.client, input).await {
-            Ok(output) => reply::success(
-                format!(
-                    "Found {} trashed HackMD note(s); returned {}",
-                    output.meta.total, output.meta.count
-                ),
-                serde_json::to_value(output).expect("trash-list output should serialize"),
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_restore_note",
-        description = "Restore a personal HackMD note from trash by internal note ID.",
-        annotations(
-            title = "Restore Trashed HackMD Note",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn restore_note(
-        &self,
-        Parameters(input): Parameters<RestoreNoteInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::note::trash::restore_note(&self.client, input).await {
-            Ok(output) => reply::success(
-                format!("Restored HackMD note {}", output.note_id),
-                serde_json::json!({"result": output}),
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_edit_note",
-        description = "Default tool for normal HackMD body edits. Applies one strict Codex patch to the current content only when every hunk context is unique; prefer this over hackmd_update_note for body changes.",
-        annotations(
-            title = "Edit HackMD Note Safely",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn edit_note(
-        &self,
-        Parameters(input): Parameters<EditNoteInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::note::edit::edit_note(&self.client, input).await {
-            Ok(Ok(output)) => {
-                let summary = if output.changed {
-                    format!("Edited HackMD note {}", output.note_id)
-                } else {
-                    format!("HackMD note {} is unchanged", output.note_id)
-                };
-                reply::success(summary, serde_json::json!({"result": output}))
-            }
-            Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_get_history",
-        description = "Get recently viewed HackMD notes in API history order with slim metadata and client-side pagination.",
-        annotations(
-            title = "Get HackMD Browse History",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn get_history(
-        &self,
-        Parameters(input): Parameters<HistoryInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::note::history::get_history(&self.client, input).await {
-            Ok(output) => reply::success(
-                format!(
-                    "Found {} HackMD history item(s); returned {}",
-                    output.meta.total, output.meta.count
-                ),
-                serde_json::to_value(output).expect("history output should serialize"),
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_list_folders",
-        description = "List folders in a personal or team HackMD workspace.",
-        annotations(
-            title = "List HackMD Folders",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn list_folders(
-        &self,
-        Parameters(input): Parameters<FolderWorkspaceInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::folders::list_folders(&self.client, input).await {
-            Ok(output) => reply::success(
-                format!(
-                    "Found {} HackMD folder(s); returned {}",
-                    output.meta.total, output.meta.count
-                ),
-                serde_json::to_value(output).expect("folder-list output should serialize"),
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_get_folder",
-        description = "Get one folder by internal ID in a personal or team HackMD workspace.",
-        annotations(
-            title = "Get HackMD Folder",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn get_folder(
-        &self,
-        Parameters(input): Parameters<FolderRefInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::folders::get_folder(&self.client, input).await {
-            Ok(output) => reply::success(
-                format!("Fetched HackMD folder {}", output.folder.id),
-                serde_json::to_value(output).expect("folder output should serialize"),
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_create_folder",
-        description = "Create a root or nested folder in a personal or verified team HackMD workspace.",
-        annotations(
-            title = "Create HackMD Folder",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn create_folder(
-        &self,
-        Parameters(input): Parameters<CreateFolderInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::folders::create_folder(&self.client, input).await {
-            Ok(output) => reply::success(
-                format!("Created HackMD folder {}", output.folder.id),
-                serde_json::to_value(output).expect("folder output should serialize"),
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_update_folder",
-        description = "Update team folder metadata and read back until PATCH is visible. Personal folder PATCH and all folder moves are unsupported by HackMD.",
-        annotations(
-            title = "Update HackMD Folder",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn update_folder(
-        &self,
-        Parameters(input): Parameters<UpdateFolderInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::folders::update_folder(&self.client, input).await {
-            Ok(output) => reply::success(
-                format!("Updated HackMD folder {}", output.folder.id),
-                serde_json::to_value(output).expect("folder output should serialize"),
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_delete_folder",
-        description = "Delete a folder. A non-empty folder is unchanged unless the same request supplies confirm: true.",
-        annotations(
-            title = "Delete HackMD Folder",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn delete_folder(
-        &self,
-        Parameters(input): Parameters<DeleteFolderInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::folders::delete_folder(&self.client, input).await {
-            Ok(output) => {
-                let summary = if output.deleted {
-                    format!("Deleted HackMD folder {}", output.folder_id)
-                } else {
-                    format!(
-                        "Folder {} has {} child folder(s); confirm deletion",
-                        output.folder_id, output.child_count
-                    )
-                };
-                reply::success(
-                    summary,
-                    serde_json::to_value(output).expect("folder-delete output should serialize"),
-                )
-            }
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_set_folder_order",
-        description = "Set the direct-child order for one parent while preserving every unrelated entry in HackMD's whole folder-order map. Omit parent_folder_id for root.",
-        annotations(
-            title = "Set HackMD Folder Order",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn set_folder_order(
-        &self,
-        Parameters(input): Parameters<SetFolderOrderInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::folders::set_folder_order(&self.client, input).await {
-            Ok(output) => reply::success(
-                format!("Set HackMD folder order for {}", output.parent),
-                serde_json::to_value(output).expect("folder-order output should serialize"),
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_upload_note_image",
-        description = "Upload a local image to a personal-workspace note and return only its HackMD CDN link. Files above 5 MiB require confirmation; files above 10 MiB are refused.",
-        annotations(
-            title = "Upload HackMD Note Image",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn upload_note_image(
-        &self,
-        Parameters(input): Parameters<UploadNoteImageInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::note::image::upload_note_image(&self.client, &self.files, input).await {
-            Ok(Ok(output)) => reply::success(
-                "Uploaded HackMD note image",
-                serde_json::to_value(output).expect("image-upload output should serialize"),
-            ),
-            Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_pull_note",
-        description = "Pull one HackMD note's exact Markdown body to an absolute local path and atomically record a private sync baseline. Existing files require overwrite_local: true.",
-        annotations(
-            title = "Pull HackMD Note",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn pull_note(
-        &self,
-        Parameters(input): Parameters<PullNoteInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::sync::pull::pull_note(&self.client, &self.files, input).await {
-            Ok(Ok(output)) => reply::success(
-                format!("Pulled HackMD note {}", output.note_id),
-                serde_json::to_value(output).expect("pull output should serialize"),
-            ),
-            Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_push_note",
-        description = "Push a tracked local Markdown file with safe baseline comparison by default. strategy: overwrite requires confirm: true and replaces unversioned remote content.",
-        annotations(
-            title = "Push HackMD Note",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn push_note(
-        &self,
-        Parameters(input): Parameters<PushNoteInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::sync::push::push_note(&self.client, &self.files, input).await {
-            Ok(Ok(output)) => reply::success(
-                "Evaluated tracked HackMD note push",
-                serde_json::to_value(output).expect("push output should serialize"),
-            ),
-            Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_check_note_sync",
-        description = "Read local, private baseline, and remote note state without writing, returning in_sync, remote_changed, local_changed, or conflict plus SHA-256 hashes.",
-        annotations(
-            title = "Check HackMD Note Sync",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    async fn check_note_sync(
-        &self,
-        Parameters(input): Parameters<CheckNoteSyncInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::sync::check::check_note_sync(&self.client, &self.files, input).await {
-            Ok(output) => reply::success(
-                "Checked tracked HackMD note sync state",
-                serde_json::to_value(output).expect("sync-check output should serialize"),
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_save_remote_snapshot",
-        description = "Atomically save the tracked note's current remote body as sibling *.remote.md without changing the working Markdown file. Existing snapshots require explicit overwrite.",
-        annotations(
-            title = "Save HackMD Remote Snapshot",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn save_remote_snapshot(
-        &self,
-        Parameters(input): Parameters<SaveRemoteSnapshotInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::sync::snapshot::save_remote_snapshot(&self.client, &self.files, input).await {
-            Ok(output) => reply::success(
-                "Saved HackMD remote snapshot",
-                serde_json::to_value(output).expect("snapshot output should serialize"),
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-}
-
 #[allow(
     clippy::unused_async_trait_impl,
     reason = "the handler bodies are generated by rmcp's tool_handler macro"
 )]
-#[rmcp::tool_handler(router = Self::tool_router())]
+#[rmcp::tool_handler(router = Self::router())]
 impl rmcp::ServerHandler for HackmdServer {
     /// Wraps every dispatch in one span and one retry scope, so each tool call
     /// carries a request ID through its logs and reports in `_meta` how much
@@ -649,7 +86,7 @@ impl rmcp::ServerHandler for HackmdServer {
             rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         async move {
             tracing::info!("tool call started");
-            let result = crate::retry::scope_call(Self::tool_router().call(tool_context)).await;
+            let result = crate::retry::scope_call(Self::router().call(tool_context)).await;
             match &result {
                 Ok(rmcp::model::CallToolResponse::Complete(response)) => tracing::info!(
                     is_error = response.is_error.unwrap_or(false),
@@ -680,7 +117,7 @@ fn teams_result(teams: &[TeamResponse]) -> rmcp::model::CallToolResult {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct EmptyInput {}
+pub(crate) struct EmptyInput {}
 
 #[cfg(test)]
 mod tests {
@@ -778,7 +215,7 @@ mod tests {
 
     #[test]
     fn tools_have_generated_schemas_and_exact_annotations() {
-        let tools = HackmdServer::tool_router().list_all();
+        let tools = HackmdServer::router().list_all();
 
         assert_eq!(tools.len(), 22);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {

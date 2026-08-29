@@ -67,6 +67,17 @@ pub(crate) fn timestamp_text(value: Option<i64>) -> String {
 }
 
 /// The single hash format written to sidecars and reported by the sync tools.
+fn state_key(workspace: &Workspace, internal_id: &str) -> String {
+    match workspace {
+        Workspace::Personal => format!("personal--{}", encode_component(internal_id)),
+        Workspace::Team { team_path } => format!(
+            "team--{}--{}",
+            encode_component(team_path),
+            encode_component(internal_id)
+        ),
+    }
+}
+
 pub(crate) fn body_hash(body: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
 }
@@ -102,19 +113,22 @@ impl StateStore {
     }
 
     fn paths_for(&self, workspace: &Workspace, internal_id: &str) -> StatePaths {
-        let key = match workspace {
-            Workspace::Personal => format!("personal--{}", encode_component(internal_id)),
-            Workspace::Team { team_path } => format!(
-                "team--{}--{}",
-                encode_component(team_path),
-                encode_component(internal_id)
-            ),
-        };
+        self.paths_for_key(&state_key(workspace, internal_id))
+    }
+
+    fn paths_for_key(&self, key: &str) -> StatePaths {
         let tracked = self.root.join("tracked");
         StatePaths {
             sidecar: tracked.join(format!("{key}.json")),
             baseline: tracked.join(format!("{key}.baseline.md")),
         }
+    }
+
+    /// Where the pointer from a local file back to its sidecar lives. The name
+    /// is a hash so any path, however long or oddly encoded, maps to one file.
+    fn index_path(&self, canonical: &Path) -> PathBuf {
+        let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+        self.root.join("by-path").join(format!("{digest:x}"))
     }
 
     /// Persists sync state atomically per file. Only pull/push handlers should
@@ -135,7 +149,36 @@ impl StateStore {
         write_private_atomic(&paths.baseline, baseline_body.as_bytes())?;
         let sidecar = serde_json::to_vec_pretty(state)?;
         write_private_atomic(&paths.sidecar, &sidecar)?;
+
+        // A hint, not a source of truth: the loader verifies whatever it finds
+        // and falls back to a scan, so a stale or missing pointer costs speed
+        // and never correctness.
+        let index = self.index_path(&state.local_file_identity.canonical_path);
+        let index_parent = index.parent().ok_or(StateError::InvalidStatePath)?;
+        create_private_dir_all(index_parent)?;
+        write_private_atomic(
+            &index,
+            state_key(&state.workspace, &state.internal_id).as_bytes(),
+        )?;
         Ok(())
+    }
+
+    /// Follows the by-path pointer, if one is there and still describes this
+    /// file. `None` means the caller should scan, which also covers state
+    /// written before the index existed.
+    fn load_via_index(&self, canonical: &Path) -> Result<Option<LoadedTrackedState>, StateError> {
+        let Ok(key) = fs::read_to_string(self.index_path(canonical)) else {
+            return Ok(None);
+        };
+        let paths = self.paths_for_key(key.trim());
+        let Ok(sidecar) = fs::read(&paths.sidecar) else {
+            return Ok(None);
+        };
+        let state: TrackedNoteState = serde_json::from_slice(&sidecar)?;
+        if state.local_file_identity.canonical_path != canonical {
+            return Ok(None);
+        }
+        Self::load_verified(state, paths).map(Some)
     }
 
     /// Finds the tracked note whose recorded file is `local_path`.
@@ -148,6 +191,9 @@ impl StateStore {
         local_path: &Path,
     ) -> Result<LoadedTrackedState, StateError> {
         let canonical = fs::canonicalize(local_path)?;
+        if let Some(loaded) = self.load_via_index(&canonical)? {
+            return Ok(loaded);
+        }
         let tracked = self.root.join("tracked");
         let entries = fs::read_dir(tracked).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -164,27 +210,33 @@ impl StateStore {
             let state: TrackedNoteState = serde_json::from_slice(&fs::read(&path)?)?;
             if state.local_file_identity.canonical_path == canonical {
                 let paths = self.paths_for(&state.workspace, &state.internal_id);
-                let baseline_body = fs::read_to_string(&paths.baseline)?;
-
-                // A torn or hand-edited pair would silently corrupt every later
-                // three-way comparison, so refuse the state instead of
-                // guessing.
-                if body_hash(&baseline_body) != state.baseline_body_hash {
-                    return Err(StateError::BaselineMismatch {
-                        baseline_path: paths.baseline,
-                        note_id: state.internal_id,
-                        workspace: state.workspace,
-                        local_path: state.local_path,
-                    });
-                }
-                return Ok(LoadedTrackedState {
-                    state,
-                    baseline_body,
-                    baseline_path: paths.baseline,
-                });
+                return Self::load_verified(state, paths);
             }
         }
         Err(StateError::NotTracked)
+    }
+
+    fn load_verified(
+        state: TrackedNoteState,
+        paths: StatePaths,
+    ) -> Result<LoadedTrackedState, StateError> {
+        let baseline_body = fs::read_to_string(&paths.baseline)?;
+
+        // A torn or hand-edited pair would silently corrupt every later
+        // three-way comparison, so refuse the state instead of guessing.
+        if body_hash(&baseline_body) != state.baseline_body_hash {
+            return Err(StateError::BaselineMismatch {
+                baseline_path: paths.baseline,
+                note_id: state.internal_id,
+                workspace: state.workspace,
+                local_path: state.local_path,
+            });
+        }
+        Ok(LoadedTrackedState {
+            state,
+            baseline_body,
+            baseline_path: paths.baseline,
+        })
     }
 }
 
@@ -315,7 +367,7 @@ pub(crate) enum StateError {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use super::{LocalFileIdentity, StateStore, TrackedNoteState};
+    use super::{LocalFileIdentity, StateError, StateStore, TrackedNoteState};
     use crate::models::Workspace;
 
     fn fixture_state(workspace: Workspace) -> TrackedNoteState {
@@ -331,6 +383,49 @@ mod tests {
                 file_id: Some(2),
             },
         }
+    }
+
+    #[test]
+    fn lookup_uses_the_index_and_survives_losing_it() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let store = StateStore::new(directory.path().join("state"));
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").expect("local fixture should write");
+        store
+            .persist_from_sync(
+                &TrackedNoteState::capture(
+                    "note/id".to_owned(),
+                    Workspace::Personal,
+                    local_path.clone(),
+                    "baseline",
+                    Some(1),
+                )
+                .expect("fixture state should capture"),
+                "baseline",
+            )
+            .expect("state should persist");
+
+        let loaded = store
+            .load_for_local_path(&local_path)
+            .expect("indexed lookup should find the note");
+        assert_eq!(loaded.state.internal_id, "note/id");
+
+        // Delete the pointer: the scan still finds it, which is what keeps
+        // state written by older builds loadable.
+        fs::remove_dir_all(directory.path().join("state/by-path"))
+            .expect("index should be removable");
+        let loaded = store
+            .load_for_local_path(&local_path)
+            .expect("scan should still find the note");
+        assert_eq!(loaded.state.internal_id, "note/id");
+
+        // A pointer aimed at a note that describes some other file is ignored.
+        let other = directory.path().join("other.md");
+        fs::write(&other, "baseline").expect("other fixture should write");
+        assert!(matches!(
+            store.load_for_local_path(&other),
+            Err(StateError::NotTracked)
+        ));
     }
 
     #[cfg(unix)]
