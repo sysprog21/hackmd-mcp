@@ -64,6 +64,11 @@ pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(
+    unknown_lints,
+    clippy::unused_async_trait_impl,
+    reason = "rmcp generates the trait method body and requires its async signature"
+)]
 #[rmcp::tool_handler(router = Self::router().clone())]
 impl rmcp::ServerHandler for HackmdServer {
     /// Wraps every dispatch in one span and one retry scope, so each tool call
