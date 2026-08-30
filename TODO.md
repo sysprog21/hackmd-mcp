@@ -218,11 +218,6 @@ dependency, or background task without a bound and an invalidation rule.
   `hackmd_check_note_sync`, use a demonstrated conditional GET when available;
   otherwise fetch once and hash while reading. Never report `in_sync` from TTL
   alone.
-- [ ] Centralize the three-way classification used by check and push into one
-  pure function over baseline/local/remote hashes. Read full bodies only for
-  the branches that need content or a conflict diff. Table-test `in_sync`,
-  local-only, remote-only, conflict, missing baseline, and timestamp-changed but
-  body-identical cases.
 - [ ] Make edits differential locally: parse and validate the patch against the
   cached/current body, skip no-op PATCH requests, and send HackMD the full body
   only because API v1 requires it. Preserve strict unique-context matching and

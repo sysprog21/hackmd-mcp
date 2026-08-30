@@ -2,6 +2,13 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Centralize check/push three-way change classification in one pure function
+  over fixed-size SHA-256 digests. Carry the already-verified baseline digest
+  out of state loading, reuse computed local/remote digests for result hashes,
+  and allocate conflict diffs only for conflicts. Table-driven coverage proves
+  in-sync, local-only, remote-only, and conflict states; focused tests cover a
+  missing baseline with recovery guidance and a timestamp-only remote change
+  whose body remains identical.
 - [x] Enforce exact HackMD API request budgets for core note workflows with a
   shared method/path sequence assertion: direct get performs one item GET;
   scoped get performs profile discovery, one workspace list, and one item GET;

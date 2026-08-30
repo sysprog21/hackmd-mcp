@@ -7,7 +7,8 @@ use thiserror::Error;
 use crate::{
     client::{HackmdClient, HackmdError},
     local::{LocalAccessError, LocalFiles},
-    sync::state::{StateError, body_hash, timestamp_text},
+    sync::state::{StateError, body_digest, body_hash_from_digest, timestamp_text},
+    sync::{ChangeState, classify_changes},
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -74,13 +75,13 @@ pub(crate) async fn check_note_sync(
         .ok_or_else(|| CheckNoteSyncError::MissingRemoteContent {
             note_id: tracked.state.internal_id.clone(),
         })?;
-    let local_changed = local != tracked.baseline_body;
-    let remote_changed = remote != tracked.baseline_body;
-    let status = match (local_changed, remote_changed) {
-        (false, false) => SyncStatus::InSync,
-        (false, true) => SyncStatus::RemoteChanged,
-        (true, false) => SyncStatus::LocalChanged,
-        (true, true) => SyncStatus::Conflict,
+    let local_digest = body_digest(&local);
+    let remote_digest = body_digest(&remote);
+    let status = match classify_changes(&tracked.baseline_digest, &local_digest, &remote_digest) {
+        ChangeState::InSync => SyncStatus::InSync,
+        ChangeState::LocalOnly => SyncStatus::LocalChanged,
+        ChangeState::RemoteOnly => SyncStatus::RemoteChanged,
+        ChangeState::Conflict => SyncStatus::Conflict,
     };
     Ok(CheckNoteSyncOutput {
         status,
@@ -90,8 +91,8 @@ pub(crate) async fn check_note_sync(
         remote_timestamp: timestamp_text(remote_note.last_changed_at),
         // The loader already verified this hash against the baseline file.
         baseline_body_hash: tracked.state.baseline_body_hash,
-        local_body_hash: body_hash(&local),
-        remote_body_hash: body_hash(&remote),
+        local_body_hash: body_hash_from_digest(&local_digest),
+        remote_body_hash: body_hash_from_digest(&remote_digest),
     })
 }
 
@@ -162,5 +163,24 @@ mod tests {
             fs::read_to_string(&local_path).expect("local should remain readable"),
             "local"
         );
+    }
+
+    #[tokio::test]
+    async fn timestamp_only_change_remains_in_sync() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "same body").expect("local fixture should write");
+        let fixture = crate::fixture::SequenceServer::spawn([(
+            200,
+            r#"{"id":"id","title":"Note","content":"same body","lastChangedAt":99}"#,
+        )]);
+        let files = crate::fixture::tracked_files(directory.path(), "id", &local_path, "same body");
+
+        let output = check_note_sync(&fixture.client(), &files, CheckNoteSyncInput { local_path })
+            .await
+            .expect("timestamp-only check should succeed");
+        assert_eq!(output.status, SyncStatus::InSync);
+        assert_eq!(output.remote_timestamp, "99");
+        assert_request_sequence(&fixture.finish(), &["GET /v1/notes/id HTTP/1.1"]);
     }
 }

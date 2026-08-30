@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -80,7 +81,20 @@ fn state_key(workspace: &Workspace, internal_id: &str) -> String {
 
 /// The single hash format written to sidecars and reported by the sync tools.
 pub(crate) fn body_hash(body: &str) -> String {
-    format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
+    body_hash_from_digest(&body_digest(body))
+}
+
+pub(crate) fn body_hash_from_digest(digest: &[u8; 32]) -> String {
+    let mut hash = String::with_capacity(71);
+    hash.push_str("sha256:");
+    for byte in digest {
+        write!(hash, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hash
+}
+
+pub(crate) fn body_digest(body: &str) -> [u8; 32] {
+    Sha256::digest(body.as_bytes()).into()
 }
 
 /// Stable identity captured for the local Markdown file.
@@ -97,9 +111,11 @@ pub(crate) struct StateStore {
     root: PathBuf,
 }
 
+#[derive(Debug)]
 pub(crate) struct LoadedTrackedState {
     pub(crate) state: TrackedNoteState,
     pub(crate) baseline_body: String,
+    pub(crate) baseline_digest: [u8; 32],
     pub(crate) baseline_path: PathBuf,
 }
 
@@ -327,11 +343,23 @@ impl StateStore {
         state: TrackedNoteState,
         paths: StatePaths,
     ) -> Result<LoadedTrackedState, StateError> {
-        let baseline_body = fs::read_to_string(&paths.baseline)?;
+        let baseline_body = fs::read_to_string(&paths.baseline).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                StateError::MissingBaseline {
+                    baseline_path: paths.baseline.clone(),
+                    note_id: state.internal_id.clone(),
+                    workspace: state.workspace.clone(),
+                    local_path: state.local_path.clone(),
+                }
+            } else {
+                StateError::Io(error)
+            }
+        })?;
 
         // A torn or hand-edited pair would silently corrupt every later
         // three-way comparison, so refuse the state instead of guessing.
-        if body_hash(&baseline_body) != state.baseline_body_hash {
+        let baseline_digest = body_digest(&baseline_body);
+        if body_hash_from_digest(&baseline_digest) != state.baseline_body_hash {
             return Err(StateError::BaselineMismatch {
                 baseline_path: paths.baseline,
                 note_id: state.internal_id,
@@ -342,6 +370,7 @@ impl StateStore {
         Ok(LoadedTrackedState {
             state,
             baseline_body,
+            baseline_digest,
             baseline_path: paths.baseline,
         })
     }
@@ -506,6 +535,17 @@ pub(crate) enum StateError {
     #[error("tracked sidecar identity does not match its filename")]
     StateIdentityMismatch,
     #[error(
+        "tracked baseline {} is missing; re-pull note {note_id} from {workspace} to {} before syncing",
+        baseline_path.display(),
+        local_path.display()
+    )]
+    MissingBaseline {
+        baseline_path: PathBuf,
+        note_id: String,
+        workspace: Workspace,
+        local_path: PathBuf,
+    },
+    #[error(
         "tracked baseline {} does not match its recorded hash; re-pull note {note_id} from {workspace} to {} before syncing",
         baseline_path.display(),
         local_path.display()
@@ -589,6 +629,35 @@ mod tests {
             store.load_for_local_path(&other),
             Err(StateError::NotTracked)
         ));
+    }
+
+    #[test]
+    fn missing_baseline_has_a_recovery_error() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let store = StateStore::new(directory.path().join("state"));
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").expect("local fixture should write");
+        let state = TrackedNoteState::capture(
+            "note-id".to_owned(),
+            Workspace::Personal,
+            local_path.clone(),
+            "baseline",
+            Some(1),
+        )
+        .expect("fixture state should capture");
+        store
+            .persist_from_sync(&state, "baseline")
+            .expect("state should persist");
+        fs::remove_file(store.paths_for(&Workspace::Personal, "note-id").baseline)
+            .expect("baseline should be removable");
+
+        let error = store
+            .load_for_local_path(&local_path)
+            .expect_err("a missing baseline must prevent sync");
+        assert!(matches!(&error, StateError::MissingBaseline { .. }));
+        let message = error.to_string();
+        assert!(message.contains("re-pull note note-id from the personal workspace"));
+        assert!(message.contains(&local_path.display().to_string()));
     }
 
     #[test]

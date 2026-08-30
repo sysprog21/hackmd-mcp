@@ -11,8 +11,8 @@ use crate::{
     local::{LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
-    sync::state::{StateError, TrackedNoteState},
-    sync::{BODY_MAX_BYTES, BODY_WARNING_BYTES},
+    sync::state::{StateError, TrackedNoteState, body_digest},
+    sync::{BODY_MAX_BYTES, BODY_WARNING_BYTES, ChangeState, classify_changes},
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
@@ -197,28 +197,27 @@ async fn push_resolved(
         baseline_path: &tracked.baseline_path,
     };
     if matches!(strategy, PushStrategy::Safe) {
-        if local == tracked.baseline_body {
-            let status = if remote == tracked.baseline_body {
-                PushStatus::NothingToPush
-            } else {
-                PushStatus::RemoteChanged
-            };
-            return Ok(Ok(output(&target, status, false)));
-        }
-
-        // The remote body was read once, in push_note, and only local string
-        // comparisons have happened since. A second read here would observe the
-        // same instant at the cost of another round trip, and it could not
-        // close the window that matters anyway: HackMD has no conditional
-        // write, so an edit landing between this check and the PATCH below is
-        // overwritten either way.
-        if remote != tracked.baseline_body {
-            return Ok(Ok(conflict_output(
-                &target,
-                &tracked.baseline_body,
-                &local,
-                &remote,
-            )));
+        let change = classify_changes(
+            &tracked.baseline_digest,
+            &body_digest(&local),
+            &body_digest(&remote),
+        );
+        match change {
+            ChangeState::InSync => {
+                return Ok(Ok(output(&target, PushStatus::NothingToPush, false)));
+            }
+            ChangeState::RemoteOnly => {
+                return Ok(Ok(output(&target, PushStatus::RemoteChanged, false)));
+            }
+            ChangeState::Conflict => {
+                return Ok(Ok(conflict_output(
+                    &target,
+                    &tracked.baseline_body,
+                    &local,
+                    &remote,
+                )));
+            }
+            ChangeState::LocalOnly => {}
         }
     } else if remote == local {
         let result = output(&target, PushStatus::NothingToPush, false);
