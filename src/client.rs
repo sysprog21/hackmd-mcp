@@ -3,10 +3,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::{
-    path::Path,
-    time::{Duration, SystemTime},
-};
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use url::Url;
 
@@ -222,7 +219,9 @@ impl HackmdClient {
     pub(crate) async fn upload_note_image(
         &self,
         note_id: &str,
-        image_path: &Path,
+        file_name: &str,
+        image: tokio::fs::File,
+        size_bytes: u64,
     ) -> Result<ImageUploadResponse, HackmdError> {
         let segments = ["notes", note_id, "images"];
         let url = self.url_for_segments(&segments)?;
@@ -234,10 +233,11 @@ impl HackmdClient {
                 method: "POST".to_owned(),
                 path: path.clone(),
             })?;
-        let form = reqwest::multipart::Form::new()
-            .file("image", image_path)
-            .await
-            .map_err(|_| HackmdError::ImageRead)?;
+        let form = reqwest::multipart::Form::new().part(
+            "image",
+            reqwest::multipart::Part::stream_with_length(image, size_bytes)
+                .file_name(file_name.to_owned()),
+        );
         let response = self
             .http
             .post(url)
@@ -765,8 +765,6 @@ pub(crate) enum HackmdError {
     InvalidBaseUrl,
     #[error("HackMD API path segments such as note IDs and team paths must not be empty")]
     EmptyPathSegment,
-    #[error("image file could not be opened for upload")]
-    ImageRead,
     #[error(
         "POST {path}: HackMD rejected the image as too large (413); resize it below 5 MB and retry"
     )]

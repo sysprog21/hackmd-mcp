@@ -5,8 +5,13 @@
 //! server's concern, so the tools that read and write them are handed this
 //! context alongside the client.
 
-use std::path::{Component, Path, PathBuf};
+use std::{
+    fs,
+    io::{self, Read, Write},
+    path::{Component, Path, PathBuf},
+};
 
+use cap_std::{ambient_authority, fs::Dir};
 use thiserror::Error;
 
 use crate::sync::state::StateStore;
@@ -15,6 +20,21 @@ use crate::sync::state::StateStore;
 pub(crate) struct LocalFiles {
     state: StateStore,
     root: Option<PathBuf>,
+}
+
+pub(crate) struct LocalMetadata {
+    is_file: bool,
+    is_dir: bool,
+}
+
+impl LocalMetadata {
+    pub(crate) const fn is_file(&self) -> bool {
+        self.is_file
+    }
+
+    pub(crate) const fn is_dir(&self) -> bool {
+        self.is_dir
+    }
 }
 
 #[derive(Debug, Error)]
@@ -29,6 +49,8 @@ pub(crate) enum LocalAccessError {
     OutsideRoot { path: PathBuf, root: PathBuf },
     #[error("HACKMD_MCP_WORKSPACE_ROOT ({}) does not exist", root.display())]
     MissingRoot { root: PathBuf },
+    #[error("local file operation failed")]
+    Io(#[from] io::Error),
 }
 
 impl LocalFiles {
@@ -74,6 +96,144 @@ impl LocalFiles {
                 root,
             })
         }
+    }
+
+    pub(crate) fn metadata(&self, path: &Path) -> Result<LocalMetadata, LocalAccessError> {
+        let Some((dir, relative)) = self.confined(path)? else {
+            let metadata = fs::metadata(path)?;
+            return Ok(LocalMetadata {
+                is_file: metadata.is_file(),
+                is_dir: metadata.is_dir(),
+            });
+        };
+        let metadata = dir.metadata(relative)?;
+        Ok(LocalMetadata {
+            is_file: metadata.is_file(),
+            is_dir: metadata.is_dir(),
+        })
+    }
+
+    pub(crate) fn read(&self, path: &Path) -> Result<Vec<u8>, LocalAccessError> {
+        let Some((dir, relative)) = self.confined(path)? else {
+            return Ok(fs::read(path)?);
+        };
+        let mut bytes = Vec::new();
+        dir.open(relative)?.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn open_read(&self, path: &Path) -> Result<fs::File, LocalAccessError> {
+        let Some((dir, relative)) = self.confined(path)? else {
+            return Ok(fs::File::open(path)?);
+        };
+        Ok(dir.open(relative)?.into_std())
+    }
+
+    pub(crate) fn read_to_string(&self, path: &Path) -> Result<String, LocalAccessError> {
+        String::from_utf8(self.read(path)?).map_err(|error| {
+            LocalAccessError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
+        })
+    }
+
+    pub(crate) fn exists(&self, path: &Path) -> Result<bool, LocalAccessError> {
+        match self.metadata(path) {
+            Ok(_) => Ok(true),
+            Err(LocalAccessError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Atomically replaces a confined file through a directory capability.
+    /// Every pathname lookup from the root through the final rename stays
+    /// beneath the opened root even if another process swaps symlinks.
+    pub(crate) fn write_atomic(
+        &self,
+        path: &Path,
+        contents: &[u8],
+        create_parent_dirs: bool,
+    ) -> Result<(), LocalAccessError> {
+        let Some((dir, relative)) = self.confined(path)? else {
+            if create_parent_dirs {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+            return crate::sync::state::write_local_atomic(path, contents)
+                .map_err(|error| LocalAccessError::Io(io::Error::other(error)));
+        };
+        let parent = relative.parent().ok_or_else(|| {
+            LocalAccessError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing parent",
+            ))
+        })?;
+        if create_parent_dirs {
+            dir.create_dir_all(parent)?;
+        }
+        let file_name = relative.file_name().ok_or_else(|| {
+            LocalAccessError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing filename",
+            ))
+        })?;
+        let existing_permissions = dir
+            .metadata(&relative)
+            .ok()
+            .map(|metadata| metadata.permissions());
+        for _ in 0..16 {
+            let temporary = parent.join(format!(
+                ".{}.hackmd-mcp-{:016x}.tmp",
+                file_name.to_string_lossy(),
+                fastrand::u64(..)
+            ));
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            let Ok(mut file) = dir.open_with(&temporary, &options) else {
+                continue;
+            };
+            let result = (|| {
+                if let Some(permissions) = existing_permissions.clone() {
+                    file.set_permissions(permissions)?;
+                }
+                file.write_all(contents)?;
+                file.sync_all()?;
+                dir.rename(&temporary, &dir, &relative)
+            })();
+            if let Err(error) = result {
+                let _ = dir.remove_file(&temporary);
+                return Err(LocalAccessError::Io(error));
+            }
+            return Ok(());
+        }
+        Err(LocalAccessError::Io(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate an atomic temporary file",
+        )))
+    }
+
+    fn confined(&self, path: &Path) -> Result<Option<(Dir, PathBuf)>, LocalAccessError> {
+        let Some(root) = self.root.as_ref() else {
+            return Ok(None);
+        };
+        if path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(LocalAccessError::Traversal {
+                path: path.to_path_buf(),
+            });
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| LocalAccessError::OutsideRoot {
+                path: path.to_path_buf(),
+                root: root.clone(),
+            })?;
+        let dir = Dir::open_ambient_dir(root, ambient_authority())
+            .map_err(|_| LocalAccessError::MissingRoot { root: root.clone() })?;
+        Ok(Some((dir, relative.to_path_buf())))
     }
 }
 
@@ -138,6 +298,68 @@ mod tests {
             files.allow(&root.join("link.md")),
             Err(LocalAccessError::OutsideRoot { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swapping_a_symlink_cannot_escape_capability_reads_or_writes() {
+        use std::{
+            os::unix::fs::symlink,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+            thread,
+        };
+
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let root = directory.path().join("notes");
+        let inside = root.join("inside");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&inside).expect("inside directory should create");
+        fs::create_dir_all(&outside).expect("outside directory should create");
+        fs::write(inside.join("note.md"), "inside").expect("inside fixture should write");
+        fs::write(outside.join("note.md"), "outside-secret").expect("outside fixture should write");
+
+        let link = root.join("link");
+        symlink(&inside, &link).expect("initial symlink should create");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_link = link.clone();
+        let worker_inside = inside.clone();
+        let worker_outside = outside.clone();
+        let worker = thread::spawn(move || {
+            let mut outside_next = true;
+            while !worker_stop.load(Ordering::Relaxed) {
+                let replacement = worker_link.with_extension("replacement");
+                let _ = fs::remove_file(&replacement);
+                let target = if outside_next {
+                    &worker_outside
+                } else {
+                    &worker_inside
+                };
+                if symlink(target, &replacement).is_ok() {
+                    let _ = fs::rename(&replacement, &worker_link);
+                }
+                outside_next = !outside_next;
+            }
+        });
+
+        let files = LocalFiles::new(directory.path().join("state"), Some(root));
+        for _ in 0..500 {
+            if let Ok(contents) = files.read_to_string(&link.join("note.md")) {
+                assert_eq!(contents, "inside");
+            }
+            let _ = files.write_atomic(&link.join("written.md"), b"confined", false);
+        }
+        stop.store(true, Ordering::Relaxed);
+        worker.join().expect("symlink swapper should stop");
+
+        assert_eq!(
+            fs::read_to_string(outside.join("note.md")).expect("outside fixture should remain"),
+            "outside-secret"
+        );
+        assert!(!outside.join("written.md").exists());
     }
 
     #[test]

@@ -1,7 +1,6 @@
 use std::{
-    fs::File,
-    io::Read,
-    path::{Path, PathBuf},
+    io::{Read, Seek, SeekFrom},
+    path::PathBuf,
 };
 
 use rmcp::schemars;
@@ -72,14 +71,7 @@ pub(crate) enum UploadNoteImageError {
 /// The tool hands a local file to a remote CDN that answers with a public link,
 /// so the file has to be what the caller says it is. Without this, one confused
 /// or coerced tool call publishes a private key as readily as a screenshot.
-fn ensure_supported_image(path: &Path) -> Result<(), UploadNoteImageError> {
-    let mut header = Vec::with_capacity(12);
-    File::open(path)
-        .map_err(|_| UploadNoteImageError::InvalidFile)?
-        .take(12)
-        .read_to_end(&mut header)
-        .map_err(|_| UploadNoteImageError::InvalidFile)?;
-
+fn ensure_supported_image(header: &[u8]) -> Result<(), UploadNoteImageError> {
     let supported = header.starts_with(b"\x89PNG\r\n\x1a\n")
         || header.starts_with(b"\xff\xd8\xff")
         || header.starts_with(b"GIF87a")
@@ -99,8 +91,12 @@ pub(crate) async fn upload_note_image(
         return Err(UploadNoteImageError::RelativePath);
     }
     files.allow(&input.image_path)?;
-    let metadata =
-        std::fs::metadata(&input.image_path).map_err(|_| UploadNoteImageError::InvalidFile)?;
+    let mut image = files
+        .open_read(&input.image_path)
+        .map_err(|_| UploadNoteImageError::InvalidFile)?;
+    let metadata = image
+        .metadata()
+        .map_err(|_| UploadNoteImageError::InvalidFile)?;
     if !metadata.is_file() {
         return Err(UploadNoteImageError::InvalidFile);
     }
@@ -111,7 +107,14 @@ pub(crate) async fn upload_note_image(
     if size_bytes > IMAGE_WARNING_BYTES && !input.confirm_large_file {
         return Err(UploadNoteImageError::ConfirmationRequired { size_bytes });
     }
-    ensure_supported_image(&input.image_path)?;
+    let mut header = [0_u8; 12];
+    let header_len = image
+        .read(&mut header)
+        .map_err(|_| UploadNoteImageError::InvalidFile)?;
+    ensure_supported_image(&header[..header_len])?;
+    image
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| UploadNoteImageError::InvalidFile)?;
     let resolution = crate::note::reference::resolve_note_ref(
         client,
         input.workspace,
@@ -125,8 +128,18 @@ pub(crate) async fn upload_note_image(
     if matches!(note.workspace, Workspace::Team { .. }) {
         return Err(UploadNoteImageError::TeamUnsupported);
     }
+    let file_name = input
+        .image_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image");
     let response = client
-        .upload_note_image(&note.note_id, &input.image_path)
+        .upload_note_image(
+            &note.note_id,
+            file_name,
+            tokio::fs::File::from_std(image),
+            size_bytes,
+        )
         .await?;
     Ok(Ok(UploadNoteImageOutput {
         link: response.data.link,

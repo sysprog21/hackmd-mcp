@@ -1,7 +1,4 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -116,7 +113,7 @@ pub(crate) async fn push_note(
         return Err(PushNoteError::RelativePath);
     }
     files.allow(&input.local_path)?;
-    let local = validate_and_read_local(&input)?;
+    let local = validate_and_read_local(files, &input)?;
     let tracked = files.state().load_for_local_path(&input.local_path)?;
     let resolution = crate::note::reference::resolve_note_ref(
         client,
@@ -144,15 +141,22 @@ pub(crate) async fn push_note(
     .await
 }
 
-fn validate_and_read_local(input: &PushNoteInput) -> Result<String, PushNoteError> {
+fn validate_and_read_local(
+    files: &LocalFiles,
+    input: &PushNoteInput,
+) -> Result<String, PushNoteError> {
     if matches!(input.strategy, PushStrategy::Overwrite) && !input.confirm {
         return Err(PushNoteError::OverwriteConfirmationRequired);
     }
-    let metadata = fs::metadata(&input.local_path).map_err(|_| PushNoteError::InvalidLocalFile)?;
+    let metadata = files
+        .metadata(&input.local_path)
+        .map_err(|_| PushNoteError::InvalidLocalFile)?;
     if !metadata.is_file() {
         return Err(PushNoteError::InvalidLocalFile);
     }
-    let local = fs::read_to_string(&input.local_path).map_err(PushNoteError::LocalIo)?;
+    let local = files
+        .read_to_string(&input.local_path)
+        .map_err(|error| PushNoteError::LocalIo(std::io::Error::other(error)))?;
     validate_body_size(local.len(), input.confirm_large_file)?;
     Ok(local)
 }

@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::{
     client::{HackmdClient, HackmdError},
     local::{LocalAccessError, LocalFiles},
-    sync::state::{StateError, write_local_atomic},
+    sync::state::StateError,
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -57,7 +57,7 @@ pub(crate) async fn save_remote_snapshot(
     // input, so it goes through the same policy before anything is created.
     let snapshot_path = tracked.state.local_path.with_extension("remote.md");
     files.allow(&snapshot_path)?;
-    if snapshot_path.exists() && !input.overwrite_snapshot {
+    if files.exists(&snapshot_path)? && !input.overwrite_snapshot {
         return Err(SaveRemoteSnapshotError::SnapshotExists);
     }
     let remote = client
@@ -67,7 +67,7 @@ pub(crate) async fn save_remote_snapshot(
         .ok_or_else(|| SaveRemoteSnapshotError::MissingRemoteContent {
             note_id: tracked.state.internal_id.clone(),
         })?;
-    write_local_atomic(&snapshot_path, remote.as_bytes())?;
+    files.write_atomic(&snapshot_path, remote.as_bytes(), false)?;
     Ok(SaveRemoteSnapshotOutput {
         note_id: tracked.state.internal_id,
         local_path: tracked.state.local_path,

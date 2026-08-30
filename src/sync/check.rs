@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -62,7 +62,9 @@ pub(crate) async fn check_note_sync(
         return Err(CheckNoteSyncError::RelativePath);
     }
     files.allow(&input.local_path)?;
-    let local = fs::read_to_string(&input.local_path).map_err(|_| CheckNoteSyncError::LocalRead)?;
+    let local = files
+        .read_to_string(&input.local_path)
+        .map_err(|_| CheckNoteSyncError::LocalRead)?;
     let tracked = files.state().load_for_local_path(&input.local_path)?;
     let remote_note = client
         .get_note(&tracked.state.workspace, &tracked.state.internal_id)

@@ -16,6 +16,7 @@ otel = [
 ]
 
 [dependencies]
+cap-std = "4"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
 fastrand = "2"
@@ -31,7 +32,7 @@ sha2 = "0.10"
 similar = "2"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "time"] }
 tracing = "0.1"
 tracing-opentelemetry = { version = "0.33", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

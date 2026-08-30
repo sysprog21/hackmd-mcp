@@ -171,6 +171,12 @@
 
 ## P2.5 — local Markdown sync
 
+- [x] Enforce `HACKMD_MCP_WORKSPACE_ROOT` with capability-relative file opens,
+  metadata, reads, directory creation, atomic renames, and streaming image
+  uploads. Pull, push, check, snapshot, and image tools no longer validate a
+  pathname and reopen it through ambient authority; an adversarial Unix test
+  swaps inside/outside symlinks during repeated reads and writes and proves the
+  outside tree is never accessed. Reject relative configured roots at startup.
 - [x] Add paginated `hackmd_list_tracked_notes` for discovering private sync
   records without reading working files or contacting HackMD. Add confirmed,
   local-only `hackmd_untrack_note` keyed by workspace and internal note ID; it

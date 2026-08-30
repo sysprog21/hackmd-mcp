@@ -1,7 +1,4 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -12,7 +9,7 @@ use crate::{
     local::{LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
-    sync::state::{StateError, TrackedNoteState, write_local_atomic},
+    sync::state::{StateError, TrackedNoteState},
     sync::{BODY_MAX_BYTES, BODY_WARNING_BYTES},
 };
 
@@ -69,8 +66,6 @@ pub(crate) enum PullNoteError {
         BODY_MAX_BYTES / 1024 / 1024
     )]
     TooLarge { size_bytes: usize },
-    #[error("local path validation failed")]
-    PathIo(#[source] std::io::Error),
     #[error(transparent)]
     Reference(#[from] NoteRefError),
     #[error(transparent)]
@@ -88,8 +83,7 @@ pub(crate) async fn pull_note(
         return Err(PullNoteError::RelativePath);
     }
     files.allow(&input.local_path)?;
-    let destination = validate_destination(&input)?;
-    let allow_existing_destination = destination.exists() && input.overwrite_local;
+    let destination = validate_destination(files, &input)?;
     let resolution = crate::note::reference::resolve_note_ref(
         client,
         input.workspace,
@@ -108,12 +102,7 @@ pub(crate) async fn pull_note(
         })?;
     let size_bytes = body.len();
     validate_body_size(size_bytes, input.confirm_large_file)?;
-    let destination = prepare_destination(
-        &destination,
-        input.create_parent_dirs,
-        allow_existing_destination,
-    )?;
-    write_local_atomic(&destination, body.as_bytes())?;
+    files.write_atomic(&destination, body.as_bytes(), input.create_parent_dirs)?;
     let state = TrackedNoteState::capture(
         note.note_id.clone(),
         note.workspace.clone(),
@@ -141,9 +130,12 @@ fn validate_body_size(size_bytes: usize, confirmed: bool) -> Result<(), PullNote
     Ok(())
 }
 
-fn validate_destination(input: &PullNoteInput) -> Result<PathBuf, PullNoteError> {
-    if input.local_path.exists() {
-        let metadata = fs::metadata(&input.local_path).map_err(PullNoteError::PathIo)?;
+fn validate_destination(
+    files: &LocalFiles,
+    input: &PullNoteInput,
+) -> Result<PathBuf, PullNoteError> {
+    if files.exists(&input.local_path)? {
+        let metadata = files.metadata(&input.local_path)?;
         if metadata.is_dir() {
             return Err(PullNoteError::DestinationDirectory);
         }
@@ -153,51 +145,22 @@ fn validate_destination(input: &PullNoteInput) -> Result<PathBuf, PullNoteError>
             }
             return Err(PullNoteError::DestinationExists);
         }
-        return fs::canonicalize(&input.local_path).map_err(PullNoteError::PathIo);
+        return Ok(input.local_path.clone());
     }
     let parent = input
         .local_path
         .parent()
         .ok_or(PullNoteError::InvalidParent)?;
-    if !parent.exists() {
+    if !files.exists(parent)? {
         if !input.create_parent_dirs {
             return Err(PullNoteError::MissingParent);
         }
         return Ok(input.local_path.clone());
     }
-    if !parent.is_dir() {
+    if !files.metadata(parent)?.is_dir() {
         return Err(PullNoteError::InvalidParent);
     }
-    let canonical_parent = fs::canonicalize(parent).map_err(PullNoteError::PathIo)?;
-    let name = input
-        .local_path
-        .file_name()
-        .ok_or(PullNoteError::InvalidParent)?;
-    Ok(canonical_parent.join(name))
-}
-
-fn prepare_destination(
-    path: &Path,
-    create_parent_dirs: bool,
-    allow_existing: bool,
-) -> Result<PathBuf, PullNoteError> {
-    if path.exists() {
-        return if allow_existing {
-            Ok(path.to_path_buf())
-        } else {
-            Err(PullNoteError::DestinationExists)
-        };
-    }
-    let parent = path.parent().ok_or(PullNoteError::InvalidParent)?;
-    if !parent.exists() {
-        if !create_parent_dirs {
-            return Err(PullNoteError::MissingParent);
-        }
-        fs::create_dir_all(parent).map_err(PullNoteError::PathIo)?;
-    }
-    let canonical_parent = fs::canonicalize(parent).map_err(PullNoteError::PathIo)?;
-    let name = path.file_name().ok_or(PullNoteError::InvalidParent)?;
-    Ok(canonical_parent.join(name))
+    Ok(input.local_path.clone())
 }
 
 fn is_markdown(path: &Path) -> bool {

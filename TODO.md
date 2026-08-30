@@ -191,14 +191,6 @@ test (see P3) for each and record the answer here.
 ## P2 — complete daily HackMD workflow
 
 ## P2.5 — local Markdown sync
-
-- [ ] Close the check-then-open race in `HACKMD_MCP_WORKSPACE_ROOT`
-  confinement. `LocalFiles::allow` rejects an escaping symlink at validation
-  time, but each tool later opens the pathname separately, so another process
-  can swap an ancestor for a symlink between those operations. Introduce one
-  confined open/create abstraction (platform-specific where necessary), route
-  pull, push, snapshot, and image upload through it, and add an adversarial
-  symlink-swap test on Unix.
 - [ ] Make tracked-state recovery isolate corruption. A malformed by-path hint
   or the sidecar it names currently returns a JSON/I/O error instead of falling
   back to the verified sidecar scan, and one malformed unrelated sidecar can

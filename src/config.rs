@@ -82,6 +82,12 @@ impl Config {
         let workspace_root = get("HACKMD_MCP_WORKSPACE_ROOT")
             .filter(|path| !path.trim().is_empty())
             .map(PathBuf::from);
+        if workspace_root
+            .as_ref()
+            .is_some_and(|root| !root.is_absolute())
+        {
+            return Err(ConfigError::RelativeWorkspaceRoot);
+        }
 
         let api_url = Url::parse(&api_url).map_err(ConfigError::InvalidApiUrl)?;
         validate_api_url(&api_url, policy)?;
@@ -356,6 +362,8 @@ pub(crate) enum ConfigError {
     InsecureApiUrl,
     #[error("platform state directory is unavailable; set HACKMD_MCP_STATE_DIR")]
     StateDirectoryUnavailable,
+    #[error("HACKMD_MCP_WORKSPACE_ROOT must be an absolute path")]
+    RelativeWorkspaceRoot,
     #[error(
         "the working-directory .env sets HACKMD_API_URL while HACKMD_API_TOKEN comes from the environment, which would send that token to the endpoint the file names; set HACKMD_API_URL in the environment too, or unset HACKMD_API_TOKEN so the .env values apply as one pair"
     )]
@@ -418,6 +426,16 @@ mod tests {
             .expect("an empty state override should use the safe default");
 
         assert!(config.state_dir.ends_with("hackmd-mcp"));
+    }
+
+    #[test]
+    fn workspace_root_must_be_absolute() {
+        let error = config_from(&[("HACKMD_MCP_WORKSPACE_ROOT", "relative/notes")])
+            .expect_err("relative workspace root should be rejected");
+        assert_eq!(
+            error.to_string(),
+            "HACKMD_MCP_WORKSPACE_ROOT must be an absolute path"
+        );
     }
 
     #[test]
