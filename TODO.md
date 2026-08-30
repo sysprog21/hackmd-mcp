@@ -222,10 +222,10 @@ dependency, or background task without a bound and an invalidation rule.
 
 ### P2 — consolidate test coverage
 
-- [ ] Migrate HTTP tests to `Scenario` in three reviewable batches: first
-  `client` request/retry/cache tests, then note/folder handlers, then sync/server
-  workflows. In each batch, encode method/path and meaningful auth/content/body
-  expectations in the declaration instead of inspecting raw requests afterward.
+- [ ] Finish migrating HTTP tests to `Scenario` in two reviewable batches:
+  note/folder handlers, then sync/server workflows. In each batch, encode
+  method/path and meaningful auth/content/body expectations in the declaration
+  instead of inspecting raw requests afterward.
   Once `rg 'SequenceServer::spawn(_with_headers|_delayed)?' src` has no ordinary
   response-only call sites, remove the tuple constructors and
   `assert_request_sequence`; retain explicit repeating/disconnect helpers only

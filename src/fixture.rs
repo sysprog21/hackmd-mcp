@@ -178,16 +178,6 @@ impl SequenceServer {
         Self::spawn_with_headers(responses.map(|(status, body)| (status, body, EMPTY_HEADERS)))
     }
 
-    /// Replays one response after `delay`, for tests that need the client to be
-    /// waiting when something else happens.
-    pub(crate) fn spawn_delayed(status: u16, body: &str, delay: Duration) -> Self {
-        Self::spawn_with_mode(
-            vec![fixture_response(status, body, EMPTY_HEADERS, delay)],
-            false,
-            None,
-        )
-    }
-
     /// Accepts one complete request and closes the connection without a
     /// response, producing a deterministic transport error without releasing a
     /// port that another parallel fixture could claim.

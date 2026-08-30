@@ -2,6 +2,12 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Migrate the client request, retry, and list-cache HTTP tests to declarative
+  `Scenario` steps. Routes, encoded segments, selected authorization and content
+  headers, request bodies, retry sequences, response headers, and delays are now
+  checked centrally; raw request-string assertions and the superseded delayed
+  tuple helper were removed. Focused client tests and strict Clippy pass.
+
 - [x] Bound the only active cache by both 32 workspaces and 8 MiB of estimated
   retained allocation. Accounting includes the note slice, every `String`/`Vec`
   capacity, nested user/folder metadata, workspace keys, and unexpected content

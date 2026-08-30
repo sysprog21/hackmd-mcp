@@ -1247,7 +1247,7 @@ mod tests {
     }
     use crate::{
         dto::{CreateNoteRequest, UpdateNoteRequest},
-        fixture::{FIXTURE_TOKEN, SequenceServer},
+        fixture::{FIXTURE_TOKEN, Scenario, SequenceServer},
         models::Workspace,
     };
 
@@ -1255,7 +1255,13 @@ mod tests {
     async fn a_fresh_note_list_is_reused_until_a_write_invalidates_it() {
         // Two list responses for three list calls: the second call is served
         // from cache, and only the write in between forces another fetch.
-        let server = SequenceServer::spawn([(200, NOTES), (202, ""), (200, NOTES)]);
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/notes", 200, NOTES),
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, "")
+                .expect_header("content-type", "application/json")
+                .expect_body("the renamed title", |body| body == r#"{"title":"Renamed"}"#),
+            Scenario::new("GET", "/v1/notes", 200, NOTES),
+        ]);
         let client = server.client_with_cache();
 
         let first = client
@@ -1284,17 +1290,16 @@ mod tests {
             .await
             .expect("list after a write should fetch again");
 
-        let requests = server.finish();
-        assert_eq!(requests.len(), 3);
-        assert!(requests[0].starts_with("GET /v1/notes HTTP/1.1\r\n"));
-        assert!(requests[1].starts_with("PATCH /v1/notes/note-id HTTP/1.1\r\n"));
-        assert!(requests[2].starts_with("GET /v1/notes HTTP/1.1\r\n"));
+        server.finish();
     }
 
     #[tokio::test]
     async fn refresh_bypasses_and_replaces_a_cached_note_list() {
         const RENAMED: &str = r#"[{"id":"note-id","title":"Renamed"}]"#;
-        let server = SequenceServer::spawn([(200, NOTES), (200, RENAMED)]);
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/notes", 200, NOTES),
+            Scenario::new("GET", "/v1/notes", 200, RENAMED),
+        ]);
         let client = server.client_with_cache();
 
         let original = client
@@ -1313,13 +1318,15 @@ mod tests {
         assert_eq!(original[0].title, "Note");
         assert_eq!(refreshed[0].title, "Renamed");
         assert_eq!(cached, refreshed);
-        assert_eq!(server.finish().len(), 2);
+        server.finish();
     }
 
     #[tokio::test]
     async fn concurrent_workspace_misses_share_one_list_request() {
         let server =
-            crate::fixture::SequenceServer::spawn_delayed(200, NOTES, Duration::from_millis(100));
+            SequenceServer::spawn_scenarios([
+                Scenario::new("GET", "/v1/notes", 200, NOTES).delay(Duration::from_millis(100))
+            ]);
         let client = Arc::new(server.client_with_cache());
 
         let (first, second) = tokio::join!(
@@ -1329,7 +1336,7 @@ mod tests {
 
         assert_eq!(first.expect("first list should succeed").len(), 1);
         assert_eq!(second.expect("second list should succeed").len(), 1);
-        assert_eq!(server.finish().len(), 1);
+        server.finish();
     }
 
     #[test]
@@ -1546,8 +1553,11 @@ mod tests {
     async fn a_write_that_fails_still_drops_the_cached_list() {
         // HackMD applies writes asynchronously, so a PATCH that answers with an
         // error may still have landed. The cache has to go either way.
-        let server =
-            SequenceServer::spawn([(200, NOTES), (400, r#"{"error":"nope"}"#), (200, NOTES)]);
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/notes", 200, NOTES),
+            Scenario::new("PATCH", "/v1/notes/note-id", 400, r#"{"error":"nope"}"#),
+            Scenario::new("GET", "/v1/notes", 200, NOTES),
+        ]);
         let client = server.client_with_cache();
 
         client
@@ -1570,12 +1580,15 @@ mod tests {
             .await
             .expect("list after a failed write should fetch again");
 
-        assert_eq!(server.finish().len(), 3);
+        server.finish();
     }
 
     #[tokio::test]
     async fn team_and_personal_lists_do_not_share_a_cache_entry() {
-        let server = SequenceServer::spawn([(200, NOTES), (200, NOTES)]);
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/notes", 200, NOTES),
+            Scenario::new("GET", "/v1/teams/core/notes", 200, NOTES),
+        ]);
         let client = server.client_with_cache();
 
         client
@@ -1592,15 +1605,19 @@ mod tests {
             .await
             .expect("team list should fetch separately");
 
-        let requests = server.finish();
-        assert!(requests[0].starts_with("GET /v1/notes HTTP/1.1\r\n"));
-        assert!(requests[1].starts_with("GET /v1/teams/core/notes HTTP/1.1\r\n"));
+        server.finish();
     }
 
     #[tokio::test]
     async fn encodes_each_path_segment_and_attaches_bearer_auth() {
         const TOKEN: &str = "fixture-bearer-token";
-        let server = SequenceServer::spawn([(200, r#"{"id":"ok"}"#)]);
+        let server = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/teams/team%2Fpath/notes/note%20%3F%23",
+            200,
+            r#"{"id":"ok"}"#,
+        )
+        .expect_header("authorization", "Bearer fixture-bearer-token")]);
         let client = server.client_with_token(TOKEN);
         assert!(!format!("{client:?}").contains(TOKEN));
 
@@ -1614,18 +1631,19 @@ mod tests {
             .expect("fixture request should succeed")
             .expect("JSON response should be present");
         assert_eq!(response, json!({"id": "ok"}));
-        let request = server.finish_one();
-        assert!(request.starts_with("GET /v1/teams/team%2Fpath/notes/note%20%3F%23 HTTP/1.1\r\n"));
-        assert!(
-            request
-                .to_ascii_lowercase()
-                .contains("authorization: bearer fixture-bearer-token\r\n")
-        );
+        server.finish();
     }
 
     #[tokio::test]
     async fn sends_json_payload_and_parses_response_once() {
-        let server = SequenceServer::spawn([(200, r#"{"saved":true}"#)]);
+        let server = SequenceServer::spawn_scenarios([Scenario::new(
+            "PATCH",
+            "/v1/notes/id",
+            200,
+            r#"{"saved":true}"#,
+        )
+        .expect_header("content-type", "application/json")
+        .expect_body("the title JSON", |body| body == r#"{"title":"hello"}"#)]);
         let client = server.client();
         let payload = json!({"title": "hello"});
 
@@ -1634,14 +1652,14 @@ mod tests {
             .await
             .expect("fixture request should succeed");
         assert_eq!(response, Some(json!({"saved": true})));
-        let request = server.finish_one();
-        assert!(request.starts_with("PATCH /v1/notes/id HTTP/1.1\r\n"));
-        assert!(request.ends_with(r#"{"title":"hello"}"#));
+        server.finish();
     }
 
     #[tokio::test]
     async fn omitted_optional_fields_remain_omitted_on_the_wire() {
-        let server = SequenceServer::spawn([(204, "")]);
+        let server = SequenceServer::spawn_scenarios([Scenario::new("POST", "/v1/notes", 204, "")
+            .expect_header("content-type", "application/json")
+            .expect_body("an empty JSON object", |body| body == "{}")]);
         let client = server.client();
         let payload = serde_json::to_value(CreateNoteRequest::default())
             .expect("typed payload should serialize");
@@ -1651,18 +1669,18 @@ mod tests {
             .await
             .expect("fixture request should succeed");
         assert_eq!(response, None);
-        let request = server.finish_one();
-        assert!(request.starts_with("POST /v1/notes HTTP/1.1\r\n"));
-        assert!(request.ends_with("{}"));
-        assert!(!request.contains("readPermission"));
-        assert!(!request.contains("writePermission"));
-        assert!(!request.contains("commentPermission"));
+        server.finish();
     }
 
     #[tokio::test]
     async fn accepts_empty_202_and_204_responses() {
         for status in [202, 204] {
-            let server = SequenceServer::spawn([(status, "")]);
+            let server = SequenceServer::spawn_scenarios([Scenario::new(
+                "PATCH",
+                "/v1/notes/id",
+                status,
+                "",
+            )]);
             let client = server.client_without_retry(FIXTURE_TOKEN);
             let response = client
                 .request_json::<Value>(Method::PATCH, &["notes", "id"], NO_BODY)
@@ -1676,7 +1694,14 @@ mod tests {
     #[tokio::test]
     async fn typed_crud_operations_use_workspace_routes_and_payloads() {
         let created = r#"{"id":"new-id","title":"New"}"#;
-        let create_server = SequenceServer::spawn([(201, created)]);
+        let create_server = SequenceServer::spawn_scenarios([Scenario::new(
+            "POST",
+            "/v1/teams/team%2Fpath/notes",
+            201,
+            created,
+        )
+        .expect_header("content-type", "application/json")
+        .expect_body("the new title", |body| body == r#"{"title":"New"}"#)]);
         let create_client = create_server.client();
         let note = create_client
             .create_note(
@@ -1691,11 +1716,18 @@ mod tests {
             .await
             .expect("team note should be created");
         assert_eq!(note.id, "new-id");
-        let request = create_server.finish_one();
-        assert!(request.starts_with("POST /v1/teams/team%2Fpath/notes HTTP/1.1\r\n"));
-        assert!(request.ends_with(r#"{"title":"New"}"#));
+        create_server.finish();
 
-        let update_server = SequenceServer::spawn([(202, "")]);
+        let update_server = SequenceServer::spawn_scenarios([Scenario::new(
+            "PATCH",
+            "/v1/notes/note%2Fid",
+            202,
+            "",
+        )
+        .expect_header("content-type", "application/json")
+        .expect_body("the cleared parent folder", |body| {
+            body == r#"{"parentFolderId":null}"#
+        })]);
         let update_client = update_server.client();
         let response = update_client
             .update_note(
@@ -1709,11 +1741,14 @@ mod tests {
             .await
             .expect("personal note update should be accepted");
         assert_eq!(response, None);
-        let request = update_server.finish_one();
-        assert!(request.starts_with("PATCH /v1/notes/note%2Fid HTTP/1.1\r\n"));
-        assert!(request.ends_with(r#"{"parentFolderId":null}"#));
+        update_server.finish();
 
-        let delete_server = SequenceServer::spawn([(204, "")]);
+        let delete_server = SequenceServer::spawn_scenarios([Scenario::new(
+            "DELETE",
+            "/v1/teams/team/notes/note-id",
+            204,
+            "",
+        )]);
         let delete_client = delete_server.client();
         let response = delete_client
             .delete_note(
@@ -1725,11 +1760,7 @@ mod tests {
             .await
             .expect("team note should be deleted");
         assert_eq!(response, None);
-        assert!(
-            delete_server
-                .finish_one()
-                .starts_with("DELETE /v1/teams/team/notes/note-id HTTP/1.1\r\n")
-        );
+        delete_server.finish();
     }
 
     #[tokio::test]
@@ -1743,7 +1774,12 @@ mod tests {
             (500, "upstream HackMD error (500 Internal Server Error)"),
         ];
         for (status, expected) in cases {
-            let server = SequenceServer::spawn([(status, r#"{"error":"fixture"}"#)]);
+            let server = SequenceServer::spawn_scenarios([Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                status,
+                r#"{"error":"fixture"}"#,
+            )]);
             let client = server.client_without_retry(FIXTURE_TOKEN);
             let error = client
                 .request_json::<Value>(Method::GET, &["notes", "id"], NO_BODY)
@@ -1763,10 +1799,9 @@ mod tests {
             ("x-ratelimit-userremaining", "0"),
             ("x-ratelimit-userreset", "42"),
         ];
-        let server = crate::fixture::SequenceServer::spawn_with_headers([(
-            429,
-            r#"{"error":"slow down"}"#,
-            HEADERS,
+        let server = SequenceServer::spawn_scenarios([HEADERS.iter().fold(
+            Scenario::new("GET", "/v1/notes", 429, r#"{"error":"slow down"}"#),
+            |scenario, (name, value)| scenario.response_header(name, value),
         )]);
         let client = HackmdClient::new(Config::for_loopback_test_no_retry(
             &server.api_url,
@@ -1788,7 +1823,8 @@ mod tests {
     async fn upstream_errors_keep_bounded_redacted_body_detail() {
         const TOKEN: &str = "upstream-sensitive-token";
         let body = format!(r#"{{"error":"failure for {TOKEN}"}}"#);
-        let server = SequenceServer::spawn([(503, &body)]);
+        let server =
+            SequenceServer::spawn_scenarios([Scenario::new("GET", "/v1/notes", 503, &body)]);
         let client = server.client_without_retry(TOKEN);
 
         let message = client
@@ -1805,7 +1841,8 @@ mod tests {
     async fn bounds_generic_errors_and_redacts_the_token() {
         const TOKEN: &str = "fixture-sensitive-token";
         let body = format!("{} {TOKEN} {}", "x".repeat(280), "x".repeat(400));
-        let server = SequenceServer::spawn([(400, &body)]);
+        let server =
+            SequenceServer::spawn_scenarios([Scenario::new("GET", "/v1/notes", 400, &body)]);
         let client = server.client_with_token(TOKEN);
 
         let message = client
@@ -1822,7 +1859,12 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_json_without_exposing_the_body() {
-        let server = SequenceServer::spawn([(200, "not-json-sensitive-content")]);
+        let server = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/me",
+            200,
+            "not-json-sensitive-content",
+        )]);
         let client = server.client();
 
         let message = client
@@ -1849,8 +1891,13 @@ mod tests {
         ));
         assert_eq!(disconnect.finish().len(), 1);
 
-        let server =
-            SequenceServer::spawn_delayed(200, r#"{"ok":true}"#, Duration::from_millis(100));
+        let server = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/me",
+            200,
+            r#"{"ok":true}"#,
+        )
+        .delay(Duration::from_millis(100))]);
         let timeout_config = Config::for_loopback_test_with_timeout(
             &server.api_url,
             "fixture-token",
@@ -1891,7 +1938,9 @@ mod tests {
 
     #[tokio::test]
     async fn typed_profile_and_team_operations_use_discovery_routes() {
-        let profile_server = SequenceServer::spawn([(
+        let profile_server = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/me",
             200,
             r#"{"id":"user-id","name":"Alice","email":"alice@example.test","userPath":"alice","photo":null,"teams":[]}"#,
         )]);
@@ -1901,13 +1950,11 @@ mod tests {
             .await
             .expect("profile should deserialize");
         assert_eq!(profile.user_path, "alice");
-        assert!(
-            profile_server
-                .finish_one()
-                .starts_with("GET /v1/me HTTP/1.1\r\n")
-        );
+        profile_server.finish();
 
-        let teams_server = SequenceServer::spawn([(
+        let teams_server = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/teams",
             200,
             r#"[{"id":"team-id","name":"Engineering","path":"engineering","description":null,"hardLimit":100,"visibility":"private"}]"#,
         )]);
@@ -1917,20 +1964,16 @@ mod tests {
             .await
             .expect("teams should deserialize");
         assert_eq!(teams[0].path, "engineering");
-        assert!(
-            teams_server
-                .finish_one()
-                .starts_with("GET /v1/teams HTTP/1.1\r\n")
-        );
+        teams_server.finish();
     }
 
     #[tokio::test]
     async fn retries_only_gets_and_explicitly_idempotent_patches() {
-        const RETRY_AFTER: &[(&str, &str)] = &[("Retry-After", "0")];
-        let get_server = crate::fixture::SequenceServer::spawn_with_headers([
-            (500, r#"{"error":"transient"}"#, &[]),
-            (429, r#"{"error":"rate"}"#, RETRY_AFTER),
-            (200, r#"{"ok":true}"#, &[]),
+        let get_server = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/retry", 500, r#"{"error":"transient"}"#),
+            Scenario::new("GET", "/v1/retry", 429, r#"{"error":"rate"}"#)
+                .response_header("Retry-After", "0"),
+            Scenario::new("GET", "/v1/retry", 200, r#"{"ok":true}"#),
         ]);
         let retry = crate::config::RetryConfig {
             max_retries: 3,
@@ -1949,10 +1992,20 @@ mod tests {
             .expect("GET should recover")
             .expect("GET should return JSON");
         assert_eq!(response, json!({"ok": true}));
-        assert_eq!(get_server.finish().len(), 3);
+        get_server.finish();
 
-        let patch_server =
-            crate::fixture::SequenceServer::spawn([(500, r#"{"error":"transient"}"#), (202, "")]);
+        let patch_server = SequenceServer::spawn_scenarios([
+            Scenario::new("PATCH", "/v1/notes/id", 500, r#"{"error":"transient"}"#)
+                .expect_header("content-type", "application/json")
+                .expect_body("the replacement title", |body| {
+                    body == r#"{"title":"same replacement"}"#
+                }),
+            Scenario::new("PATCH", "/v1/notes/id", 202, "")
+                .expect_header("content-type", "application/json")
+                .expect_body("the same replacement title", |body| {
+                    body == r#"{"title":"same replacement"}"#
+                }),
+        ]);
         let patch_client = HackmdClient::new(Config::for_loopback_test_with_retry(
             &patch_server.api_url,
             "fixture-token",
@@ -1967,16 +2020,16 @@ mod tests {
             )
             .await
             .expect("idempotent PATCH should recover");
-        let patch_requests = patch_server.finish();
-        assert_eq!(patch_requests.len(), 2);
-        assert!(
-            patch_requests
-                .iter()
-                .all(|request| request.ends_with(r#"{"title":"same replacement"}"#))
-        );
+        patch_server.finish();
 
-        let post_server =
-            crate::fixture::SequenceServer::spawn([(500, r#"{"error":"do not retry"}"#)]);
+        let post_server = SequenceServer::spawn_scenarios([Scenario::new(
+            "POST",
+            "/v1/notes",
+            500,
+            r#"{"error":"do not retry"}"#,
+        )
+        .expect_header("content-type", "application/json")
+        .expect_body("an empty JSON object", |body| body == "{}")]);
         let post_client = HackmdClient::new(Config::for_loopback_test_with_retry(
             &post_server.api_url,
             "fixture-token",
@@ -1989,7 +2042,7 @@ mod tests {
                 .await,
             Err(HackmdError::Upstream { .. })
         ));
-        assert_eq!(post_server.finish().len(), 1);
+        post_server.finish();
     }
 
     #[tokio::test]
