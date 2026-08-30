@@ -200,6 +200,7 @@ dependency, or background task without a bound and an invalidation rule.
   statuses into `DONE.md` with the date. Implement
   `If-None-Match` or `If-Modified-Since` only after a live `304` is demonstrated;
   otherwise record the cache as inapplicable and retain fresh body GETs.
+
 ### P1 — cached tracking and differential note operations
 
 - [ ] After the P0 live-header task demonstrates a usable remote validator, add
@@ -217,11 +218,17 @@ dependency, or background task without a bound and an invalidation rule.
 
 ### P2 — consolidate test coverage
 
-- [ ] Move cross-module workflow coverage to integration tests through the MCP
-  transport: resolve/get/edit, pull/check/push/conflict, folder placement, and
-  delete/restore. Unit tests should own parsers, validation boundaries, cache
-  races, state recovery, and pure sync classification; avoid asserting the same
-  behavior at three layers.
+- [ ] Add `tests/support/` helpers that start the real stdio binary, serve a
+  declarative loopback HTTP sequence, frame MCP initialize/tool calls, and
+  collect responses with a five-second deadline and panic-safe child cleanup.
+- [ ] Using that harness, cover resolve/get/edit, folder placement, and
+  delete/restore as MCP integration workflows. Then delete overlapping
+  cross-module server/unit assertions while retaining parser, validation, and
+  route-contract unit tests.
+- [ ] Add a stateful pull/check/push/conflict MCP integration workflow using one
+  temporary workspace and state directory. Assert file/sidecar transitions and
+  exact HTTP request budgets, then remove only equivalent orchestration-level
+  unit tests; retain pure classification and state-recovery tests.
 - [ ] Add a coverage report in CI and ratchet changed-line coverage after the
   initial baseline. Exclude generated macro code, but do not exclude error,
   recovery, cache-eviction, or platform-specific branches. Coverage tooling
@@ -240,6 +247,7 @@ dependency, or background task without a bound and an invalidation rule.
 - [ ] Add `cargo machete` (or an equivalent unused-direct-dependency check) to
   CI and run `cargo tree -d` on dependency updates. Keep RustSec auditing. Pin
   the CI tool version so a new lint cannot break `main` without review.
+
 ## Deliberately deferred
 
 - A bounded `hackmd_watch_note_sync` polling tool. A watch capped at 20 seconds
