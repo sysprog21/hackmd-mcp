@@ -202,12 +202,6 @@ test (see P3) for each and record the answer here.
   suite passes with `--test-threads=1`. Give each fixture an explicit readiness
   handshake and deterministic shutdown/request accounting, then stress the
   parallel suite rather than serializing CI.
-- [ ] Bound cache memory independently of TTL. Expired workspace entries are
-  retained until a write clears the whole map, so a long-lived process that
-  touches many team paths can grow the map indefinitely. Remove expired entries
-  opportunistically and impose a small maximum workspace count with a defined
-  eviction policy; expose hit, miss, fill, and eviction events through tracing
-  without note metadata.
 
 ## P4 — remote use
 

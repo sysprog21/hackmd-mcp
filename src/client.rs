@@ -529,8 +529,15 @@ async fn sleep_before_retry(
 /// cannot infer the payload type once the parameter is generic.
 const NO_BODY: Option<&Value> = None;
 
-/// One workspace's list, and when it was fetched.
-type CachedNotes = (tokio::time::Instant, Arc<[NoteResponse]>);
+const MAX_CACHED_WORKSPACES: usize = 32;
+
+/// One workspace's list, when it was fetched, and its LRU position.
+#[derive(Debug)]
+struct CachedNotes {
+    stored: tokio::time::Instant,
+    last_access: u64,
+    notes: Arc<[NoteResponse]>,
+}
 
 /// A short-lived copy of a workspace's note list.
 ///
@@ -547,6 +554,7 @@ struct NotesCache {
 #[derive(Debug, Default)]
 struct NotesCacheState {
     generation: u64,
+    access_clock: u64,
     entries: HashMap<Workspace, CachedNotes>,
     flights: HashMap<Workspace, Arc<CacheFlight>>,
 }
@@ -604,16 +612,36 @@ impl NotesCache {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if !bypass_cache && !self.ttl.is_zero() {
-            if let Some((stored, notes)) = state.entries.get(workspace) {
-                if stored.elapsed() < self.ttl {
-                    return CacheLookup::Hit(Arc::clone(notes));
+            state.access_clock = state.access_clock.wrapping_add(1);
+            let access = state.access_clock;
+            if let Some(cached) = state.entries.get_mut(workspace) {
+                if cached.stored.elapsed() < self.ttl {
+                    cached.last_access = access;
+                    tracing::debug!(cache_event = "hit", "HackMD note-list cache");
+                    return CacheLookup::Hit(Arc::clone(&cached.notes));
                 }
             }
-            state.entries.remove(workspace);
+            if state.entries.remove(workspace).is_some() {
+                tracing::debug!(
+                    cache_event = "eviction",
+                    reason = "expired",
+                    "HackMD note-list cache"
+                );
+            }
         }
         if let Some(flight) = state.flights.get(workspace) {
+            tracing::debug!(
+                cache_event = "miss",
+                coalesced = true,
+                "HackMD note-list cache"
+            );
             return CacheLookup::Wait(Arc::clone(flight));
         }
+        tracing::debug!(
+            cache_event = "miss",
+            coalesced = false,
+            "HackMD note-list cache"
+        );
         let generation = state.generation;
         let flight = Arc::new(CacheFlight::new());
         state.flights.insert(workspace.clone(), Arc::clone(&flight));
@@ -642,10 +670,48 @@ impl NotesCache {
                 if let Some(notes) = notes {
                     accepted = true;
                     if !self.ttl.is_zero() {
+                        let now = tokio::time::Instant::now();
+                        let expired = state
+                            .entries
+                            .iter()
+                            .filter_map(|(key, cached)| {
+                                (cached.stored.elapsed() >= self.ttl).then(|| key.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        for key in expired {
+                            state.entries.remove(&key);
+                            tracing::debug!(
+                                cache_event = "eviction",
+                                reason = "expired",
+                                "HackMD note-list cache"
+                            );
+                        }
+                        if !state.entries.contains_key(workspace)
+                            && state.entries.len() >= MAX_CACHED_WORKSPACES
+                            && let Some(lru) = state
+                                .entries
+                                .iter()
+                                .min_by_key(|(_, cached)| cached.last_access)
+                                .map(|(key, _)| key.clone())
+                        {
+                            state.entries.remove(&lru);
+                            tracing::debug!(
+                                cache_event = "eviction",
+                                reason = "capacity",
+                                "HackMD note-list cache"
+                            );
+                        }
+                        state.access_clock = state.access_clock.wrapping_add(1);
+                        let access = state.access_clock;
                         state.entries.insert(
                             workspace.clone(),
-                            (tokio::time::Instant::now(), Arc::clone(notes)),
+                            CachedNotes {
+                                stored: now,
+                                last_access: access,
+                                notes: Arc::clone(notes),
+                            },
                         );
+                        tracing::debug!(cache_event = "fill", "HackMD note-list cache");
                     }
                 }
             }
@@ -663,6 +729,14 @@ impl NotesCache {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         state.generation = state.generation.wrapping_add(1);
+        if !state.entries.is_empty() {
+            tracing::debug!(
+                cache_event = "eviction",
+                reason = "invalidation",
+                count = state.entries.len(),
+                "HackMD note-list cache"
+            );
+        }
         state.entries.clear();
     }
 }
@@ -967,7 +1041,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CacheFill, CacheLookup, HackmdClient, HackmdError, NO_BODY, NotesCache, retry_after,
+        CacheFill, CacheLookup, HackmdClient, HackmdError, MAX_CACHED_WORKSPACES, NO_BODY,
+        NotesCache, retry_after,
     };
     use crate::config::Config;
 
@@ -1104,6 +1179,82 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(50), flight.wait())
             .await
             .expect("abandoned fill should wake waiters");
+    }
+
+    #[test]
+    fn cache_capacity_evicts_the_least_recently_used_workspace() {
+        let cache = NotesCache::new(Duration::from_secs(60));
+        let notes: Arc<[crate::dto::NoteResponse]> = Vec::new().into();
+        for index in 0..MAX_CACHED_WORKSPACES {
+            let workspace = Workspace::Team {
+                team_path: format!("team-{index}"),
+            };
+            let CacheLookup::Fill { generation, flight } = cache.begin(&workspace, false) else {
+                panic!("new workspace should miss");
+            };
+            assert!(cache.finish(&workspace, generation, &flight, Some(&notes)));
+        }
+        let recently_used = Workspace::Team {
+            team_path: "team-0".to_owned(),
+        };
+        assert!(matches!(
+            cache.begin(&recently_used, false),
+            CacheLookup::Hit(_)
+        ));
+        let newest = Workspace::Team {
+            team_path: format!("team-{MAX_CACHED_WORKSPACES}"),
+        };
+        let CacheLookup::Fill { generation, flight } = cache.begin(&newest, false) else {
+            panic!("new workspace should miss");
+        };
+        assert!(cache.finish(&newest, generation, &flight, Some(&notes)));
+
+        assert_eq!(
+            cache
+                .state
+                .lock()
+                .expect("cache mutex should lock")
+                .entries
+                .len(),
+            MAX_CACHED_WORKSPACES
+        );
+        assert!(matches!(
+            cache.begin(&recently_used, false),
+            CacheLookup::Hit(_)
+        ));
+        let least_recently_used = Workspace::Team {
+            team_path: "team-1".to_owned(),
+        };
+        let CacheLookup::Fill { generation, flight } = cache.begin(&least_recently_used, false)
+        else {
+            panic!("least-recently-used workspace should have been evicted");
+        };
+        let _ = cache.finish(&least_recently_used, generation, &flight, None);
+    }
+
+    #[tokio::test]
+    async fn a_fill_prunes_expired_entries_for_other_workspaces() {
+        let cache = NotesCache::new(Duration::from_millis(5));
+        let notes: Arc<[crate::dto::NoteResponse]> = Vec::new().into();
+        for team_path in ["old-a", "old-b"] {
+            let workspace = Workspace::Team {
+                team_path: team_path.to_owned(),
+            };
+            let CacheLookup::Fill { generation, flight } = cache.begin(&workspace, false) else {
+                panic!("new workspace should miss");
+            };
+            assert!(cache.finish(&workspace, generation, &flight, Some(&notes)));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let current = Workspace::Personal;
+        let CacheLookup::Fill { generation, flight } = cache.begin(&current, false) else {
+            panic!("new workspace should miss");
+        };
+        assert!(cache.finish(&current, generation, &flight, Some(&notes)));
+        let state = cache.state.lock().expect("cache mutex should lock");
+        assert_eq!(state.entries.len(), 1);
+        assert!(state.entries.contains_key(&Workspace::Personal));
     }
 
     #[tokio::test]

@@ -263,6 +263,12 @@
   explicit refreshes share one upstream request. The fill guard wakes waiters
   on request failure or task cancellation, preventing a dead flight from
   blocking later reference resolution.
+- [x] Bound the note-list cache to 32 workspaces with least-recently-used
+  capacity eviction. The initial cache implementation already removed an
+  expired entry when that same workspace was touched; fills now prune expired
+  entries across all workspaces as well. Emit debug-level hit, miss, fill, and
+  expired/capacity/invalidation eviction events with counts and reasons but no
+  workspace or note metadata.
 - [x] Add process-unique request IDs and redacted JSON tracing to stderr for
   every MCP tool call and HackMD request. `RUST_LOG` opts into debug detail;
   the optional `otel` feature plus `HACKMD_MCP_OTEL=true` exports spans through
