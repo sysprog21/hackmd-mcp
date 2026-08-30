@@ -2,6 +2,17 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Audit every direct dependency and its enabled features in
+  `DEPENDENCIES.md`. Disable unused Clap color/suggestion support and
+  tracing-subscriber ANSI/log bridging, removing eight packages from both the
+  default and all-feature resolved graphs and reducing the release executable
+  from 14,847,184 to 14,788,104 bytes on the same toolchain. Default,
+  no-default, and all-feature builds plus all stdio behavior tests pass.
+- [x] Keep test-only `futures-util` under dev-dependencies. Retain `tempfile` as
+  a normal dependency because production sync-state persistence uses
+  `NamedTempFile` for atomic sidecar and baseline replacement; document that
+  call site so it is not mistakenly moved into the test graph.
+
 - [x] Centralize check/push three-way change classification in one pure function
   over fixed-size SHA-256 digests. Carry the already-verified baseline digest
   out of state loading, reuse computed local/remote digests for result hashes,

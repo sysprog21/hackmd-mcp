@@ -276,14 +276,6 @@ dependency, or background task without a bound and an invalidation rule.
 - [ ] Add `cargo machete` (or an equivalent unused-direct-dependency check) to
   CI and run `cargo tree -d` on dependency updates. Keep RustSec auditing. Pin
   the CI tool version so a new lint cannot break `main` without review.
-- [ ] Audit each direct dependency by feature and call site. Document why
-  security-critical `cap-std`, protocol-critical `rmcp`, and TLS/HTTP `reqwest`
-  remain; remove unused default features and prove the default and `--all-features`
-  builds after every change.
-- [ ] Move test-only crates out of normal dependencies. In particular, determine
-  whether production atomic writes can replace `tempfile`; if not, document the
-  required production call sites. Keep `futures-util` dev-only or replace its
-  small test usage with standard-library/Tokio primitives.
 - [ ] Evaluate replacing `clap` derive with the smaller builder API or a minimal
   parser for the three supported flags. Accept the change only if release binary
   size and clean-build time improve materially while help/version/error behavior
