@@ -194,13 +194,6 @@ test (see P3) for each and record the answer here.
 
 ## P3 — efficiency and reliability
 
-- [ ] Make note-cache invalidation generation-aware. Clearing before and after
-  writes does not stop an older in-flight GET from storing its response after
-  the second clear; tag fills with an invalidation generation and discard a
-  result when the generation changed while it was in flight. Coalesce
-  concurrent misses per workspace so reference resolution cannot stampede the
-  unpaginated list endpoint, and cover both races with deterministic async
-  tests.
 - [ ] Remove timing and connection races from `SequenceServer`. On a normal
   parallel `cargo test --all-targets --all-features` run,
   `maps_network_and_timeout_failures` and

@@ -257,6 +257,12 @@
   slices without cloning the full response and clear the cache before and
   after every write. Note bodies remain uncached, and callers can explicitly
   refresh a workspace list.
+- [x] Make list fills generation-aware and single-flight per workspace. A
+  write advances the generation, so a GET that began before invalidation is
+  neither returned nor stored and must refetch; simultaneous misses and
+  explicit refreshes share one upstream request. The fill guard wakes waiters
+  on request failure or task cancellation, preventing a dead flight from
+  blocking later reference resolution.
 - [x] Add process-unique request IDs and redacted JSON tracing to stderr for
   every MCP tool call and HackMD request. `RUST_LOG` opts into debug detail;
   the optional `otel` feature plus `HACKMD_MCP_OTEL=true` exports spans through

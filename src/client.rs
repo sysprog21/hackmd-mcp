@@ -2,7 +2,10 @@ use reqwest::{Method, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use url::Url;
@@ -99,17 +102,27 @@ impl HackmdClient {
         workspace: &Workspace,
         refresh: bool,
     ) -> Result<Arc<[NoteResponse]>, HackmdError> {
-        if !refresh {
-            if let Some(cached) = self.notes.get(workspace) {
-                return Ok(cached);
+        let mut bypass_cache = refresh;
+        loop {
+            match self.notes.begin(workspace, bypass_cache) {
+                CacheLookup::Hit(notes) => return Ok(notes),
+                CacheLookup::Wait(flight) => {
+                    flight.wait().await;
+                    bypass_cache = false;
+                }
+                CacheLookup::Fill { generation, flight } => {
+                    let fill = CacheFill::new(&self.notes, workspace.clone(), generation, flight);
+                    let notes: Arc<[NoteResponse]> = self
+                        .get_required::<Vec<NoteResponse>>(&workspace_route(workspace, &["notes"]))
+                        .await?
+                        .into();
+                    if fill.complete(&notes) {
+                        return Ok(notes);
+                    }
+                    bypass_cache = false;
+                }
             }
         }
-        let notes: Arc<[NoteResponse]> = self
-            .get_required::<Vec<NoteResponse>>(&workspace_route(workspace, &["notes"]))
-            .await?
-            .into();
-        self.notes.store(workspace, &notes);
-        Ok(notes)
     }
 
     pub(crate) async fn get_note(
@@ -528,48 +541,171 @@ type CachedNotes = (tokio::time::Instant, Arc<[NoteResponse]>);
 #[derive(Debug)]
 struct NotesCache {
     ttl: Duration,
-    entries: std::sync::Mutex<HashMap<Workspace, CachedNotes>>,
+    state: Mutex<NotesCacheState>,
+}
+
+#[derive(Debug, Default)]
+struct NotesCacheState {
+    generation: u64,
+    entries: HashMap<Workspace, CachedNotes>,
+    flights: HashMap<Workspace, Arc<CacheFlight>>,
+}
+
+#[derive(Debug)]
+struct CacheFlight {
+    done: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl CacheFlight {
+    fn new() -> Self {
+        Self {
+            done: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn finish(&self) {
+        self.done.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+}
+
+enum CacheLookup {
+    Hit(Arc<[NoteResponse]>),
+    Wait(Arc<CacheFlight>),
+    Fill {
+        generation: u64,
+        flight: Arc<CacheFlight>,
+    },
 }
 
 impl NotesCache {
     fn new(ttl: Duration) -> Self {
         Self {
             ttl,
-            entries: std::sync::Mutex::new(HashMap::new()),
+            state: Mutex::new(NotesCacheState::default()),
         }
     }
 
-    fn get(&self, workspace: &Workspace) -> Option<Arc<[NoteResponse]>> {
-        let mut entries = self.entries.lock().ok()?;
-        let (stored, notes) = entries.get(workspace)?;
-        if stored.elapsed() < self.ttl {
-            return Some(Arc::clone(notes));
+    fn begin(&self, workspace: &Workspace, bypass_cache: bool) -> CacheLookup {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !bypass_cache && !self.ttl.is_zero() {
+            if let Some((stored, notes)) = state.entries.get(workspace) {
+                if stored.elapsed() < self.ttl {
+                    return CacheLookup::Hit(Arc::clone(notes));
+                }
+            }
+            state.entries.remove(workspace);
         }
-
-        // Drop it here rather than waiting for the next write: an expired list
-        // for a workspace nobody touches again would sit in memory forever.
-        entries.remove(workspace);
-        None
+        if let Some(flight) = state.flights.get(workspace) {
+            return CacheLookup::Wait(Arc::clone(flight));
+        }
+        let generation = state.generation;
+        let flight = Arc::new(CacheFlight::new());
+        state.flights.insert(workspace.clone(), Arc::clone(&flight));
+        CacheLookup::Fill { generation, flight }
     }
 
-    fn store(&self, workspace: &Workspace, notes: &Arc<[NoteResponse]>) {
-        if self.ttl.is_zero() {
-            return;
+    fn finish(
+        &self,
+        workspace: &Workspace,
+        generation: u64,
+        flight: &Arc<CacheFlight>,
+        notes: Option<&Arc<[NoteResponse]>>,
+    ) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut accepted = false;
+        if state
+            .flights
+            .get(workspace)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            state.flights.remove(workspace);
+            if state.generation == generation {
+                if let Some(notes) = notes {
+                    accepted = true;
+                    if !self.ttl.is_zero() {
+                        state.entries.insert(
+                            workspace.clone(),
+                            (tokio::time::Instant::now(), Arc::clone(notes)),
+                        );
+                    }
+                }
+            }
         }
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.insert(
-                workspace.clone(),
-                (tokio::time::Instant::now(), Arc::clone(notes)),
-            );
-        }
+        flight.finish();
+        accepted
     }
 
     /// Called after any write. Clearing every workspace rather than one is
     /// deliberate: a note can move between workspaces, and the map holds at
     /// most a handful of entries.
     fn invalidate(&self) {
-        if let Ok(mut entries) = self.entries.lock() {
-            entries.clear();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.generation = state.generation.wrapping_add(1);
+        state.entries.clear();
+    }
+}
+
+struct CacheFill<'a> {
+    cache: &'a NotesCache,
+    workspace: Workspace,
+    generation: u64,
+    flight: Arc<CacheFlight>,
+    completed: bool,
+}
+
+impl<'a> CacheFill<'a> {
+    fn new(
+        cache: &'a NotesCache,
+        workspace: Workspace,
+        generation: u64,
+        flight: Arc<CacheFlight>,
+    ) -> Self {
+        Self {
+            cache,
+            workspace,
+            generation,
+            flight,
+            completed: false,
+        }
+    }
+
+    fn complete(mut self, notes: &Arc<[NoteResponse]>) -> bool {
+        let accepted =
+            self.cache
+                .finish(&self.workspace, self.generation, &self.flight, Some(notes));
+        self.completed = true;
+        accepted
+    }
+}
+
+impl Drop for CacheFill<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self
+                .cache
+                .finish(&self.workspace, self.generation, &self.flight, None);
         }
     }
 }
@@ -823,14 +959,16 @@ impl From<HackmdError> for rmcp::model::CallToolResult {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, time::Duration};
+    use std::{net::TcpListener, sync::Arc, time::Duration};
 
     const NOTES: &str = r#"[{"id":"note-id","title":"Note"}]"#;
 
     use reqwest::Method;
     use serde_json::{Value, json};
 
-    use super::{HackmdClient, HackmdError, NO_BODY, retry_after};
+    use super::{
+        CacheFill, CacheLookup, HackmdClient, HackmdError, NO_BODY, NotesCache, retry_after,
+    };
     use crate::config::Config;
 
     #[test]
@@ -917,6 +1055,55 @@ mod tests {
         assert_eq!(refreshed[0].title, "Renamed");
         assert_eq!(cached, refreshed);
         assert_eq!(server.finish().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_workspace_misses_share_one_list_request() {
+        let server =
+            crate::fixture::SequenceServer::spawn_delayed(200, NOTES, Duration::from_millis(100));
+        let client = Arc::new(server.client_with_cache());
+
+        let (first, second) = tokio::join!(
+            client.list_notes(&Workspace::Personal, false),
+            client.list_notes(&Workspace::Personal, false)
+        );
+
+        assert_eq!(first.expect("first list should succeed").len(), 1);
+        assert_eq!(second.expect("second list should succeed").len(), 1);
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[test]
+    fn invalidation_generation_rejects_an_older_in_flight_fill() {
+        let cache = NotesCache::new(Duration::from_secs(60));
+        let CacheLookup::Fill { generation, flight } = cache.begin(&Workspace::Personal, false)
+        else {
+            panic!("empty cache should start a fill");
+        };
+        cache.invalidate();
+        let notes: Arc<[crate::dto::NoteResponse]> = Vec::new().into();
+
+        assert!(!cache.finish(&Workspace::Personal, generation, &flight, Some(&notes)));
+        let CacheLookup::Fill { generation, flight } = cache.begin(&Workspace::Personal, false)
+        else {
+            panic!("stale fill must not repopulate the cache");
+        };
+        let _ = cache.finish(&Workspace::Personal, generation, &flight, None);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_fill_leader_wakes_coalesced_waiters() {
+        let cache = NotesCache::new(Duration::from_secs(60));
+        let CacheLookup::Fill { generation, flight } = cache.begin(&Workspace::Personal, false)
+        else {
+            panic!("empty cache should start a fill");
+        };
+        let fill = CacheFill::new(&cache, Workspace::Personal, generation, Arc::clone(&flight));
+        drop(fill);
+
+        tokio::time::timeout(Duration::from_millis(50), flight.wait())
+            .await
+            .expect("abandoned fill should wake waiters");
     }
 
     #[tokio::test]
