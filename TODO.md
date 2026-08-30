@@ -222,10 +222,14 @@ dependency, or background task without a bound and an invalidation rule.
 
 ### P2 — consolidate test coverage
 
-- [ ] Replace repeated ad-hoc HTTP response tuples with a scenario builder that
-  declares expected method, encoded path, selected headers, body predicate,
-  response, and optional delay. Keep accepted sockets explicitly blocking and
-  enforce one overall fixture deadline on every platform.
+- [ ] Migrate HTTP tests to `Scenario` in three reviewable batches: first
+  `client` request/retry/cache tests, then note/folder handlers, then sync/server
+  workflows. In each batch, encode method/path and meaningful auth/content/body
+  expectations in the declaration instead of inspecting raw requests afterward.
+  Once `rg 'SequenceServer::spawn(_with_headers|_delayed)?' src` has no ordinary
+  response-only call sites, remove the tuple constructors and
+  `assert_request_sequence`; retain explicit repeating/disconnect helpers only
+  for unbounded-visibility and transport-failure behavior.
 - [ ] Convert duplicated personal/team and status-code tests into table-driven
   cases. Retain separate tests only where route shape, permissions, or API
   behavior genuinely differs. Test names must describe the invariant rather

@@ -2,6 +2,15 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Add the declarative HTTP `Scenario` fixture foundation. Each step names
+  the expected method and encoded path, selected exact headers, a described body
+  predicate, response status/body/headers, and optional delay. Accepted sockets
+  become blocking before reads; one five-second deadline bounds accept, request
+  read, declared delay, and result collection on every platform. Delays are
+  shutdown-interruptible and cannot outlive that deadline. Focused tests cover
+  the full declaration surface and deadline cap; tuple-call-site migration is
+  split into explicit module batches in `TODO.md`.
+
 - [x] Split guarded live coverage into `live-readonly` and `live-destructive`
   binaries. The read-only suite performs only authenticated GETs, reports
   personal/team list and item validator headers plus conditional statuses, and
