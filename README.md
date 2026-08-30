@@ -118,6 +118,18 @@ cargo clippy --all-targets --all-features -- -D warnings
 (release build), `make clean`, and `make indent`, which formats the sources with rustfmt plus
 `commentflow` and `shfmt` when those are installed.
 
-The destructive live suite in `tests/live-smoke.rs` is ignored by default. Run
-it only with a dedicated test account and the explicit environment gates
-documented at the top of that file.
+Both live suites are ignored by default. The read-only validator probe mutates
+nothing and prints `ETag`/`Last-Modified` plus conditional response status:
+
+```sh
+HACKMD_RUN_LIVE_READONLY_TESTS=1 HACKMD_LIVE_TEST_TOKEN=... \
+    cargo test --test live-readonly -- --ignored --nocapture
+```
+
+The destructive suite requires a dedicated account and both explicit gates:
+
+```sh
+HACKMD_RUN_LIVE_TESTS=1 HACKMD_CONFIRM_DESTRUCTIVE_LIVE_TESTS=YES \
+    HACKMD_LIVE_TEST_TOKEN=... \
+    cargo test --test live-destructive -- --ignored --nocapture
+```

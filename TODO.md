@@ -188,11 +188,18 @@ dependency, or background task without a bound and an invalidation rule.
 
 ### P0 — efficient HackMD API communication
 
-- [ ] Measure the response headers returned by personal and team note GET/list
-  endpoints in the guarded live suite. Record whether `ETag`, `Last-Modified`,
-  or conditional requests are supported. Implement `If-None-Match` or
-  `If-Modified-Since` only after a live `304` is demonstrated; otherwise keep
-  timestamp/hash validation and document why conditional HTTP is unavailable.
+- [ ] Run the read-only validator probe with a dedicated token and team path:
+
+  ```sh
+  HACKMD_RUN_LIVE_READONLY_TESTS=1 HACKMD_LIVE_TEST_TOKEN=... \
+      HACKMD_LIVE_TEST_TEAM_PATH=... \
+      cargo test --test live-readonly -- --ignored --nocapture
+  ```
+
+  Copy its personal/team note GET/list `ETag`, `Last-Modified`, and conditional
+  statuses into `DONE.md` with the date. Implement
+  `If-None-Match` or `If-Modified-Since` only after a live `304` is demonstrated;
+  otherwise record the cache as inapplicable and retain fresh body GETs.
 - [ ] Add a benchmark fixture with 10,000 note summaries and concurrent callers.
   Track list-cache hit latency, miss coalescing, filtering/sorting time, request
   count, and allocations. Set regression thresholds only after three stable CI
@@ -228,10 +235,6 @@ dependency, or background task without a bound and an invalidation rule.
   delete/restore. Unit tests should own parsers, validation boundaries, cache
   races, state recovery, and pure sync classification; avoid asserting the same
   behavior at three layers.
-- [ ] Split guarded live tests into read-only and destructive groups. Run the
-  read-only contract manually with a token and keep destructive tests behind
-  both the existing opt-in and an explicit confirmation variable. Every live
-  test must clean up resources and print created IDs on cleanup failure.
 - [ ] Add a coverage report in CI and ratchet changed-line coverage after the
   initial baseline. Exclude generated macro code, but do not exclude error,
   recovery, cache-eviction, or platform-specific branches. Coverage tooling

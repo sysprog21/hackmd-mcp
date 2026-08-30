@@ -2,6 +2,15 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Split guarded live coverage into `live-readonly` and `live-destructive`
+  binaries. The read-only suite performs only authenticated GETs, reports
+  personal/team list and item validator headers plus conditional statuses, and
+  requires one explicit opt-in. The destructive suite now requires both its
+  original gate and `HACKMD_CONFIRM_DESTRUCTIVE_LIVE_TESTS=YES`; panic-safe
+  cleanup uses non-panicking DELETEs and prints every leaked resource ID on
+  HTTP or transport failure. Both ignored suites compile under strict Clippy,
+  and README commands make each mode directly executable.
+
 - [x] Avoid discovery requests for direct internal IDs and validated tracked
   identities. Direct references resolve without API I/O; sync checks address
   the sidecar's verified workspace/internal ID with exactly one fresh item GET.

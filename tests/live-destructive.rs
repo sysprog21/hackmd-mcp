@@ -5,9 +5,10 @@
 //!
 //! ```sh
 //! HACKMD_RUN_LIVE_TESTS=1 \
+//!     HACKMD_CONFIRM_DESTRUCTIVE_LIVE_TESTS=YES \
 //!     HACKMD_LIVE_TEST_TOKEN=... \
 //!     HACKMD_LIVE_TEST_TEAM_PATH=... \
-//!     cargo test --test live-smoke -- --ignored
+//!     cargo test --test live-destructive -- --ignored --nocapture
 //! ```
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +29,11 @@ impl LiveApi {
             std::env::var("HACKMD_RUN_LIVE_TESTS").as_deref(),
             Ok("1"),
             "set HACKMD_RUN_LIVE_TESTS=1 to acknowledge destructive live tests"
+        );
+        assert_eq!(
+            std::env::var("HACKMD_CONFIRM_DESTRUCTIVE_LIVE_TESTS").as_deref(),
+            Ok("YES"),
+            "set HACKMD_CONFIRM_DESTRUCTIVE_LIVE_TESTS=YES to confirm writes and cleanup"
         );
         let token = std::env::var("HACKMD_LIVE_TEST_TOKEN")
             .expect("set a dedicated HACKMD_LIVE_TEST_TOKEN; the normal server token is refused");
@@ -105,6 +111,23 @@ impl LiveApi {
         self.empty_ok(Method::DELETE, &["notes", note_id], None)
             .await;
     }
+
+    async fn cleanup_delete(&self, segments: &[&str], resource: &str) {
+        match self
+            .http
+            .delete(self.url(segments))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => eprintln!(
+                "cleanup failed for {resource}: status={}",
+                response.status()
+            ),
+            Err(error) => eprintln!("cleanup failed for {resource}: transport error: {error}"),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -116,19 +139,22 @@ struct Fixtures {
 
 async fn cleanup(api: &LiveApi, fixtures: &mut Fixtures) {
     if let Some(note_id) = fixtures.note.take() {
-        let _ = api
-            .request(Method::DELETE, &["notes", &note_id], None)
+        api.cleanup_delete(&["notes", &note_id], &format!("note {note_id}"))
             .await;
     }
     if let Some(folder_id) = fixtures.child_folder.take() {
-        let _ = api
-            .request(Method::DELETE, &["folders", &folder_id], None)
-            .await;
+        api.cleanup_delete(
+            &["folders", &folder_id],
+            &format!("child folder {folder_id}"),
+        )
+        .await;
     }
     if let Some(folder_id) = fixtures.parent_folder.take() {
-        let _ = api
-            .request(Method::DELETE, &["folders", &folder_id], None)
-            .await;
+        api.cleanup_delete(
+            &["folders", &folder_id],
+            &format!("parent folder {folder_id}"),
+        )
+        .await;
     }
 }
 
@@ -387,22 +413,18 @@ async fn team_folder_updates_and_image_route_are_measured() {
     .await;
 
     if let Some(note_id) = note_id {
-        let _ = api
-            .request(
-                Method::DELETE,
-                &["teams", &team_path, "notes", &note_id],
-                None,
-            )
-            .await;
+        api.cleanup_delete(
+            &["teams", &team_path, "notes", &note_id],
+            &format!("team note {note_id}"),
+        )
+        .await;
     }
     for folder_id in folder_ids.into_iter().rev() {
-        let _ = api
-            .request(
-                Method::DELETE,
-                &["teams", &team_path, "folders", &folder_id],
-                None,
-            )
-            .await;
+        api.cleanup_delete(
+            &["teams", &team_path, "folders", &folder_id],
+            &format!("team folder {folder_id}"),
+        )
+        .await;
     }
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
