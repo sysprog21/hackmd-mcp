@@ -2,6 +2,15 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Remove avoidable large-body copies from edit and sync push. Serialize
+  borrowed Markdown directly, retain one reusable encoded request body across
+  idempotent retries, and verify every retry sends the identical payload.
+  Conflict summaries now bound each diff input to 256 KiB and stream each
+  formatted side into a 1,900-byte UTF-8-aware writer instead of constructing
+  multi-megabyte intermediate strings. Digest classification remains borrowed,
+  diffs remain conflict-only, and a 10 MiB Unicode boundary test covers the
+  maximum accepted body size.
+
 - [x] Evaluate replacing Clap derive with a minimal parser under the documented
   acceptance gate. The experiment removed six resolved packages and reduced
   the release executable from 14,788,104 to 14,343,688 bytes, but an isolated

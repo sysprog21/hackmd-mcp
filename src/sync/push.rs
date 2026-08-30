@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+};
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -7,7 +10,6 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
-    dto::UpdateNoteRequest,
     local::{LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
@@ -225,14 +227,7 @@ async fn push_resolved(
         return Ok(Ok(result));
     }
     client
-        .update_note(
-            &note.workspace,
-            &note.note_id,
-            &UpdateNoteRequest {
-                content: Some(local.clone()),
-                ..UpdateNoteRequest::default()
-            },
-        )
+        .update_note_content(&note.workspace, &note.note_id, &local)
         .await?;
     let readback = crate::client::poll_readback(
         || client.get_note(&note.workspace, &note.note_id),
@@ -293,24 +288,92 @@ fn conflict_output(
 }
 
 fn conflict_diff(baseline: &str, local: &str, remote: &str) -> String {
-    const MAX_CHARS: usize = 4_000;
-    let local_diff = TextDiff::from_lines(baseline, local)
-        .unified_diff()
-        .context_radius(2)
-        .header("baseline", "local")
-        .to_string();
-    let remote_diff = TextDiff::from_lines(baseline, remote)
-        .unified_diff()
-        .context_radius(2)
-        .header("baseline", "remote")
-        .to_string();
-    let combined = format!("LOCAL CHANGES\n{local_diff}\nREMOTE CHANGES\n{remote_diff}");
-    let mut chars = combined.chars();
-    let mut bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
-    if chars.next().is_some() {
-        bounded.push('…');
+    const DIFF_BYTES: usize = 1_900;
+    let baseline = bounded_diff_input(baseline);
+    let local = bounded_diff_input(local);
+    let remote = bounded_diff_input(remote);
+    let local_diff = bounded_unified_diff(&baseline, &local, "local", DIFF_BYTES);
+    let remote_diff = bounded_unified_diff(&baseline, &remote, "remote", DIFF_BYTES);
+    format!("LOCAL CHANGES\n{local_diff}\nREMOTE CHANGES\n{remote_diff}")
+}
+
+fn bounded_diff_input(value: &str) -> Cow<'_, str> {
+    const MAX_INPUT_BYTES: usize = 256 * 1024;
+    if value.len() <= MAX_INPUT_BYTES {
+        return Cow::Borrowed(value);
     }
-    bounded
+
+    let mut head_end = MAX_INPUT_BYTES / 2;
+    while !value.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = value.len() - MAX_INPUT_BYTES / 2;
+    while !value.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let omitted = tail_start - head_end;
+    Cow::Owned(format!(
+        "[… {omitted} bytes omitted from diff input …]\n{}\n{}",
+        &value[..head_end],
+        &value[tail_start..]
+    ))
+}
+
+fn bounded_unified_diff(baseline: &str, changed: &str, label: &str, limit: usize) -> String {
+    let diff = TextDiff::from_lines(baseline, changed);
+    let mut writer = BoundedWriter::new(limit);
+    let _ = diff
+        .unified_diff()
+        .context_radius(2)
+        .header("baseline", label)
+        .to_writer(&mut writer);
+    writer.finish()
+}
+
+struct BoundedWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    truncated: bool,
+}
+
+impl BoundedWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit + "…".len()),
+            limit,
+            truncated: false,
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if self.truncated {
+            self.bytes.extend_from_slice("…".as_bytes());
+        }
+        String::from_utf8(self.bytes).expect("diff formatter writes valid UTF-8")
+    }
+}
+
+impl std::io::Write for BoundedWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if buffer.len() <= remaining {
+            self.bytes.extend_from_slice(buffer);
+            return Ok(buffer.len());
+        }
+
+        let text = std::str::from_utf8(buffer).map_err(std::io::Error::other)?;
+        let mut end = remaining.min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.bytes.extend_from_slice(&buffer[..end]);
+        self.truncated = true;
+        Ok(end)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn advance_state(
@@ -487,6 +550,21 @@ mod tests {
         let remote = "remote\n".repeat(2_000);
         let summary = conflict_diff(&baseline, &local, &remote);
         assert!(summary.chars().count() <= 4_001);
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn conflict_diff_bounds_maximum_size_single_lines_before_formatting() {
+        let baseline = "a".repeat(BODY_MAX_BYTES);
+        let local = "b".repeat(BODY_MAX_BYTES);
+        let remote = "界".repeat(BODY_MAX_BYTES / "界".len());
+
+        let summary = conflict_diff(&baseline, &local, &remote);
+
+        assert!(summary.chars().count() <= 4_001);
+        assert!(summary.contains("LOCAL CHANGES"));
+        assert!(summary.contains("REMOTE CHANGES"));
+        assert!(summary.contains("bytes omitted from diff input"));
         assert!(summary.ends_with('…'));
     }
 

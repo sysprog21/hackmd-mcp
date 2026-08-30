@@ -4,7 +4,6 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
-    dto::UpdateNoteRequest,
     models::Workspace,
     note::patch::PatchError,
     note::reference::{NoteRefError, NoteResolution},
@@ -75,14 +74,7 @@ pub(crate) async fn edit_note(
     let changed = updated != content;
     if changed {
         client
-            .update_note(
-                &note.workspace,
-                &note.note_id,
-                &UpdateNoteRequest {
-                    content: Some(updated.clone()),
-                    ..UpdateNoteRequest::default()
-                },
-            )
+            .update_note_content(&note.workspace, &note.note_id, &updated)
             .await?;
         let readback = crate::client::poll_readback(
             || client.get_note(&note.workspace, &note.note_id),

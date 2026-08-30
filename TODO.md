@@ -263,10 +263,6 @@ dependency, or background task without a bound and an invalidation rule.
   for note bodies by capacity, cap workspace-summary caches independently, and
   expose hit/miss/eviction counters without note titles, bodies, paths, or token
   data.
-- [ ] Remove avoidable full-body copies in sync. Hash byte slices incrementally,
-  pass borrowed `str`/`Path` values through classification, allocate conflict
-  diffs only for conflicts, and bound diff construction before formatting it.
-  Prove unchanged behavior with large-body boundary tests.
 - [ ] Review long-lived `String`, `Vec`, and `Arc` fields with a heap profiler.
   Change representation only where the baseline shows retained memory; avoid
   speculative `Box<str>`/`Arc<str>` churn that merely moves allocations.

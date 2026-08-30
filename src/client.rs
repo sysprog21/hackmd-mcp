@@ -155,6 +155,24 @@ impl HackmdClient {
             .await
     }
 
+    /// Updates only note content without cloning the caller's potentially
+    /// large Markdown body into an owned DTO before JSON encoding.
+    pub(crate) async fn update_note_content(
+        &self,
+        workspace: &Workspace,
+        note_id: &str,
+        content: &str,
+    ) -> Result<Option<Value>, HackmdError> {
+        #[derive(Serialize)]
+        struct ContentUpdate<'a> {
+            content: &'a str,
+        }
+
+        let segments = workspace_route(workspace, &["notes", note_id]);
+        self.request_json_idempotent(Method::PATCH, &segments, Some(&ContentUpdate { content }))
+            .await
+    }
+
     pub(crate) async fn delete_note(
         &self,
         workspace: &Workspace,
@@ -376,18 +394,17 @@ impl HackmdClient {
             .transpose()
             .map_err(|_| HackmdError::InvalidPayload)?;
 
+        let mut request = self.http.request(method.clone(), url).bearer_auth(token);
+        if let Some(body) = body {
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body);
+        }
+
         self.invalidate_list_cache_on_write(&method);
         tracing::debug!(method = %method_text, path = %path, "HackMD request started");
         let (status, bytes, rate_limit) = loop {
-            let mut request = self
-                .http
-                .request(method.clone(), url.clone())
-                .bearer_auth(token);
-            if let Some(body) = body.as_ref() {
-                request = request
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .body(body.clone());
-            }
+            let request = request.try_clone().ok_or(HackmdError::InvalidPayload)?;
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(_) if retryable && retries < retry.max_retries => {
@@ -1707,7 +1724,13 @@ mod tests {
             )
             .await
             .expect("idempotent PATCH should recover");
-        assert_eq!(patch_server.finish().len(), 2);
+        let patch_requests = patch_server.finish();
+        assert_eq!(patch_requests.len(), 2);
+        assert!(
+            patch_requests
+                .iter()
+                .all(|request| request.ends_with(r#"{"title":"same replacement"}"#))
+        );
 
         let post_server =
             crate::fixture::SequenceServer::spawn([(500, r#"{"error":"do not retry"}"#)]);
