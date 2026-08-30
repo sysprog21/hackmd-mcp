@@ -547,12 +547,14 @@ async fn sleep_before_retry(
 const NO_BODY: Option<&Value> = None;
 
 const MAX_CACHED_WORKSPACES: usize = 32;
+const MAX_CACHED_NOTE_LIST_BYTES: usize = 8 * 1024 * 1024;
 
 /// One workspace's list, when it was fetched, and its LRU position.
 #[derive(Debug)]
 struct CachedNotes {
     stored: tokio::time::Instant,
     last_access: u64,
+    size_bytes: usize,
     notes: Arc<[NoteResponse]>,
 }
 
@@ -565,6 +567,8 @@ struct CachedNotes {
 #[derive(Debug)]
 struct NotesCache {
     ttl: Duration,
+    max_entries: usize,
+    max_bytes: usize,
     state: Mutex<NotesCacheState>,
 }
 
@@ -572,6 +576,10 @@ struct NotesCache {
 struct NotesCacheState {
     generation: u64,
     access_clock: u64,
+    total_bytes: usize,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
     entries: HashMap<Workspace, CachedNotes>,
     flights: HashMap<Workspace, Arc<CacheFlight>>,
 }
@@ -617,8 +625,14 @@ enum CacheLookup {
 
 impl NotesCache {
     fn new(ttl: Duration) -> Self {
+        Self::with_limits(ttl, MAX_CACHED_WORKSPACES, MAX_CACHED_NOTE_LIST_BYTES)
+    }
+
+    fn with_limits(ttl: Duration, max_entries: usize, max_bytes: usize) -> Self {
         Self {
             ttl,
+            max_entries,
+            max_bytes,
             state: Mutex::new(NotesCacheState::default()),
         }
     }
@@ -631,25 +645,44 @@ impl NotesCache {
         if !bypass_cache && !self.ttl.is_zero() {
             state.access_clock = state.access_clock.wrapping_add(1);
             let access = state.access_clock;
-            if let Some(cached) = state.entries.get_mut(workspace)
-                && cached.stored.elapsed() < self.ttl
-            {
-                cached.last_access = access;
-                tracing::debug!(cache_event = "hit", "HackMD note-list cache");
-                return CacheLookup::Hit(Arc::clone(&cached.notes));
+            let hit = state.entries.get_mut(workspace).and_then(|cached| {
+                (cached.stored.elapsed() < self.ttl).then(|| {
+                    cached.last_access = access;
+                    Arc::clone(&cached.notes)
+                })
+            });
+            if let Some(notes) = hit {
+                state.hits = state.hits.saturating_add(1);
+                tracing::debug!(
+                    cache_event = "hit",
+                    hits = state.hits,
+                    misses = state.misses,
+                    evictions = state.evictions,
+                    cached_bytes = state.total_bytes,
+                    "HackMD note-list cache"
+                );
+                return CacheLookup::Hit(notes);
             }
-            if state.entries.remove(workspace).is_some() {
+            if remove_cache_entry(&mut state, workspace) {
+                state.evictions = state.evictions.saturating_add(1);
                 tracing::debug!(
                     cache_event = "eviction",
                     reason = "expired",
+                    evictions = state.evictions,
+                    cached_bytes = state.total_bytes,
                     "HackMD note-list cache"
                 );
             }
         }
+        state.misses = state.misses.saturating_add(1);
         if let Some(flight) = state.flights.get(workspace) {
             tracing::debug!(
                 cache_event = "miss",
                 coalesced = true,
+                hits = state.hits,
+                misses = state.misses,
+                evictions = state.evictions,
+                cached_bytes = state.total_bytes,
                 "HackMD note-list cache"
             );
             return CacheLookup::Wait(Arc::clone(flight));
@@ -657,6 +690,10 @@ impl NotesCache {
         tracing::debug!(
             cache_event = "miss",
             coalesced = false,
+            hits = state.hits,
+            misses = state.misses,
+            evictions = state.evictions,
+            cached_bytes = state.total_bytes,
             "HackMD note-list cache"
         );
         let generation = state.generation;
@@ -687,7 +724,18 @@ impl NotesCache {
                 && let Some(notes) = notes
             {
                 accepted = true;
-                if !self.ttl.is_zero() {
+                let size_bytes = cached_note_bytes(workspace, notes);
+                if remove_cache_entry(&mut state, workspace) {
+                    state.evictions = state.evictions.saturating_add(1);
+                    tracing::debug!(
+                        cache_event = "eviction",
+                        reason = "replacement",
+                        evictions = state.evictions,
+                        cached_bytes = state.total_bytes,
+                        "HackMD note-list cache"
+                    );
+                }
+                if !self.ttl.is_zero() && self.max_entries > 0 && size_bytes <= self.max_bytes {
                     let now = tokio::time::Instant::now();
                     let expired = state
                         .entries
@@ -696,25 +744,35 @@ impl NotesCache {
                         .map(|(key, _cached)| key.clone())
                         .collect::<Vec<_>>();
                     for key in expired {
-                        state.entries.remove(&key);
+                        remove_cache_entry(&mut state, &key);
+                        state.evictions = state.evictions.saturating_add(1);
                         tracing::debug!(
                             cache_event = "eviction",
                             reason = "expired",
+                            evictions = state.evictions,
+                            cached_bytes = state.total_bytes,
                             "HackMD note-list cache"
                         );
                     }
-                    if !state.entries.contains_key(workspace)
-                        && state.entries.len() >= MAX_CACHED_WORKSPACES
-                        && let Some(lru) = state
+                    while (!state.entries.is_empty())
+                        && (state.entries.len() >= self.max_entries
+                            || state.total_bytes.saturating_add(size_bytes) > self.max_bytes)
+                    {
+                        let Some(lru) = state
                             .entries
                             .iter()
                             .min_by_key(|(_, cached)| cached.last_access)
                             .map(|(key, _)| key.clone())
-                    {
-                        state.entries.remove(&lru);
+                        else {
+                            break;
+                        };
+                        remove_cache_entry(&mut state, &lru);
+                        state.evictions = state.evictions.saturating_add(1);
                         tracing::debug!(
                             cache_event = "eviction",
                             reason = "capacity",
+                            evictions = state.evictions,
+                            cached_bytes = state.total_bytes,
                             "HackMD note-list cache"
                         );
                     }
@@ -725,10 +783,25 @@ impl NotesCache {
                         CachedNotes {
                             stored: now,
                             last_access: access,
+                            size_bytes,
                             notes: Arc::clone(notes),
                         },
                     );
-                    tracing::debug!(cache_event = "fill", "HackMD note-list cache");
+                    state.total_bytes = state.total_bytes.saturating_add(size_bytes);
+                    tracing::debug!(
+                        cache_event = "fill",
+                        cached_bytes = state.total_bytes,
+                        max_cached_bytes = self.max_bytes,
+                        "HackMD note-list cache"
+                    );
+                } else if !self.ttl.is_zero() {
+                    tracing::debug!(
+                        cache_event = "skip",
+                        reason = "byte_capacity",
+                        entry_bytes = size_bytes,
+                        max_cached_bytes = self.max_bytes,
+                        "HackMD note-list cache"
+                    );
                 }
             }
         }
@@ -746,15 +819,84 @@ impl NotesCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.generation = state.generation.wrapping_add(1);
         if !state.entries.is_empty() {
+            state.evictions = state
+                .evictions
+                .saturating_add(u64::try_from(state.entries.len()).unwrap_or(u64::MAX));
             tracing::debug!(
                 cache_event = "eviction",
                 reason = "invalidation",
                 count = state.entries.len(),
+                evictions = state.evictions,
                 "HackMD note-list cache"
             );
         }
         state.entries.clear();
+        state.total_bytes = 0;
     }
+}
+
+fn remove_cache_entry(state: &mut NotesCacheState, workspace: &Workspace) -> bool {
+    if let Some(removed) = state.entries.remove(workspace) {
+        state.total_bytes = state.total_bytes.saturating_sub(removed.size_bytes);
+        true
+    } else {
+        false
+    }
+}
+
+fn cached_note_bytes(workspace: &Workspace, notes: &[NoteResponse]) -> usize {
+    let workspace_bytes = std::mem::size_of::<Workspace>()
+        + match workspace {
+            Workspace::Personal => 0,
+            Workspace::Team { team_path } => team_path.capacity(),
+        };
+    notes.iter().fold(
+        workspace_bytes.saturating_add(std::mem::size_of_val(notes)),
+        |total, note| total.saturating_add(note_heap_bytes(note)),
+    )
+}
+
+fn note_heap_bytes(note: &NoteResponse) -> usize {
+    fn optional(value: Option<&String>) -> usize {
+        value.map_or(0, String::capacity)
+    }
+
+    let strings = note.id.capacity()
+        + note.title.capacity()
+        + optional(note.short_id.as_ref())
+        + optional(note.publish_link.as_ref())
+        + optional(note.content.as_ref())
+        + optional(note.description.as_ref())
+        + optional(note.permalink.as_ref())
+        + optional(note.user_path.as_ref())
+        + optional(note.team_path.as_ref());
+    let tags = note.tags.iter().fold(
+        note.tags.capacity() * std::mem::size_of::<String>(),
+        |sum, tag| sum.saturating_add(tag.capacity()),
+    );
+    let user = note.last_change_user.as_ref().map_or(0, |user| {
+        user.name.capacity()
+            + user.user_path.capacity()
+            + user.photo.capacity()
+            + optional(user.biography.as_ref())
+    });
+    let folders = note.folder_paths.iter().fold(
+        note.folder_paths.capacity() * std::mem::size_of::<crate::dto::FolderPathResponse>(),
+        |sum, folder| {
+            sum.saturating_add(
+                folder.id.capacity()
+                    + folder.name.capacity()
+                    + optional(folder.parent_id.as_ref())
+                    + optional(folder.icon.as_ref())
+                    + optional(folder.color.as_ref())
+                    + optional(folder.client_id.as_ref()),
+            )
+        },
+    );
+    strings
+        .saturating_add(tags)
+        .saturating_add(user)
+        .saturating_add(folders)
 }
 
 struct CacheFill<'a> {
@@ -1084,7 +1226,7 @@ mod tests {
 
     use super::{
         CacheFill, CacheLookup, HackmdClient, HackmdError, MAX_CACHED_WORKSPACES, NO_BODY,
-        NotesCache, retry_after,
+        NotesCache, cached_note_bytes, retry_after,
     };
     use crate::config::Config;
 
@@ -1272,6 +1414,107 @@ mod tests {
             panic!("least-recently-used workspace should have been evicted");
         };
         let _ = cache.finish(&least_recently_used, generation, &flight, None);
+    }
+
+    #[test]
+    fn cache_byte_capacity_counts_allocations_and_evicts_lru_entries() {
+        let first_workspace = Workspace::Team {
+            team_path: "first".to_owned(),
+        };
+        let second_workspace = Workspace::Team {
+            team_path: "second".to_owned(),
+        };
+        let mut first_note: crate::dto::NoteResponse =
+            serde_json::from_str(r#"{"id":"first","title":"First"}"#)
+                .expect("note fixture should deserialize");
+        let mut reserved_content = String::with_capacity(2_048);
+        reserved_content.push('x');
+        first_note.content = Some(reserved_content);
+        let first: Arc<[crate::dto::NoteResponse]> = vec![first_note].into();
+        let second: Arc<[crate::dto::NoteResponse]> = vec![
+            serde_json::from_str(r#"{"id":"second","title":"Second"}"#)
+                .expect("note fixture should deserialize"),
+        ]
+        .into();
+        let first_bytes = cached_note_bytes(&first_workspace, &first);
+        let second_bytes = cached_note_bytes(&second_workspace, &second);
+        assert!(first_bytes >= 2_048, "String capacity must be accounted");
+        let cache =
+            NotesCache::with_limits(Duration::from_secs(60), 10, first_bytes.max(second_bytes));
+
+        for (workspace, notes) in [(&first_workspace, &first), (&second_workspace, &second)] {
+            let CacheLookup::Fill { generation, flight } = cache.begin(workspace, false) else {
+                panic!("new workspace should miss");
+            };
+            assert!(cache.finish(workspace, generation, &flight, Some(notes)));
+        }
+        assert!(matches!(
+            cache.begin(&second_workspace, false),
+            CacheLookup::Hit(_)
+        ));
+
+        let state = cache.state.lock().expect("cache mutex should lock");
+        assert_eq!(state.entries.len(), 1);
+        assert!(state.entries.contains_key(&second_workspace));
+        assert_eq!(state.total_bytes, second_bytes);
+        assert_eq!(state.evictions, 1);
+        assert_eq!(state.hits, 1);
+        assert_eq!(state.misses, 2);
+    }
+
+    #[test]
+    fn zero_or_undersized_byte_capacity_disables_storage_without_rejecting_fill() {
+        let workspace = Workspace::Personal;
+        let notes: Arc<[crate::dto::NoteResponse]> = vec![
+            serde_json::from_str(r#"{"id":"id","title":"Title"}"#)
+                .expect("note fixture should deserialize"),
+        ]
+        .into();
+        let required = cached_note_bytes(&workspace, &notes);
+
+        for max_bytes in [0, required - 1] {
+            let cache = NotesCache::with_limits(Duration::from_secs(60), 1, max_bytes);
+            let CacheLookup::Fill { generation, flight } = cache.begin(&workspace, false) else {
+                panic!("empty cache should miss");
+            };
+            assert!(cache.finish(&workspace, generation, &flight, Some(&notes)));
+            assert!(cache.state.lock().expect("cache mutex").entries.is_empty());
+            assert!(matches!(
+                cache.begin(&workspace, false),
+                CacheLookup::Fill { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn oversized_refresh_removes_the_previous_cached_value() {
+        let workspace = Workspace::Personal;
+        let original: Arc<[crate::dto::NoteResponse]> = vec![
+            serde_json::from_str(r#"{"id":"id","title":"Original"}"#)
+                .expect("note fixture should deserialize"),
+        ]
+        .into();
+        let limit = cached_note_bytes(&workspace, &original);
+        let cache = NotesCache::with_limits(Duration::from_secs(60), 1, limit);
+        let CacheLookup::Fill { generation, flight } = cache.begin(&workspace, false) else {
+            panic!("empty cache should miss");
+        };
+        assert!(cache.finish(&workspace, generation, &flight, Some(&original)));
+
+        let mut oversized_note: crate::dto::NoteResponse =
+            serde_json::from_str(r#"{"id":"id","title":"Changed"}"#)
+                .expect("note fixture should deserialize");
+        oversized_note.content = Some("x".repeat(limit));
+        let oversized: Arc<[crate::dto::NoteResponse]> = vec![oversized_note].into();
+        let CacheLookup::Fill { generation, flight } = cache.begin(&workspace, true) else {
+            panic!("refresh should begin a fill");
+        };
+        assert!(cache.finish(&workspace, generation, &flight, Some(&oversized)));
+
+        let state = cache.state.lock().expect("cache mutex should lock");
+        assert!(state.entries.is_empty());
+        assert_eq!(state.total_bytes, 0);
+        assert_eq!(state.evictions, 1);
     }
 
     #[tokio::test]

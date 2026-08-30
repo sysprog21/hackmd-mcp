@@ -249,10 +249,6 @@ dependency, or background task without a bound and an invalidation rule.
 - [ ] Establish reproducible peak-RSS and allocation baselines for startup,
   listing 10,000 notes, a 10 MiB pull, safe push, and a three-way conflict. Run
   release builds with default features and with `otel`; report both separately.
-- [ ] Enforce byte-based limits on every cache, not just entry counts. Account
-  for note bodies by capacity, cap workspace-summary caches independently, and
-  expose hit/miss/eviction counters without note titles, bodies, paths, or token
-  data.
 - [ ] Review long-lived `String`, `Vec`, and `Arc` fields with a heap profiler.
   Change representation only where the baseline shows retained memory; avoid
   speculative `Box<str>`/`Arc<str>` churn that merely moves allocations.

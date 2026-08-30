@@ -2,6 +2,15 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Bound the only active cache by both 32 workspaces and 8 MiB of estimated
+  retained allocation. Accounting includes the note slice, every `String`/`Vec`
+  capacity, nested user/folder metadata, workspace keys, and unexpected content
+  bodies; no note-body cache exists. Oversized or zero-capacity fills are
+  returned to their caller but not retained, and an oversized refresh removes
+  the older cached value. LRU/expiry/replacement/invalidation paths maintain
+  total bytes and monotonic hit/miss/eviction counters exposed in metadata-free
+  debug events. Focused tests verify capacity accounting and counter drift.
+
 - [x] Add the declarative HTTP `Scenario` fixture foundation. Each step names
   the expected method and encoded path, selected exact headers, a described body
   predicate, response status/body/headers, and optional delay. Accepted sockets
