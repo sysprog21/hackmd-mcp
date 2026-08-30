@@ -65,6 +65,19 @@ impl LocalFiles {
         &self.state
     }
 
+    pub(crate) fn probe_workspace_root(&self) -> Result<(), LocalAccessError> {
+        let Some(root) = self.root.as_ref() else {
+            return Ok(());
+        };
+        let dir = Dir::open_ambient_dir(root, ambient_authority())
+            .map_err(|_| LocalAccessError::MissingRoot { root: root.clone() })?;
+        if dir.metadata(".")?.is_dir() {
+            Ok(())
+        } else {
+            Err(LocalAccessError::MissingRoot { root: root.clone() })
+        }
+    }
+
     /// Decides whether a caller-supplied path may be read or written.
     ///
     /// Without `HACKMD_MCP_WORKSPACE_ROOT` every absolute path is allowed,

@@ -23,7 +23,7 @@ impl HackmdServer {
         Self { client, files }
     }
 
-    /// The 22 tools, assembled from one router per family. Splitting them keeps
+    /// The 24 tools, assembled from one router per family. Splitting them keeps
     /// each file about a single part of the API; the router the transport sees
     /// is the same either way.
     ///

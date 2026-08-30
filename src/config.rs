@@ -178,6 +178,17 @@ impl Config {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_local_paths_for_tests(
+        mut self,
+        state_dir: PathBuf,
+        workspace_root: Option<PathBuf>,
+    ) -> Self {
+        self.state_dir = state_dir;
+        self.workspace_root = workspace_root;
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_loopback_test_with_timeout(
         api_url: &str,
         token: &str,

@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod dto;
 mod folders;
+mod health;
 mod local;
 mod models;
 mod note;
@@ -19,6 +20,8 @@ mod fixture;
 
 /// The package version exposed by the server binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub use health::{SelfCheckReport, run_self_check};
 
 /// Runs the MCP server over standard input and output until the client closes
 /// the transport.

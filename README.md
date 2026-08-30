@@ -50,6 +50,18 @@ start. Otherwise a checked-out repository could point your token at a host of it
 choosing. A token inside the file does not change this, because an inherited value takes
 precedence over it. Set both keys in the same place.
 
+## Self-check
+
+Run `hackmd-mcp --self-check` to print a JSON report and exit without starting
+the MCP transport. It reports the package version, whether a token is present,
+the API origin, state-directory writability, and whether workspace-root
+confinement is configured and accessible. It never prints the token.
+
+Add `--probe-api` to perform one authenticated, read-only `GET /me` request. The
+report includes only probe success or a bounded error—not profile data. A failed
+local check or requested API probe produces a nonzero exit status while keeping
+stdout valid JSON for editor integrations.
+
 The token is loaded lazily, redacted from diagnostics, and never validated at
 startup. Local sync state can contain note content and must also remain private.
 

@@ -284,6 +284,13 @@
 
 ## P4 — remote use
 
+- [x] Add `--self-check` as a machine-readable JSON diagnostic that exits
+  before the MCP transport starts. Report version, token presence without its
+  value, API origin, a real private state-directory write probe, and configured
+  workspace-root confinement/accessibility. Optional `--probe-api` performs
+  only authenticated `GET /me` and reports success or a bounded error without
+  returning profile data. Failed checks keep stdout valid JSON and exit
+  nonzero for editor integrations.
 - [x] Add `clap`-generated `--help` and `--version`, covered through the built
   executable. Add `README.md`, `.env.example`, `.env` ignore protection, sample
   Claude Desktop and Codex stdio configurations, token/state security guidance,

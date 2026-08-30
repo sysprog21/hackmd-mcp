@@ -108,6 +108,14 @@ impl StateStore {
         Self { root }
     }
 
+    pub(crate) fn probe_writable(&self) -> Result<(), StateError> {
+        create_private_dir_all(&self.root)?;
+        let temporary = NamedTempFile::new_in(&self.root)?;
+        set_private_permissions(temporary.as_file())?;
+        temporary.as_file().sync_all()?;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn root(&self) -> &Path {
         &self.root

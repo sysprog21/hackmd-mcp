@@ -197,12 +197,6 @@ test (see P3) for each and record the answer here.
 
 ## P4 — remote use
 
-- [ ] Add a machine-readable health/self-check command that performs no remote
-  mutation: report version, token presence (never its value), API endpoint
-  origin, state-directory writability, workspace-root confinement, and an
-  optional authenticated `/me` probe. This gives editor integrations a safe
-  startup diagnostic without parsing logs or making an MCP write call.
-
 ## Deliberately deferred
 
 - A bounded `hackmd_watch_note_sync` polling tool. A watch capped at 20 seconds

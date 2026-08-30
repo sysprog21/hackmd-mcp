@@ -76,6 +76,8 @@ fn help_and_version_exit_without_starting_the_transport() {
     let help = String::from_utf8(help.stdout).expect("help should be UTF-8");
     assert!(help.contains("Local-first MCP server for the HackMD API"));
     assert!(help.contains("--version"));
+    assert!(help.contains("--self-check"));
+    assert!(help.contains("--probe-api"));
 
     let version = Command::new(env!("CARGO_BIN_EXE_hackmd-mcp"))
         .arg("--version")
@@ -87,6 +89,66 @@ fn help_and_version_exit_without_starting_the_transport() {
             .expect("version should be UTF-8")
             .trim(),
         concat!("hackmd-mcp ", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn self_check_prints_json_and_exits_before_transport_startup() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let output = Command::new(env!("CARGO_BIN_EXE_hackmd-mcp"))
+        .arg("--self-check")
+        .env_remove("HACKMD_API_TOKEN")
+        .env_remove("HACKMD_API_URL")
+        .env_remove("HACKMD_MCP_WORKSPACE_ROOT")
+        .env("HACKMD_MCP_STATE_DIR", directory.path().join("state"))
+        .output()
+        .expect("self-check should run");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("self-check output should be JSON");
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(report["token_present"], false);
+    assert_eq!(report["api_origin"], "https://api.hackmd.io");
+    assert_eq!(report["state_directory"]["writable"], true);
+    assert_eq!(report["workspace_root"]["configured"], false);
+    assert_eq!(report["workspace_root"]["confined"], false);
+    assert!(report.get("api_probe").is_none());
+}
+
+#[test]
+fn api_probe_requires_self_check_mode() {
+    let output = Command::new(env!("CARGO_BIN_EXE_hackmd-mcp"))
+        .arg("--probe-api")
+        .output()
+        .expect("invalid CLI invocation should exit");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn requested_api_probe_reports_missing_token_as_json_failure() {
+    let directory = tempfile::tempdir().expect("temporary directory should create");
+    let output = Command::new(env!("CARGO_BIN_EXE_hackmd-mcp"))
+        .args(["--self-check", "--probe-api"])
+        .env_remove("HACKMD_API_TOKEN")
+        .env_remove("HACKMD_API_URL")
+        .env_remove("HACKMD_MCP_WORKSPACE_ROOT")
+        .env("HACKMD_MCP_STATE_DIR", directory.path().join("state"))
+        .output()
+        .expect("self-check probe should run");
+    assert!(!output.status.success());
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("failure should remain JSON");
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["token_present"], false);
+    assert_eq!(report["api_probe"]["requested"], true);
+    assert_eq!(report["api_probe"]["ok"], false);
+    assert!(
+        report["api_probe"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("HACKMD_API_TOKEN is not configured"))
     );
 }
 
