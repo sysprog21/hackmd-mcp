@@ -2,6 +2,12 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Establish reproducible release peak-RSS baselines for startup, 10,000-note
+  listing, an actual 10 MiB pull, safe push, and a maximum three-way conflict,
+  separately for default and `otel` features. `scripts/measure-memory.sh` builds
+  first and emits TSV; `MEMORY.md` records the 2026-08-31 matrix, methodology,
+  fixture overhead caveat, and the unusable local Massif result.
+
 - [x] Audit personal/team and status-code test families for consolidation. HTTP
   status mappings and empty-success statuses already use case tables; combined
   workspace tests already share setup. Keep the remaining personal/team cases

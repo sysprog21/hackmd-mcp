@@ -229,12 +229,11 @@ dependency, or background task without a bound and an invalidation rule.
 
 ### P3 — reduce memory consumption
 
-- [ ] Establish reproducible peak-RSS and allocation baselines for startup,
-  listing 10,000 notes, a 10 MiB pull, safe push, and a three-way conflict. Run
-  release builds with default features and with `otel`; report both separately.
-- [ ] Review long-lived `String`, `Vec`, and `Arc` fields with a heap profiler.
-  Change representation only where the baseline shows retained memory; avoid
-  speculative `Box<str>`/`Arc<str>` churn that merely moves allocations.
+- [ ] Install `heaptrack` (Valgrind Massif 3.22 failed to complete even the
+  bounded startup workload here), then profile the five commands emitted by
+  `scripts/measure-memory.sh`. Attribute retained allocations to long-lived
+  `String`, `Vec`, and `Arc` fields; change representation only where snapshots
+  show retention, and rerun the same default/`otel` matrix afterward.
 
 ### P4 — eliminate unnecessary Rust dependencies
 

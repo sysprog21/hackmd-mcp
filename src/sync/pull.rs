@@ -293,6 +293,52 @@ mod tests {
         fixture.finish();
     }
 
+    /// Manual peak-memory workload used by `scripts/measure-memory.sh`.
+    #[tokio::test]
+    #[ignore = "manual 10 MiB pull memory baseline"]
+    async fn benchmark_10_mib_pull() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let destination = directory.path().join("note.md");
+        let content = "x".repeat(BODY_MAX_BYTES);
+        let response = serde_json::to_string(&serde_json::json!({
+            "id": "large-note",
+            "title": "Large",
+            "content": content,
+            "lastChangedAt": 1
+        }))
+        .expect("large response should serialize");
+        let fixture =
+            crate::fixture::SequenceServer::spawn_scenarios([crate::fixture::Scenario::new(
+                "GET",
+                "/v1/notes/large-note",
+                200,
+                &response,
+            )]);
+        let files = crate::fixture::unconfined_files(directory.path().join("state"));
+        let output = pull_note(
+            &fixture.client(),
+            &files,
+            PullNoteInput {
+                workspace: Workspace::Personal,
+                note_ref: "large-note".to_owned(),
+                refresh: false,
+                local_path: destination.clone(),
+                overwrite_local: false,
+                create_parent_dirs: true,
+                confirm_large_file: true,
+            },
+        )
+        .await
+        .expect("maximum-size pull should succeed")
+        .expect("direct note should resolve");
+        assert_eq!(output.bytes, BODY_MAX_BYTES);
+        assert_eq!(
+            fs::metadata(destination).expect("note should exist").len(),
+            BODY_MAX_BYTES as u64
+        );
+        fixture.finish();
+    }
+
     #[tokio::test]
     async fn path_guards_fail_before_network_or_filesystem_mutation() {
         let client = HackmdClient::new(Config::for_tests()).expect("client should build");
