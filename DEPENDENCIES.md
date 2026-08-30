@@ -8,7 +8,7 @@ resolved graph.
 | Dependency | Required role and feature policy |
 | --- | --- |
 | `cap-std` | Capability-confined local file access prevents workspace-root escapes. Its default feature set is empty. |
-| `clap` | Parses the two self-check flags plus generated help/version. Color and typo suggestions are disabled; derive, errors, help, usage, and `std` remain covered by stdio tests. |
+| `clap` | Parses the two self-check flags plus generated help/version. Color and typo suggestions are disabled; derive, errors, help, usage, and `std` remain covered by stdio tests. A measured minimal-parser experiment reduced size but regressed clean release build time, so the maintained parser remains. |
 | `directories` | Selects the platform state directory when no explicit override is configured. |
 | `fastrand` | Supplies retry full jitter and collision-resistant atomic-write suffixes. The `std` default is required for process/thread-local randomness. |
 | `httpdate` | Parses standards-compliant HTTP-date `Retry-After` values; a partial local parser would weaken rate-limit handling. |

@@ -276,10 +276,6 @@ dependency, or background task without a bound and an invalidation rule.
 - [ ] Add `cargo machete` (or an equivalent unused-direct-dependency check) to
   CI and run `cargo tree -d` on dependency updates. Keep RustSec auditing. Pin
   the CI tool version so a new lint cannot break `main` without review.
-- [ ] Evaluate replacing `clap` derive with the smaller builder API or a minimal
-  parser for the three supported flags. Accept the change only if release binary
-  size and clean-build time improve materially while help/version/error behavior
-  remains covered by `tests/stdio.rs`.
 - [ ] Evaluate whether `fastrand` and `httpdate` can be removed using existing
   runtime/HTTP facilities without weakening jitter or RFC date parsing. Do not
   replace either with hand-rolled randomness or a partial date parser.

@@ -2,6 +2,13 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Evaluate replacing Clap derive with a minimal parser under the documented
+  acceptance gate. The experiment removed six resolved packages and reduced
+  the release executable from 14,788,104 to 14,343,688 bytes, but an isolated
+  locked release build regressed from 46.02 to 53.28 seconds. Reject the parser
+  churn, retain trimmed Clap with its tested help/version/error behavior, and
+  record the result in the dependency policy.
+
 - [x] Audit every direct dependency and its enabled features in
   `DEPENDENCIES.md`. Disable unused Clap color/suggestion support and
   tracing-subscriber ANSI/log bridging, removing eight packages from both the
