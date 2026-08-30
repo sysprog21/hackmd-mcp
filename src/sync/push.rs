@@ -311,7 +311,10 @@ fn conflict_diff(baseline: &str, local: &str, remote: &str) -> String {
 }
 
 fn bounded_diff_input(value: &str) -> Cow<'_, str> {
-    const MAX_INPUT_BYTES: usize = 256 * 1024;
+    // Each side can emit at most 1.9 KiB. Keeping 8 KiB from both ends gives
+    // the formatter ample context while preventing `similar` from indexing
+    // hundreds of KiB that can never reach the result.
+    const MAX_INPUT_BYTES: usize = 16 * 1024;
     if value.len() <= MAX_INPUT_BYTES {
         return Cow::Borrowed(value);
     }

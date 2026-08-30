@@ -223,14 +223,6 @@ dependency, or background task without a bound and an invalidation rule.
   recovery, cache-eviction, or platform-specific branches. Coverage tooling
   must remain CI-only rather than a runtime dependency.
 
-### P3 — reduce memory consumption
-
-- [ ] Install `heaptrack` (Valgrind Massif 3.22 failed to complete even the
-  bounded startup workload here), then profile the five commands emitted by
-  `scripts/measure-memory.sh`. Attribute retained allocations to long-lived
-  `String`, `Vec`, and `Arc` fields; change representation only where snapshots
-  show retention, and rerun the same default/`otel` matrix afterward.
-
 ### P4 — eliminate unnecessary Rust dependencies
 
 - [ ] Add `cargo machete` (or an equivalent unused-direct-dependency check) to

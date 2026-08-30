@@ -297,9 +297,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "manual 10 MiB pull memory baseline"]
     async fn benchmark_10_mib_pull() {
+        const WORKLOAD_BYTES: usize = 10 * 1024 * 1024;
         let directory = tempfile::tempdir().expect("temp directory should create");
         let destination = directory.path().join("note.md");
-        let content = "x".repeat(BODY_MAX_BYTES);
+        let content = "x".repeat(WORKLOAD_BYTES);
         let response = serde_json::to_string(&serde_json::json!({
             "id": "large-note",
             "title": "Large",
@@ -331,10 +332,10 @@ mod tests {
         .await
         .expect("maximum-size pull should succeed")
         .expect("direct note should resolve");
-        assert_eq!(output.bytes, BODY_MAX_BYTES);
+        assert_eq!(output.bytes, WORKLOAD_BYTES);
         assert_eq!(
             fs::metadata(destination).expect("note should exist").len(),
-            BODY_MAX_BYTES as u64
+            WORKLOAD_BYTES as u64
         );
         fixture.finish();
     }

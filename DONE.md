@@ -2,6 +2,15 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Profile allocations for all five memory workloads with the locally
+  available GNU libc `memusage` after Massif proved unusable. The 10,000-note
+  cache retains 5,987,804 accounted bytes under its 8 MiB cap; startup, sync,
+  and server fields do not retain bulk note bodies, so speculative `Box<str>` or
+  `Arc<str>` conversions were rejected. Reduce conflict formatter input from
+  256 KiB to 16 KiB per version because only 1.9 KiB per side can be emitted.
+  Correct the pull workload to an actual 10 MiB rather than the 50 MiB product
+  maximum, rerun default/`otel` RSS, and record allocation peaks in `MEMORY.md`.
+
 - [x] Consolidate cross-module workflows at the RMCP transport boundary without
   weakening the production HTTPS-only configuration. One lifecycle resolves a
   scoped URL, gets and edits its note, confirms create-time folder placement,
