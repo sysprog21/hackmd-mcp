@@ -196,6 +196,12 @@ dependency, or background task without a bound and an invalidation rule.
       cargo test --test live-readonly -- --ignored --nocapture
   ```
 
+  Prerequisite audit on 2026-08-31: none of the three live-test variables is
+  present locally, and `gh secret list --repo sysprog21/hackmd-mcp` reports no
+  repository secrets. Supply a dedicated read-only token (and preferably a
+  team path) in the local environment; do not commit it or substitute an
+  anonymous response.
+
   Copy its personal/team note GET/list `ETag`, `Last-Modified`, and conditional
   statuses into `DONE.md` with the date. Implement
   `If-None-Match` or `If-Modified-Since` only after a live `304` is demonstrated;
