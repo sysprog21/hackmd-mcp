@@ -30,6 +30,9 @@ pub(crate) struct ListNotesInput {
     /// Require every supplied tag, matched case-insensitively.
     #[serde(default)]
     pub(crate) tags: Vec<String>,
+    /// Bypass the 60-second workspace cache and fetch a new list from HackMD.
+    #[serde(default)]
+    pub(crate) refresh: bool,
     /// Deterministic note ordering (default `last_changed_desc`).
     #[serde(default)]
     #[schemars(default = "default_sort")]
@@ -92,7 +95,7 @@ pub(crate) async fn list_notes(
     input: ListNotesInput,
 ) -> Result<ListNotesOutput, ListNotesError> {
     validate_limit(input.limit)?;
-    let notes = client.list_notes(&input.workspace).await?;
+    let notes = client.list_notes(&input.workspace, input.refresh).await?;
     Ok(filter_sort_page(&notes, &input))
 }
 
@@ -216,6 +219,7 @@ mod tests {
             offset: 0,
             query: None,
             tags: Vec::new(),
+            refresh: false,
             sort: NoteSort::LastChangedDesc,
         }
     }

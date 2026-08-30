@@ -20,6 +20,9 @@ pub(crate) struct GetNoteInput {
     pub(crate) workspace: Workspace,
     /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
     pub(crate) note_ref: String,
+    /// Bypass cached note lists when resolving an `@owner/slug` URL.
+    #[serde(default)]
+    pub(crate) refresh: bool,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -67,8 +70,13 @@ pub(crate) async fn get_note(
     client: &HackmdClient,
     input: GetNoteInput,
 ) -> Result<Result<NoteDetail, NoteResolution>, GetNoteError> {
-    let resolution =
-        crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
+    let resolution = crate::note::reference::resolve_note_ref(
+        client,
+        input.workspace,
+        &input.note_ref,
+        input.refresh,
+    )
+    .await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
@@ -179,6 +187,7 @@ mod tests {
             GetNoteInput {
                 workspace: Workspace::Personal,
                 note_ref: "internal-id".to_owned(),
+                refresh: false,
             },
         )
         .await

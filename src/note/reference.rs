@@ -57,6 +57,7 @@ pub(crate) async fn resolve_note_ref(
     client: &HackmdClient,
     workspace: Workspace,
     note_ref: &str,
+    refresh: bool,
 ) -> Result<NoteResolution, NoteRefError> {
     match parse_note_ref(note_ref)? {
         ParsedNoteRef::Direct(note_id) => Ok(NoteResolution::Resolved {
@@ -77,7 +78,7 @@ pub(crate) async fn resolve_note_ref(
                     team_path: team.path,
                 }
             };
-            let notes = client.list_notes(&workspace).await?;
+            let notes = client.list_notes(&workspace, refresh).await?;
             Ok(unique_matches(&workspace, &slug, &notes, |note, query| {
                 note.short_id.as_deref() == Some(query) || note.permalink.as_deref() == Some(query)
             }))
@@ -209,7 +210,7 @@ mod tests {
             "https://hackmd.io/short-id",
             "hackmd.io/short-id",
         ] {
-            let result = resolve_note_ref(&client, Workspace::Personal, value)
+            let result = resolve_note_ref(&client, Workspace::Personal, value, false)
                 .await
                 .expect("direct reference should resolve without an API token");
             assert!(matches!(result, NoteResolution::Resolved { .. }));
@@ -235,6 +236,7 @@ mod tests {
                 team_path: "ignored".to_owned(),
             },
             "https://hackmd.io/@alice/slug",
+            false,
         )
         .await
         .expect("personal URL should resolve");
@@ -244,6 +246,38 @@ mod tests {
         let requests = fixture.finish();
         assert!(requests[0].starts_with("GET /v1/me HTTP/1.1\r\n"));
         assert!(requests[1].starts_with("GET /v1/notes HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn scoped_url_refresh_bypasses_a_cached_workspace_list() {
+        let fixture = crate::fixture::SequenceServer::spawn([
+            (200, r#"{"id":"u","name":"User","userPath":"alice"}"#),
+            (200, r#"[{"id":"old","title":"Old","permalink":"slug"}]"#),
+            (200, r#"{"id":"u","name":"User","userPath":"alice"}"#),
+            (200, r#"[{"id":"new","title":"New","permalink":"slug"}]"#),
+        ]);
+        let client = fixture.client_with_cache();
+
+        let first = resolve_note_ref(
+            &client,
+            Workspace::Personal,
+            "https://hackmd.io/@alice/slug",
+            false,
+        )
+        .await
+        .expect("first URL should resolve");
+        let refreshed = resolve_note_ref(
+            &client,
+            Workspace::Personal,
+            "https://hackmd.io/@alice/slug",
+            true,
+        )
+        .await
+        .expect("refreshed URL should resolve");
+
+        assert!(matches!(first, NoteResolution::Resolved { note } if note.note_id == "old"));
+        assert!(matches!(refreshed, NoteResolution::Resolved { note } if note.note_id == "new"));
+        assert_eq!(fixture.finish().len(), 4);
     }
 
     #[tokio::test]
@@ -257,9 +291,14 @@ mod tests {
             (200, r#"[{"id":"team-id","title":"Team","shortId":"slug"}]"#),
         ]);
         let client = fixture.client();
-        let result = resolve_note_ref(&client, Workspace::Personal, "https://hackmd.io/@core/slug")
-            .await
-            .expect("team URL should resolve");
+        let result = resolve_note_ref(
+            &client,
+            Workspace::Personal,
+            "https://hackmd.io/@core/slug",
+            false,
+        )
+        .await
+        .expect("team URL should resolve");
         assert!(
             matches!(result, NoteResolution::Resolved { note } if note.workspace == Workspace::Team { team_path: "core".to_owned() } && note.note_id == "team-id")
         );

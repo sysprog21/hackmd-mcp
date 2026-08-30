@@ -58,6 +58,9 @@ pub(crate) struct UpdateNoteInput {
     pub(crate) workspace: Workspace,
     /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
     pub(crate) note_ref: String,
+    /// Bypass cached note lists when resolving an `@owner/slug` URL.
+    #[serde(default)]
+    pub(crate) refresh: bool,
     pub(crate) title: Option<String>,
     /// Explicit full-body replacement. Prefer `hackmd_edit_note` for normal
     /// content edits.
@@ -86,6 +89,9 @@ pub(crate) struct DeleteNoteInput {
     pub(crate) workspace: Workspace,
     /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
     pub(crate) note_ref: String,
+    /// Bypass cached note lists when resolving an `@owner/slug` URL.
+    #[serde(default)]
+    pub(crate) refresh: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -231,8 +237,13 @@ pub(crate) async fn update_note(
         parent_folder_id: input.parent_folder_id.into_request(),
     };
     payload.validate()?;
-    let resolution =
-        crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
+    let resolution = crate::note::reference::resolve_note_ref(
+        client,
+        input.workspace,
+        &input.note_ref,
+        input.refresh,
+    )
+    .await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
@@ -252,8 +263,13 @@ pub(crate) async fn delete_note(
     client: &HackmdClient,
     input: DeleteNoteInput,
 ) -> Result<Result<DeleteNoteOutput, NoteResolution>, CrudError> {
-    let resolution =
-        crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
+    let resolution = crate::note::reference::resolve_note_ref(
+        client,
+        input.workspace,
+        &input.note_ref,
+        input.refresh,
+    )
+    .await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };

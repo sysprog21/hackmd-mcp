@@ -21,7 +21,7 @@ use crate::{
 impl HackmdServer {
     #[tool(
         name = "hackmd_list_notes",
-        description = "List personal or team HackMD notes with local metadata filtering, deterministic sorting, and pagination. This does not search note content.",
+        description = "List personal or team HackMD notes with local metadata filtering, deterministic sorting, and pagination. This does not search note content; refresh=true bypasses the 60-second list cache and costs one API request.",
         annotations(
             title = "List HackMD Notes",
             read_only_hint = true,
@@ -48,7 +48,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_get_note",
-        description = "Get one HackMD note with full content, normalized metadata, folder_ids, and the exact patch_path for safe edits.",
+        description = "Get one HackMD note with full content, normalized metadata, folder_ids, and the exact patch_path for safe edits. For @owner/slug references, refresh=true bypasses the 60-second list cache.",
         annotations(
             title = "Get HackMD Note",
             read_only_hint = true,
@@ -97,7 +97,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_update_note",
-        description = "Fallback note update for metadata or an explicit full content replacement. Prefer hackmd_edit_note for normal body edits because content here overwrites the complete unversioned body.",
+        description = "Fallback note update for metadata or an explicit full content replacement. Prefer hackmd_edit_note for normal body edits because content here overwrites the complete unversioned body. For @owner/slug references, refresh=true bypasses the list cache.",
         annotations(
             title = "Update HackMD Note",
             read_only_hint = false,
@@ -122,7 +122,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_delete_note",
-        description = "Delete a HackMD note. Personal deletion moves it to recoverable trash; team restore is not exposed. This remains destructive.",
+        description = "Delete a HackMD note. Personal deletion moves it to recoverable trash; team restore is not exposed. This remains destructive. For @owner/slug references, refresh=true bypasses the list cache.",
         annotations(
             title = "Delete HackMD Note",
             read_only_hint = false,
@@ -198,7 +198,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_edit_note",
-        description = "Default tool for normal HackMD body edits. Applies one strict Codex patch to the current content only when every hunk context is unique; prefer this over hackmd_update_note for body changes.",
+        description = "Default tool for normal HackMD body edits. Applies one strict Codex patch to the current content only when every hunk context is unique; prefer this over hackmd_update_note for body changes. For @owner/slug references, refresh=true bypasses the list cache.",
         annotations(
             title = "Edit HackMD Note Safely",
             read_only_hint = false,
@@ -254,7 +254,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_upload_note_image",
-        description = "Upload a local image to a personal-workspace note and return only its HackMD CDN link. Files above 5 MiB require confirmation; files above 10 MiB are refused.",
+        description = "Upload a local image to a personal-workspace note and return only its HackMD CDN link. Files above 5 MiB require confirmation; files above 10 MiB are refused. For @owner/slug references, refresh=true bypasses the list cache.",
         annotations(
             title = "Upload HackMD Note Image",
             read_only_hint = false,

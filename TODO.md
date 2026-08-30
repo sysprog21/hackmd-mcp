@@ -179,17 +179,72 @@ test (see P3) for each and record the answer here.
 
 ## P0 — RMCP 3.x foundation
 
-## P1 — essential RMCP tools
+- [ ] Restore the stable-toolchain lint job. `cargo clippy --all-targets
+  --all-features -- -D warnings` fails on Rust/Clippy 1.97 because
+  `clippy::unused_async_trait_impl` no longer exists, yet `src/server.rs` still
+  names it in an `#[allow]`. Remove or version-proof that suppression and add a
+  check that the macro-generated `ServerHandler` implementation stays warning
+  free on both the declared 1.88 MSRV and current stable.
 
+## P1 — essential RMCP tools
 
 ## P2 — complete daily HackMD workflow
 
+- [ ] Add a read-only `hackmd_list_tracked_notes` tool and a confirmed
+  `hackmd_untrack_note` tool. Report the workspace, note ID, local path,
+  baseline hash, and last observed remote timestamp; untracking must remove
+  only this server's sidecar, baseline, and by-path hint, never the Markdown
+  file. These operations make stale sync state discoverable and removable
+  without asking users to edit the private state directory.
+
 ## P2.5 — local Markdown sync
 
+- [ ] Close the check-then-open race in `HACKMD_MCP_WORKSPACE_ROOT`
+  confinement. `LocalFiles::allow` rejects an escaping symlink at validation
+  time, but each tool later opens the pathname separately, so another process
+  can swap an ancestor for a symlink between those operations. Introduce one
+  confined open/create abstraction (platform-specific where necessary), route
+  pull, push, snapshot, and image upload through it, and add an adversarial
+  symlink-swap test on Unix.
+- [ ] Make tracked-state recovery isolate corruption. A malformed by-path hint
+  or the sidecar it names currently returns a JSON/I/O error instead of falling
+  back to the verified sidecar scan, and one malformed unrelated sidecar can
+  abort that scan. Validate index keys as a single encoded component, treat a
+  bad hint as a cache miss, continue past unrelated corrupt sidecars, and
+  return a focused corruption error only when the sidecar for the requested
+  canonical path is itself invalid.
 
 ## P3 — efficiency and reliability
 
+- [ ] Make note-cache invalidation generation-aware. Clearing before and after
+  writes does not stop an older in-flight GET from storing its response after
+  the second clear; tag fills with an invalidation generation and discard a
+  result when the generation changed while it was in flight. Coalesce
+  concurrent misses per workspace so reference resolution cannot stampede the
+  unpaginated list endpoint, and cover both races with deterministic async
+  tests.
+- [ ] Remove timing and connection races from `SequenceServer`. On a normal
+  parallel `cargo test --all-targets --all-features` run,
+  `maps_network_and_timeout_failures` and
+  `nonempty_delete_requires_confirmation_without_mutation` intermittently fail
+  with `HackmdError::Network`; both pass alone and the complete 141-test library
+  suite passes with `--test-threads=1`. Give each fixture an explicit readiness
+  handshake and deterministic shutdown/request accounting, then stress the
+  parallel suite rather than serializing CI.
+- [ ] Bound cache memory independently of TTL. Expired workspace entries are
+  retained until a write clears the whole map, so a long-lived process that
+  touches many team paths can grow the map indefinitely. Remove expired entries
+  opportunistically and impose a small maximum workspace count with a defined
+  eviction policy; expose hit, miss, fill, and eviction events through tracing
+  without note metadata.
+
 ## P4 — remote use
+
+- [ ] Add a machine-readable health/self-check command that performs no remote
+  mutation: report version, token presence (never its value), API endpoint
+  origin, state-directory writability, workspace-root confinement, and an
+  optional authenticated `/me` probe. This gives editor integrations a safe
+  startup diagnostic without parsing logs or making an MCP write call.
 
 ## Deliberately deferred
 

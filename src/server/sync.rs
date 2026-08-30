@@ -15,7 +15,7 @@ use crate::{
 impl HackmdServer {
     #[tool(
         name = "hackmd_pull_note",
-        description = "Pull one HackMD note's exact Markdown body to an absolute local path and atomically record a private sync baseline. Existing files require overwrite_local: true.",
+        description = "Pull one HackMD note's exact Markdown body to an absolute local path and atomically record a private sync baseline. Existing files require overwrite_local: true. For @owner/slug references, refresh=true bypasses the 60-second list cache.",
         annotations(
             title = "Pull HackMD Note",
             read_only_hint = false,
@@ -39,7 +39,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_push_note",
-        description = "Push a tracked local Markdown file with safe baseline comparison by default. strategy: overwrite requires confirm: true and replaces unversioned remote content.",
+        description = "Push a tracked local Markdown file with safe baseline comparison by default. strategy: overwrite requires confirm: true and replaces unversioned remote content. For @owner/slug references, refresh=true bypasses the 60-second list cache.",
         annotations(
             title = "Push HackMD Note",
             read_only_hint = false,

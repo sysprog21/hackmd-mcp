@@ -88,6 +88,10 @@
   filter/sort locally, then slice. Return `total`, `count`, `offset`,
   `has_more`, `next_offset`, and a slim note summary. Do not offer folder
   filtering here: list responses carry no `folderPaths`.
+- [x] Add an opt-in `refresh` input to `hackmd_list_notes` and every note tool
+  that can resolve an `@owner/slug` URL. It bypasses and replaces the
+  workspace's 60-second cached list, while the default path stays cached and
+  direct note IDs continue to avoid list requests entirely.
 - [x] Add `hackmd_get_note` with full content and normalized metadata. Include
   `patch_path` exactly `notes/{id}.md` for personal notes or
   `teams/{team_path}/notes/{id}.md` for team notes, unencoded, for safe content
@@ -228,10 +232,11 @@
   explicitly paginated projections; folder lists now do the same with a
   default limit of 20 and maximum of 100. Only the explicitly invoked
   `hackmd_get_note` read returns full note content.
-- [x] Evaluate a short TTL cache and omit it pending profiling evidence. The
-  external 60-second list cache exists to support full-body search, which this
-  server deliberately excludes; ordinary discovery traffic does not yet
-  justify stale reads or write-invalidation state. Note bodies remain uncached.
+- [x] Cache each workspace's unpaginated note list for 60 seconds because both
+  listing and `@owner/slug` reference resolution consume it. Share cached
+  slices without cloning the full response and clear the cache before and
+  after every write. Note bodies remain uncached, and callers can explicitly
+  refresh a workspace list.
 - [x] Add process-unique request IDs and redacted JSON tracing to stderr for
   every MCP tool call and HackMD request. `RUST_LOG` opts into debug detail;
   the optional `otel` feature plus `HACKMD_MCP_OTEL=true` exports spans through

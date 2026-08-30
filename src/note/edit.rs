@@ -19,6 +19,9 @@ pub(crate) struct EditNoteInput {
     pub(crate) workspace: Workspace,
     /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
     pub(crate) note_ref: String,
+    /// Bypass cached note lists when resolving an `@owner/slug` URL.
+    #[serde(default)]
+    pub(crate) refresh: bool,
     /// Codex patch envelope targeting the exact `patch_path` from
     /// `hackmd_get_note`.
     pub(crate) patch: String,
@@ -51,8 +54,13 @@ pub(crate) async fn edit_note(
     client: &HackmdClient,
     input: EditNoteInput,
 ) -> Result<Result<EditNoteOutput, NoteResolution>, EditNoteError> {
-    let resolution =
-        crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
+    let resolution = crate::note::reference::resolve_note_ref(
+        client,
+        input.workspace,
+        &input.note_ref,
+        input.refresh,
+    )
+    .await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
@@ -105,6 +113,7 @@ mod tests {
         EditNoteInput {
             workspace: Workspace::Personal,
             note_ref: "note-id".to_owned(),
+            refresh: false,
             patch: patch.to_owned(),
         }
     }
@@ -118,6 +127,7 @@ mod tests {
         let input = EditNoteInput {
             workspace: Workspace::Personal,
             note_ref: "note-id".to_owned(),
+            refresh: false,
             patch:
                 "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch"
                     .to_owned(),
@@ -222,6 +232,7 @@ mod tests {
                     team_path: "core".to_owned(),
                 },
                 note_ref: "note-id".to_owned(),
+                refresh: false,
                 patch: patch.to_owned(),
             },
         )

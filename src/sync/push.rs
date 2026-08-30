@@ -31,6 +31,9 @@ pub(crate) struct PushNoteInput {
     #[serde(default)]
     pub(crate) workspace: Workspace,
     pub(crate) note_ref: String,
+    /// Bypass cached note lists when resolving an `@owner/slug` URL.
+    #[serde(default)]
+    pub(crate) refresh: bool,
     pub(crate) local_path: PathBuf,
     #[serde(default = "default_strategy")]
     #[schemars(default = "default_strategy")]
@@ -115,9 +118,13 @@ pub(crate) async fn push_note(
     files.allow(&input.local_path)?;
     let local = validate_and_read_local(&input)?;
     let tracked = files.state().load_for_local_path(&input.local_path)?;
-    let resolution =
-        crate::note::reference::resolve_note_ref(client, input.workspace.clone(), &input.note_ref)
-            .await?;
+    let resolution = crate::note::reference::resolve_note_ref(
+        client,
+        input.workspace.clone(),
+        &input.note_ref,
+        input.refresh,
+    )
+    .await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
@@ -333,6 +340,7 @@ mod tests {
         PushNoteInput {
             workspace: Workspace::Personal,
             note_ref: "note-id".to_owned(),
+            refresh: false,
             local_path: path.to_path_buf(),
             strategy,
             confirm,

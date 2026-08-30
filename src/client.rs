@@ -100,9 +100,12 @@ impl HackmdClient {
     pub(crate) async fn list_notes(
         &self,
         workspace: &Workspace,
+        refresh: bool,
     ) -> Result<Arc<[NoteResponse]>, HackmdError> {
-        if let Some(cached) = self.notes.get(workspace) {
-            return Ok(cached);
+        if !refresh {
+            if let Some(cached) = self.notes.get(workspace) {
+                return Ok(cached);
+            }
         }
         let notes: Arc<[NoteResponse]> = self
             .get_required::<Vec<NoteResponse>>(&workspace_route(workspace, &["notes"]))
@@ -861,11 +864,11 @@ mod tests {
         let client = server.client_with_cache();
 
         let first = client
-            .list_notes(&Workspace::Personal)
+            .list_notes(&Workspace::Personal, false)
             .await
             .expect("first list should fetch");
         let second = client
-            .list_notes(&Workspace::Personal)
+            .list_notes(&Workspace::Personal, false)
             .await
             .expect("second list should come from cache");
         assert_eq!(first, second);
@@ -882,7 +885,7 @@ mod tests {
             .await
             .expect("write should succeed");
         client
-            .list_notes(&Workspace::Personal)
+            .list_notes(&Workspace::Personal, false)
             .await
             .expect("list after a write should fetch again");
 
@@ -894,6 +897,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_bypasses_and_replaces_a_cached_note_list() {
+        const RENAMED: &str = r#"[{"id":"note-id","title":"Renamed"}]"#;
+        let server = SequenceServer::spawn([(200, NOTES), (200, RENAMED)]);
+        let client = server.client_with_cache();
+
+        let original = client
+            .list_notes(&Workspace::Personal, false)
+            .await
+            .expect("first list should fetch");
+        let refreshed = client
+            .list_notes(&Workspace::Personal, true)
+            .await
+            .expect("refresh should fetch");
+        let cached = client
+            .list_notes(&Workspace::Personal, false)
+            .await
+            .expect("refreshed list should be cached");
+
+        assert_eq!(original[0].title, "Note");
+        assert_eq!(refreshed[0].title, "Renamed");
+        assert_eq!(cached, refreshed);
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[tokio::test]
     async fn a_write_that_fails_still_drops_the_cached_list() {
         // HackMD applies writes asynchronously, so a PATCH that answers with an
         // error may still have landed. The cache has to go either way.
@@ -902,7 +930,7 @@ mod tests {
         let client = server.client_with_cache();
 
         client
-            .list_notes(&Workspace::Personal)
+            .list_notes(&Workspace::Personal, false)
             .await
             .expect("first list should fetch");
         client
@@ -917,7 +945,7 @@ mod tests {
             .await
             .expect_err("the fixture rejects this write");
         client
-            .list_notes(&Workspace::Personal)
+            .list_notes(&Workspace::Personal, false)
             .await
             .expect("list after a failed write should fetch again");
 
@@ -930,13 +958,16 @@ mod tests {
         let client = server.client_with_cache();
 
         client
-            .list_notes(&Workspace::Personal)
+            .list_notes(&Workspace::Personal, false)
             .await
             .expect("personal list should fetch");
         client
-            .list_notes(&Workspace::Team {
-                team_path: "core".to_owned(),
-            })
+            .list_notes(
+                &Workspace::Team {
+                    team_path: "core".to_owned(),
+                },
+                false,
+            )
             .await
             .expect("team list should fetch separately");
 

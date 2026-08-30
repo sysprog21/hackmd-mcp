@@ -24,6 +24,9 @@ pub(crate) struct UploadNoteImageInput {
     #[serde(default)]
     pub(crate) workspace: Workspace,
     pub(crate) note_ref: String,
+    /// Bypass cached note lists when resolving an `@owner/slug` URL.
+    #[serde(default)]
+    pub(crate) refresh: bool,
     /// Absolute path to a local image file.
     pub(crate) image_path: PathBuf,
     /// Required for files larger than 5 MiB.
@@ -109,8 +112,13 @@ pub(crate) async fn upload_note_image(
         return Err(UploadNoteImageError::ConfirmationRequired { size_bytes });
     }
     ensure_supported_image(&input.image_path)?;
-    let resolution =
-        crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
+    let resolution = crate::note::reference::resolve_note_ref(
+        client,
+        input.workspace,
+        &input.note_ref,
+        input.refresh,
+    )
+    .await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
@@ -160,6 +168,7 @@ mod tests {
             UploadNoteImageInput {
                 workspace: Workspace::Personal,
                 note_ref: "note/id".to_owned(),
+                refresh: false,
                 image_path: image.path().to_path_buf(),
                 confirm_large_file: false,
             },
@@ -185,6 +194,7 @@ mod tests {
         let input = UploadNoteImageInput {
             workspace: Workspace::Personal,
             note_ref: "note-id".to_owned(),
+            refresh: false,
             image_path: secret.path().to_path_buf(),
             confirm_large_file: false,
         };
@@ -218,6 +228,7 @@ mod tests {
         let input = UploadNoteImageInput {
             workspace: Workspace::Personal,
             note_ref: "id".to_owned(),
+            refresh: false,
             image_path: oversized.path().to_path_buf(),
             confirm_large_file: true,
         };
@@ -234,6 +245,7 @@ mod tests {
         let warning_input = UploadNoteImageInput {
             workspace: Workspace::Personal,
             note_ref: "id".to_owned(),
+            refresh: false,
             image_path: warning.path().to_path_buf(),
             confirm_large_file: false,
         };
@@ -251,6 +263,7 @@ mod tests {
                 team_path: "core".to_owned(),
             },
             note_ref: "id".to_owned(),
+            refresh: false,
             image_path: team_image.path().to_path_buf(),
             confirm_large_file: false,
         };
@@ -272,6 +285,7 @@ mod tests {
             UploadNoteImageInput {
                 workspace: Workspace::Personal,
                 note_ref: "id".to_owned(),
+                refresh: false,
                 image_path: image.path().to_path_buf(),
                 confirm_large_file: false,
             },

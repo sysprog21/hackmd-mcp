@@ -22,6 +22,9 @@ pub(crate) struct PullNoteInput {
     #[serde(default)]
     pub(crate) workspace: Workspace,
     pub(crate) note_ref: String,
+    /// Bypass cached note lists when resolving an `@owner/slug` URL.
+    #[serde(default)]
+    pub(crate) refresh: bool,
     /// Absolute destination path for the exact remote Markdown body.
     pub(crate) local_path: PathBuf,
     #[serde(default)]
@@ -87,8 +90,13 @@ pub(crate) async fn pull_note(
     files.allow(&input.local_path)?;
     let destination = validate_destination(&input)?;
     let allow_existing_destination = destination.exists() && input.overwrite_local;
-    let resolution =
-        crate::note::reference::resolve_note_ref(client, input.workspace, &input.note_ref).await?;
+    let resolution = crate::note::reference::resolve_note_ref(
+        client,
+        input.workspace,
+        &input.note_ref,
+        input.refresh,
+    )
+    .await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
@@ -223,6 +231,7 @@ mod tests {
         let input = PullNoteInput {
             workspace: Workspace::Personal,
             note_ref: "note-id".to_owned(),
+            refresh: false,
             local_path: directory.path().join("outside.md"),
             overwrite_local: true,
             create_parent_dirs: true,
@@ -254,6 +263,7 @@ mod tests {
             PullNoteInput {
                 workspace: Workspace::Personal,
                 note_ref: "note/id".to_owned(),
+                refresh: false,
                 local_path: destination.clone(),
                 overwrite_local: false,
                 create_parent_dirs: true,
@@ -332,6 +342,7 @@ mod tests {
         let input = PullNoteInput {
             workspace: Workspace::Personal,
             note_ref: "id".to_owned(),
+            refresh: false,
             local_path: existing,
             overwrite_local: false,
             create_parent_dirs: false,
@@ -347,6 +358,7 @@ mod tests {
         let input = PullNoteInput {
             workspace: Workspace::Personal,
             note_ref: "id".to_owned(),
+            refresh: false,
             local_path: non_markdown,
             overwrite_local: false,
             create_parent_dirs: false,
@@ -360,6 +372,7 @@ mod tests {
         let input = PullNoteInput {
             workspace: Workspace::Personal,
             note_ref: "id".to_owned(),
+            refresh: false,
             local_path: directory.path().to_path_buf(),
             overwrite_local: true,
             create_parent_dirs: false,
@@ -374,6 +387,7 @@ mod tests {
         let input = PullNoteInput {
             workspace: Workspace::Personal,
             note_ref: "id".to_owned(),
+            refresh: false,
             local_path: missing_parent.clone(),
             overwrite_local: false,
             create_parent_dirs: false,
