@@ -218,17 +218,6 @@ dependency, or background task without a bound and an invalidation rule.
 
 ### P2 — consolidate test coverage
 
-- [ ] Add `tests/support/` helpers that start the real stdio binary, serve a
-  declarative loopback HTTP sequence, frame MCP initialize/tool calls, and
-  collect responses with a five-second deadline and panic-safe child cleanup.
-- [ ] Using that harness, cover resolve/get/edit, folder placement, and
-  delete/restore as MCP integration workflows. Then delete overlapping
-  cross-module server/unit assertions while retaining parser, validation, and
-  route-contract unit tests.
-- [ ] Add a stateful pull/check/push/conflict MCP integration workflow using one
-  temporary workspace and state directory. Assert file/sidecar transitions and
-  exact HTTP request budgets, then remove only equivalent orchestration-level
-  unit tests; retain pure classification and state-recovery tests.
 - [ ] Add a coverage report in CI and ratchet changed-line coverage after the
   initial baseline. Exclude generated macro code, but do not exclude error,
   recovery, cache-eviction, or platform-specific branches. Coverage tooling

@@ -2,6 +2,16 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Consolidate cross-module workflows at the RMCP transport boundary without
+  weakening the production HTTPS-only configuration. One lifecycle resolves a
+  scoped URL, gets and edits its note, confirms create-time folder placement,
+  deletes, and restores it. A second lifecycle pulls into a confined workspace,
+  checks sync, safely pushes and advances state, then reports a three-way
+  conflict while preserving the sidecar, baseline, and path index. Declarative
+  scenarios enforce exact HTTP budgets and write bodies. Existing lower-level
+  tests remain only where they cover distinct parsing, race, recovery, timeout,
+  or state invariants; no insecure stdio loopback override was added.
+
 - [x] Establish reproducible release peak-RSS baselines for startup, 10,000-note
   listing, an actual 10 MiB pull, safe push, and a maximum three-way conflict,
   separately for default and `otel` features. `scripts/measure-memory.sh` builds

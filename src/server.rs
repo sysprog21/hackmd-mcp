@@ -156,10 +156,20 @@ mod tests {
         rmcp::service::RunningService<rmcp::RoleClient, ()>,
         tokio::task::JoinHandle<()>,
     ) {
+        protocol_client_with_files(config, test_files()).await
+    }
+
+    async fn protocol_client_with_files(
+        config: Config,
+        files: Arc<crate::local::LocalFiles>,
+    ) -> (
+        rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server = HackmdServer::new(
             Arc::new(HackmdClient::new(config).expect("protocol-test client should build")),
-            test_files(),
+            files,
         );
         let server_task = tokio::spawn(async move {
             server
@@ -187,6 +197,106 @@ mod tests {
     ) {
         client.cancel().await.expect("RMCP client should cancel");
         server_task.await.expect("protocol-test server should stop");
+    }
+
+    fn note_lifecycle_fixture() -> SequenceServer {
+        SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/me",
+                200,
+                r#"{"id":"u","name":"User","userPath":"alice"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes",
+                200,
+                r#"[{"id":"note-id","title":"Note","permalink":"slug"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"old"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"old"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, "")
+                .expect_body("the edited Markdown body", |body| {
+                    body == r#"{"content":"new"}"#
+                }),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"new"}"#,
+            ),
+            Scenario::new(
+                "POST",
+                "/v1/notes",
+                201,
+                r#"{"id":"new-id","title":"Placed"}"#,
+            )
+            .expect_body("the requested folder placement", |body| {
+                body == r#"{"title":"Placed","parentFolderId":"folder-id"}"#
+            }),
+            Scenario::new(
+                "GET",
+                "/v1/notes/new-id",
+                200,
+                r#"{"id":"new-id","title":"Placed","folderPaths":[{"id":"folder-id","name":"Folder"}]}"#,
+            ),
+            Scenario::new("DELETE", "/v1/notes/new-id", 204, ""),
+            Scenario::new(
+                "PUT",
+                "/v1/trash/new-id/restore",
+                200,
+                r#"{"restored":true}"#,
+            ),
+        ])
+    }
+
+    fn sync_lifecycle_fixture() -> SequenceServer {
+        SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"baseline","lastChangedAt":1}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"baseline","lastChangedAt":1}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"baseline","lastChangedAt":1}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, "")
+                .expect_body("the locally edited body", |body| {
+                    body == r#"{"content":"local edit"}"#
+                }),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"local edit","lastChangedAt":2}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"remote edit","lastChangedAt":3}"#,
+            ),
+        ])
     }
 
     #[test]
@@ -810,6 +920,153 @@ mod tests {
                 .text,
             "patch hunk context was not found"
         );
+        stop_protocol(client, server_task).await;
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn rmcp_note_lifecycle_covers_resolution_edit_folder_delete_and_restore() {
+        let fixture = note_lifecycle_fixture();
+        let (client, server_task) = protocol_client(Config::for_loopback_test(
+            &fixture.api_url,
+            Some("fixture-token"),
+        ))
+        .await;
+
+        let get = client
+            .call_tool(call(
+                "hackmd_get_note",
+                json!({"note_ref":"https://hackmd.io/@alice/slug"}),
+            ))
+            .await
+            .expect("resolved get should complete");
+        assert_eq!(get.is_error, Some(false));
+        assert_eq!(
+            get.structured_content.expect("get result")["note"]["id"],
+            "note-id"
+        );
+
+        let edit = client
+            .call_tool(call(
+                "hackmd_edit_note",
+                json!({
+                    "note_ref":"note-id",
+                    "patch":"*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch"
+                }),
+            ))
+            .await
+            .expect("edit should complete");
+        assert_eq!(edit.is_error, Some(false));
+        assert_eq!(
+            edit.structured_content.expect("edit result")["result"]["changed"],
+            true
+        );
+
+        let create = client
+            .call_tool(call(
+                "hackmd_create_note",
+                json!({"title":"Placed","parent_folder_id":"folder-id"}),
+            ))
+            .await
+            .expect("create should complete");
+        assert_eq!(create.is_error, Some(false));
+        let created = create.structured_content.expect("create result");
+        assert_eq!(created["result"]["folder_placement_confirmed"], true);
+        assert_eq!(created["result"]["compatibility_patch_applied"], false);
+
+        let deleted = client
+            .call_tool(call("hackmd_delete_note", json!({"note_ref":"new-id"})))
+            .await
+            .expect("delete should complete");
+        assert_eq!(deleted.is_error, Some(false));
+        let restored = client
+            .call_tool(call("hackmd_restore_note", json!({"note_id":"new-id"})))
+            .await
+            .expect("restore should complete");
+        assert_eq!(restored.is_error, Some(false));
+
+        stop_protocol(client, server_task).await;
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn rmcp_sync_lifecycle_covers_pull_check_push_and_conflict() {
+        let directory = tempfile::tempdir().expect("workflow directory should create");
+        let root = directory.path().join("workspace");
+        std::fs::create_dir(&root).expect("workspace root should create");
+        let local_path = root.join("note.md");
+        let state_dir = directory.path().join("state");
+        let fixture = sync_lifecycle_fixture();
+        let files = Arc::new(crate::local::LocalFiles::new(state_dir.clone(), Some(root)));
+        let (client, server_task) = protocol_client_with_files(
+            Config::for_loopback_test(&fixture.api_url, Some("fixture-token")),
+            files,
+        )
+        .await;
+        let path = local_path.to_string_lossy().into_owned();
+
+        let pull = client
+            .call_tool(call(
+                "hackmd_pull_note",
+                json!({"note_ref":"note-id","local_path":&path,"create_parent_dirs":true}),
+            ))
+            .await
+            .expect("pull should complete");
+        assert_eq!(pull.is_error, Some(false));
+        assert_eq!(pull.structured_content.expect("pull result")["bytes"], 8);
+        assert_eq!(
+            std::fs::read_to_string(&local_path).expect("pulled note should read"),
+            "baseline"
+        );
+
+        let check = client
+            .call_tool(call("hackmd_check_note_sync", json!({"local_path":&path})))
+            .await
+            .expect("check should complete");
+        assert_eq!(check.is_error, Some(false));
+        assert_eq!(
+            check.structured_content.expect("check result")["status"],
+            "in_sync"
+        );
+
+        std::fs::write(&local_path, "local edit").expect("local edit should write");
+        let push = client
+            .call_tool(call(
+                "hackmd_push_note",
+                json!({"note_ref":"note-id","local_path":&path}),
+            ))
+            .await
+            .expect("push should complete");
+        assert_eq!(push.is_error, Some(false));
+        assert_eq!(
+            push.structured_content.expect("push result")["status"],
+            "pushed"
+        );
+
+        std::fs::write(&local_path, "second local").expect("second local edit should write");
+        let conflict = client
+            .call_tool(call(
+                "hackmd_push_note",
+                json!({"note_ref":"note-id","local_path":&path}),
+            ))
+            .await
+            .expect("conflict check should complete");
+        assert_eq!(conflict.is_error, Some(false));
+        let conflict = conflict.structured_content.expect("conflict result");
+        assert_eq!(conflict["status"], "conflict");
+        assert_eq!(conflict["merge_required"], true);
+        assert!(conflict["baseline_path"].is_string());
+        assert!(conflict["diff_summary"].is_string());
+        assert!(conflict["instructions"].is_string());
+
+        let tracked = std::fs::read_dir(state_dir.join("tracked"))
+            .expect("tracked state should exist")
+            .count();
+        let indexes = std::fs::read_dir(state_dir.join("by-path"))
+            .expect("path index should exist")
+            .count();
+        assert_eq!(tracked, 2, "sidecar and baseline should remain");
+        assert_eq!(indexes, 1, "one path index should remain");
         stop_protocol(client, server_task).await;
         fixture.finish();
     }
