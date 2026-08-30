@@ -6,13 +6,67 @@ use super::HackmdServer;
 use crate::{
     reply,
     sync::{
-        check::CheckNoteSyncInput, pull::PullNoteInput, push::PushNoteInput,
+        check::CheckNoteSyncInput,
+        pull::PullNoteInput,
+        push::PushNoteInput,
         snapshot::SaveRemoteSnapshotInput,
+        tracking::{ListTrackedNotesInput, UntrackNoteInput},
     },
 };
 
 #[tool_router(router = sync_router, vis = "pub(crate)")]
 impl HackmdServer {
+    #[tool(
+        name = "hackmd_list_tracked_notes",
+        description = "List private local HackMD sync records with workspace, note ID, Markdown path, baseline hash, and last observed remote timestamp. This reads no note bodies and makes no remote request.",
+        annotations(
+            title = "List Tracked HackMD Notes",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn list_tracked_notes(
+        &self,
+        Parameters(input): Parameters<ListTrackedNotesInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::sync::tracking::list_tracked_notes(&self.files, input) {
+            Ok(output) => reply::structured(
+                format!(
+                    "Found {} tracked HackMD note(s); returned {}",
+                    output.meta.total, output.meta.count
+                ),
+                &output,
+            ),
+            Err(error) => reply::error(error.to_string()),
+        }
+    }
+
+    #[tool(
+        name = "hackmd_untrack_note",
+        description = "Delete one private sync sidecar, exact baseline, and path-index hint. Requires confirm=true and never deletes or changes the local Markdown file or remote HackMD note.",
+        annotations(
+            title = "Untrack HackMD Note",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn untrack_note(
+        &self,
+        Parameters(input): Parameters<UntrackNoteInput>,
+    ) -> rmcp::model::CallToolResult {
+        match crate::sync::tracking::untrack_note(&self.files, input) {
+            Ok(output) => reply::structured(
+                format!("Stopped tracking HackMD note {}", output.note_id),
+                &output,
+            ),
+            Err(error) => reply::error(error.to_string()),
+        }
+    }
+
     #[tool(
         name = "hackmd_pull_note",
         description = "Pull one HackMD note's exact Markdown body to an absolute local path and atomically record a private sync baseline. Existing files require overwrite_local: true. For @owner/slug references, refresh=true bypasses the 60-second list cache.",

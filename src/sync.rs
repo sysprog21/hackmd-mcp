@@ -6,6 +6,7 @@ pub(crate) mod pull;
 pub(crate) mod push;
 pub(crate) mod snapshot;
 pub(crate) mod state;
+pub(crate) mod tracking;
 
 /// Note body sizes the sync tools accept. Above the warning size a caller must
 /// pass `confirm_large_file`; above the maximum the body is refused outright,

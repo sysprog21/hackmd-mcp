@@ -171,6 +171,13 @@
 
 ## P2.5 — local Markdown sync
 
+- [x] Add paginated `hackmd_list_tracked_notes` for discovering private sync
+  records without reading working files or contacting HackMD. Add confirmed,
+  local-only `hackmd_untrack_note` keyed by workspace and internal note ID; it
+  removes the verified sidecar, exact baseline, and only an owned by-path hint,
+  while never opening, changing, or deleting the Markdown file. Stale records
+  remain removable after their working file has disappeared.
+
 - [x] Add `hackmd_pull_note` with workspace-aware note resolution and an
   absolute local path. Write the exact remote Markdown body without rewriting
   it or injecting frontmatter, requiring explicit overwrite for existing files.

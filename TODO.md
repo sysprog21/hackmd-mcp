@@ -190,13 +190,6 @@ test (see P3) for each and record the answer here.
 
 ## P2 — complete daily HackMD workflow
 
-- [ ] Add a read-only `hackmd_list_tracked_notes` tool and a confirmed
-  `hackmd_untrack_note` tool. Report the workspace, note ID, local path,
-  baseline hash, and last observed remote timestamp; untracking must remove
-  only this server's sidecar, baseline, and by-path hint, never the Markdown
-  file. These operations make stale sync state discoverable and removable
-  without asking users to edit the private state directory.
-
 ## P2.5 — local Markdown sync
 
 - [ ] Close the check-then-open race in `HACKMD_MCP_WORKSPACE_ROOT`

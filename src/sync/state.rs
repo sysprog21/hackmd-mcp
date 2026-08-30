@@ -146,6 +146,13 @@ impl StateStore {
     ) -> Result<(), StateError> {
         let key = state_key(&state.workspace, &state.internal_id);
         let paths = self.paths_for_key(&key);
+        if let Ok(previous) = fs::read(&paths.sidecar).and_then(|bytes| {
+            serde_json::from_slice::<TrackedNoteState>(&bytes).map_err(io::Error::other)
+        }) && previous.local_file_identity.canonical_path
+            != state.local_file_identity.canonical_path
+        {
+            self.remove_hint_if_matches(&previous.local_file_identity.canonical_path, &key)?;
+        }
         write_private_atomic(&paths.baseline, baseline_body.as_bytes())?;
         let sidecar = serde_json::to_vec_pretty(state)?;
         write_private_atomic(&paths.sidecar, &sidecar)?;
@@ -159,6 +166,70 @@ impl StateStore {
             key.as_bytes(),
         )?;
         Ok(())
+    }
+
+    /// Reads every tracked sidecar without touching the working Markdown or
+    /// baseline files. Callers use this for state discovery, not sync safety;
+    /// an individual sync still verifies its baseline before comparison.
+    pub(crate) fn list_tracked(&self) -> Result<Vec<TrackedNoteState>, StateError> {
+        let tracked = self.root.join("tracked");
+        let entries = match fs::read_dir(tracked) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(StateError::Io(error)),
+        };
+        let mut states = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                states.push(serde_json::from_slice(&fs::read(path)?)?);
+            }
+        }
+        Ok(states)
+    }
+
+    /// Stops tracking exactly one workspace/note pair. The working Markdown
+    /// path in the sidecar is used only to locate its rebuildable index hint;
+    /// the working file itself is never opened, changed, or removed.
+    pub(crate) fn untrack(
+        &self,
+        workspace: &Workspace,
+        internal_id: &str,
+    ) -> Result<TrackedNoteState, StateError> {
+        let paths = self.paths_for(workspace, internal_id);
+        let sidecar = match fs::read(&paths.sidecar) {
+            Ok(sidecar) => sidecar,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(StateError::NotTracked);
+            }
+            Err(error) => return Err(StateError::Io(error)),
+        };
+        let state: TrackedNoteState = serde_json::from_slice(&sidecar)?;
+        if state.workspace != *workspace || state.internal_id != internal_id {
+            return Err(StateError::StateIdentityMismatch);
+        }
+
+        self.remove_hint_if_matches(
+            &state.local_file_identity.canonical_path,
+            &state_key(workspace, internal_id),
+        )?;
+        remove_if_present(&paths.baseline)?;
+        remove_if_present(&paths.sidecar)?;
+        Ok(state)
+    }
+
+    fn remove_hint_if_matches(
+        &self,
+        canonical: &Path,
+        expected_key: &str,
+    ) -> Result<(), StateError> {
+        let hint = self.index_path(canonical);
+        match fs::read_to_string(&hint) {
+            Ok(key) if key.trim() == expected_key => remove_if_present(&hint),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(StateError::Io(error)),
+        }
     }
 
     /// Follows the by-path pointer, if one is there and still describes this
@@ -361,6 +432,8 @@ pub(crate) enum StateError {
     Io(#[from] io::Error),
     #[error("local state serialization failed")]
     Serialize(#[from] serde_json::Error),
+    #[error("tracked sidecar identity does not match its filename")]
+    StateIdentityMismatch,
     #[error(
         "tracked baseline {} does not match its recorded hash; re-pull note {note_id} from {workspace} to {} before syncing",
         baseline_path.display(),
@@ -372,6 +445,14 @@ pub(crate) enum StateError {
         workspace: Workspace,
         local_path: PathBuf,
     },
+}
+
+fn remove_if_present(path: &Path) -> Result<(), StateError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StateError::Io(error)),
+    }
 }
 
 #[cfg(test)]
@@ -536,5 +617,35 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn untracking_an_old_note_does_not_remove_a_reused_paths_new_hint() {
+        let directory = tempfile::tempdir().expect("temporary directory should create");
+        let store = StateStore::new(directory.path().join("state"));
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").expect("working Markdown should write");
+
+        for note_id in ["old", "new"] {
+            let state = TrackedNoteState::capture(
+                note_id.to_owned(),
+                Workspace::Personal,
+                local_path.clone(),
+                "baseline",
+                Some(1),
+            )
+            .expect("tracked state should capture");
+            store
+                .persist_from_sync(&state, "baseline")
+                .expect("tracked state should persist");
+        }
+
+        store
+            .untrack(&Workspace::Personal, "old")
+            .expect("old note should untrack");
+        let loaded = store
+            .load_for_local_path(&local_path)
+            .expect("new note hint should remain usable");
+        assert_eq!(loaded.state.internal_id, "new");
     }
 }

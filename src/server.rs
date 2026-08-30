@@ -121,7 +121,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 22] = [
+    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 24] = [
         ("hackmd_get_me", true, false, true),
         ("hackmd_list_teams", true, false, true),
         ("hackmd_list_notes", true, false, true),
@@ -144,6 +144,8 @@ mod tests {
         ("hackmd_push_note", false, true, true),
         ("hackmd_check_note_sync", true, false, true),
         ("hackmd_save_remote_snapshot", false, true, false),
+        ("hackmd_list_tracked_notes", true, false, true),
+        ("hackmd_untrack_note", false, true, true),
     ];
 
     async fn protocol_client(
@@ -201,7 +203,7 @@ mod tests {
     fn tools_have_generated_schemas_and_exact_annotations() {
         let tools = HackmdServer::router().list_all();
 
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 24);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = tools
                 .iter()
@@ -214,7 +216,8 @@ mod tests {
             assert_eq!(annotations.read_only_hint, Some(read_only), "{name}");
             assert_eq!(annotations.destructive_hint, Some(destructive), "{name}");
             assert_eq!(annotations.idempotent_hint, Some(idempotent), "{name}");
-            assert_eq!(annotations.open_world_hint, Some(true));
+            let open_world = !matches!(name, "hackmd_list_tracked_notes" | "hackmd_untrack_note");
+            assert_eq!(annotations.open_world_hint, Some(open_world), "{name}");
         }
         for name in ["hackmd_get_me", "hackmd_list_teams"] {
             let tool = tools
@@ -502,7 +505,7 @@ mod tests {
             .list_tools(None)
             .await
             .expect("tools/list should succeed");
-        assert_eq!(listed.tools.len(), 22);
+        assert_eq!(listed.tools.len(), 24);
         for (name, read_only, destructive, idempotent) in EXPECTED_ANNOTATIONS {
             let tool = listed
                 .tools
@@ -582,6 +585,24 @@ mod tests {
             "safe"
         );
         assert_eq!(push.input_schema["properties"]["confirm"]["default"], false);
+        let tracked = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_list_tracked_notes")
+            .expect("tracked-note list should be listed");
+        assert_eq!(tracked.input_schema["properties"]["limit"]["default"], 20);
+        assert_eq!(tracked.input_schema["properties"]["limit"]["maximum"], 100);
+        assert_eq!(tracked.input_schema["properties"]["offset"]["default"], 0);
+        let untrack = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "hackmd_untrack_note")
+            .expect("untrack tool should be listed");
+        assert_eq!(untrack.input_schema["required"], json!(["note_id"]));
+        assert_eq!(
+            untrack.input_schema["properties"]["confirm"]["default"],
+            false
+        );
         let folders = listed
             .tools
             .iter()
