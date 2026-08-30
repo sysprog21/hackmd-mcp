@@ -2,6 +2,14 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Preserve transactional push semantics across the remote/local boundary.
+  A rejected or unconfirmed remote write leaves the baseline untouched; after
+  confirmed readback, local persistence failures return a compact note-specific
+  recovery error directing the caller to pull before another push. Write paths
+  invalidate the existing list cache before and after network I/O, and no body
+  snapshot cache is enabled. Focused tests sabotage state storage after loading
+  and separately reject PATCH to prove both failure directions.
+
 - [x] Apply note edits differentially against one freshly fetched current body.
   The strict patch parser rejects missing, wrong, and ambiguous context; no-op
   patches stop after the single GET, while changes send the API-required full

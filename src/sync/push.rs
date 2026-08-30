@@ -96,6 +96,14 @@ pub(crate) enum PushNoteError {
     MissingRemoteContent { note_id: String },
     #[error("HackMD accepted the update for note {note_id}, but read-back content did not match")]
     ReadbackMismatch { note_id: String },
+    #[error(
+        "HackMD updated note {note_id}, but local sync state could not be persisted; run hackmd_pull_note before the next push"
+    )]
+    StatePersistenceAfterWrite {
+        note_id: String,
+        #[source]
+        source: Box<StateError>,
+    },
     #[error("local file I/O failed")]
     LocalIo(#[source] std::io::Error),
     #[error(transparent)]
@@ -240,7 +248,12 @@ async fn push_resolved(
         });
     }
     let result = output(&target, PushStatus::Pushed, true);
-    advance_state(files, tracked.state, &local, readback.value.last_changed_at)?;
+    advance_state(files, tracked.state, &local, readback.value.last_changed_at).map_err(
+        |source| PushNoteError::StatePersistenceAfterWrite {
+            note_id: note.note_id,
+            source: Box::new(source),
+        },
+    )?;
     Ok(Ok(result))
 }
 
@@ -381,7 +394,7 @@ fn advance_state(
     state: TrackedNoteState,
     body: &str,
     remote_timestamp: Option<i64>,
-) -> Result<(), PushNoteError> {
+) -> Result<(), StateError> {
     let state = state.advance(body, remote_timestamp)?;
     files.state().persist_from_sync(&state, body)?;
     Ok(())
@@ -393,7 +406,7 @@ mod tests {
 
     use super::{
         PushNoteError, PushNoteInput, PushStatus, PushStrategy, conflict_diff, push_note,
-        validate_body_size,
+        push_resolved, validate_body_size,
     };
     use crate::{
         client::HackmdClient,
@@ -446,6 +459,99 @@ mod tests {
             .load_for_local_path(&local_path)
             .expect("state should still load");
         assert_eq!(loaded.baseline_body, "baseline");
+    }
+
+    #[tokio::test]
+    async fn confirmed_remote_write_with_failed_state_persistence_is_recoverable() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "local edit").expect("local fixture should write");
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        let tracked = files
+            .state()
+            .load_for_local_path(&local_path)
+            .expect("tracked state should load before sabotage");
+
+        let state_root = directory.path().join("state");
+        fs::remove_dir_all(&state_root).expect("state fixture should be removable");
+        fs::write(&state_root, "blocks directory recreation")
+            .expect("blocking state file should write");
+
+        let fixture = crate::fixture::SequenceServer::spawn([
+            (202, ""),
+            (
+                200,
+                r#"{"id":"note-id","title":"Note","content":"local edit","lastChangedAt":2}"#,
+            ),
+        ]);
+        let result = push_resolved(
+            &fixture.client(),
+            &files,
+            PushStrategy::Safe,
+            tracked,
+            crate::note::reference::ResolvedNoteRef {
+                workspace: Workspace::Personal,
+                note_id: "note-id".to_owned(),
+            },
+            serde_json::from_str(r#"{"id":"note-id","title":"Note","content":"baseline"}"#)
+                .expect("remote fixture should deserialize"),
+            "local edit".to_owned(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(PushNoteError::StatePersistenceAfterWrite { note_id, .. })
+                if note_id == "note-id"
+        ));
+        assert_request_sequence(
+            &fixture.finish(),
+            &[
+                "PATCH /v1/notes/note-id HTTP/1.1",
+                "GET /v1/notes/note-id HTTP/1.1",
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_remote_write_does_not_advance_local_state() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "local edit").expect("local fixture should write");
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        let tracked = files
+            .state()
+            .load_for_local_path(&local_path)
+            .expect("tracked state should load");
+        let fixture = crate::fixture::SequenceServer::spawn([(400, r#"{"error":"rejected"}"#)]);
+
+        let result = push_resolved(
+            &fixture.client_without_retry("fixture-token"),
+            &files,
+            PushStrategy::Safe,
+            tracked,
+            crate::note::reference::ResolvedNoteRef {
+                workspace: Workspace::Personal,
+                note_id: "note-id".to_owned(),
+            },
+            serde_json::from_str(r#"{"id":"note-id","title":"Note","content":"baseline"}"#)
+                .expect("remote fixture should deserialize"),
+            "local edit".to_owned(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(PushNoteError::Api(_))));
+        assert_eq!(
+            files
+                .state()
+                .load_for_local_path(&local_path)
+                .expect("unchanged state should load")
+                .baseline_body,
+            "baseline"
+        );
+        assert_request_sequence(&fixture.finish(), &["PATCH /v1/notes/note-id HTTP/1.1"]);
     }
 
     #[tokio::test]

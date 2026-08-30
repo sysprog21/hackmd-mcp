@@ -221,10 +221,6 @@ dependency, or background task without a bound and an invalidation rule.
   `hackmd_check_note_sync`, use a demonstrated conditional GET when available;
   otherwise fetch once and hash while reading. Never report `in_sync` from TTL
   alone.
-- [ ] Persist state and cache updates transactionally from the caller's point of
-  view: a failed remote write cannot advance the baseline; a successful remote
-  write with failed local persistence must return a recovery error containing
-  the note ID and must evict cached state.
 
 ### P2 — consolidate test coverage
 
