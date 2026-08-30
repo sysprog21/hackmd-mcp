@@ -2,6 +2,19 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Audit personal/team and status-code test families for consolidation. HTTP
+  status mappings and empty-success statuses already use case tables; combined
+  workspace tests already share setup. Keep the remaining personal/team cases
+  separate because their route shapes, preflight behavior, permissions, or
+  unsupported-operation contracts differ materially. Test names state those
+  invariants.
+
+- [x] Enforce the evidence gate for dependency changes. The direct-dependency
+  inventory and current duplicate graph were rechecked; the only new removal
+  proposal (replacing Clap) already has clean build time, release size, resolved
+  package count, and test evidence recorded above and was rejected because build
+  time regressed. No unmeasured dependency removal remains proposed.
+
 - [x] Add an ignored, threshold-free 10,000-note benchmark with 16 concurrent
   callers. It reports the coalesced miss and cached filter/sort durations, exact
   one-request budget, cache hit/miss counters, and estimated retained allocation

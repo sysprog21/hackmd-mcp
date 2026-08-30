@@ -217,10 +217,6 @@ dependency, or background task without a bound and an invalidation rule.
 
 ### P2 — consolidate test coverage
 
-- [ ] Convert duplicated personal/team and status-code tests into table-driven
-  cases. Retain separate tests only where route shape, permissions, or API
-  behavior genuinely differs. Test names must describe the invariant rather
-  than the implementation function.
 - [ ] Move cross-module workflow coverage to integration tests through the MCP
   transport: resolve/get/edit, pull/check/push/conflict, folder placement, and
   delete/restore. Unit tests should own parsers, validation boundaries, cache
@@ -245,10 +241,6 @@ dependency, or background task without a bound and an invalidation rule.
 - [ ] Add `cargo machete` (or an equivalent unused-direct-dependency check) to
   CI and run `cargo tree -d` on dependency updates. Keep RustSec auditing. Pin
   the CI tool version so a new lint cannot break `main` without review.
-- [ ] For every proposed removal, capture `cargo tree`, clean build time, release
-  binary size, and test results before and after. Reject dependency churn that
-  only replaces one direct crate with an equal or larger transitive graph.
-
 ## Deliberately deferred
 
 - A bounded `hackmd_watch_note_sync` polling tool. A watch capped at 20 seconds
