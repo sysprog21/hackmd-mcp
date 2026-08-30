@@ -232,6 +232,14 @@
 
 ## P3 — efficiency and reliability
 
+- [x] Remove parallel fixture races. The network-error test previously bound
+  and released an ephemeral port before connecting; another parallel fixture
+  could claim that port, consume the wrong request, and make both tests fail.
+  Replace it with a fixture that retains the listener and deliberately closes
+  one accepted request. All sequence fixtures now handshake after their server
+  thread starts, use interruptible nonblocking accepts, report captured request
+  counts, and shut down and join on both `finish` and `Drop`, including repeating
+  responders. Twelve consecutive default-parallel all-feature runs passed.
 - [x] Add `tests/live-smoke.rs`, disabled by default and gated by
   `HACKMD_RUN_LIVE_TESTS=1` plus a dedicated token. Its panic-safe cleanup
   covers personal profile, note create/read/edit/no-op, nested folders and

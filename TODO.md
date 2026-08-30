@@ -194,14 +194,6 @@ test (see P3) for each and record the answer here.
 
 ## P3 — efficiency and reliability
 
-- [ ] Remove timing and connection races from `SequenceServer`. On a normal
-  parallel `cargo test --all-targets --all-features` run,
-  `maps_network_and_timeout_failures` and
-  `nonempty_delete_requires_confirmation_without_mutation` intermittently fail
-  with `HackmdError::Network`; both pass alone and the complete 141-test library
-  suite passes with `--test-threads=1`. Give each fixture an explicit readiness
-  handshake and deterministic shutdown/request accounting, then stress the
-  parallel suite rather than serializing CI.
 
 ## P4 — remote use
 

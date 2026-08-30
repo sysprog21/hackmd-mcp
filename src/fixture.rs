@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -29,7 +29,8 @@ type FixtureResponse = (u16, String, FixtureHeaders);
 pub(crate) struct SequenceServer {
     pub(crate) api_url: String,
     requests: Receiver<Vec<String>>,
-    thread: JoinHandle<()>,
+    shutdown: Sender<()>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl SequenceServer {
@@ -41,6 +42,34 @@ impl SequenceServer {
     /// waiting when something else happens.
     pub(crate) fn spawn_delayed(status: u16, body: &str, delay: Duration) -> Self {
         Self::spawn_inner([(status, body.to_owned(), EMPTY_HEADERS)], delay)
+    }
+
+    /// Accepts one complete request and closes the connection without a
+    /// response, producing a deterministic transport error without releasing a
+    /// port that another parallel fixture could claim.
+    pub(crate) fn spawn_disconnect() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("fixture listener should be nonblocking");
+        let address = listener.local_addr().expect("fixture address should exist");
+        let (sender, requests) = mpsc::channel();
+        let (shutdown, shutdown_rx) = mpsc::channel();
+        let (ready, ready_rx) = mpsc::sync_channel(0);
+        let thread = thread::spawn(move || {
+            ready.send(()).expect("fixture readiness should send");
+            let captured = accept_next(&listener, &shutdown_rx)
+                .map(|mut stream| vec![read_request(&mut stream)])
+                .unwrap_or_default();
+            let _ = sender.send(captured);
+        });
+        ready_rx.recv().expect("fixture thread should become ready");
+        Self {
+            api_url: format!("http://{address}/v1"),
+            requests,
+            shutdown,
+            thread: Some(thread),
+        }
     }
 
     pub(crate) fn spawn_with_headers<const N: usize>(
@@ -76,13 +105,22 @@ impl SequenceServer {
         repeating: bool,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("fixture should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("fixture listener should be nonblocking");
         let address = listener.local_addr().expect("fixture address should exist");
         let (sender, requests) = mpsc::channel();
+        let (shutdown, shutdown_rx) = mpsc::channel();
+        let (ready, ready_rx) = mpsc::sync_channel(0);
         let thread = thread::spawn(move || {
+            ready.send(()).expect("fixture readiness should send");
             let mut captured = Vec::with_capacity(N);
             let last = responses.last().cloned();
             for (status, body, headers) in responses {
-                let (mut stream, _) = listener.accept().expect("request should connect");
+                let Some(mut stream) = accept_next(&listener, &shutdown_rx) else {
+                    let _ = sender.send(captured);
+                    return;
+                };
                 captured.push(read_request(&mut stream));
                 let extra_headers =
                     headers
@@ -97,11 +135,11 @@ impl SequenceServer {
                     "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("response should write");
+                let _ = stream.write_all(response.as_bytes());
             }
-            sender.send(captured).expect("requests should send");
+            if sender.send(captured).is_err() {
+                return;
+            }
 
             let Some((status, body, _)) = last.filter(|_| repeating) else {
                 return;
@@ -110,17 +148,19 @@ impl SequenceServer {
                 "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            while let Ok((mut stream, _)) = listener.accept() {
+            while let Some(mut stream) = accept_next(&listener, &shutdown_rx) {
                 read_request(&mut stream);
                 if stream.write_all(response.as_bytes()).is_err() {
-                    return;
+                    continue;
                 }
             }
         });
+        ready_rx.recv().expect("fixture thread should become ready");
         Self {
             api_url: format!("http://{address}/v1"),
             requests,
-            thread,
+            shutdown,
+            thread: Some(thread),
         }
     }
 
@@ -164,13 +204,42 @@ impl SequenceServer {
         requests.remove(0)
     }
 
-    pub(crate) fn finish(self) -> Vec<String> {
+    pub(crate) fn finish(mut self) -> Vec<String> {
         let requests = self
             .requests
             .recv_timeout(Duration::from_secs(2))
             .expect("requests should be captured");
-        self.thread.join().expect("fixture thread should finish");
+        let _ = self.shutdown.send(());
+        self.thread
+            .take()
+            .expect("fixture thread should exist")
+            .join()
+            .expect("fixture thread should finish");
         requests
+    }
+}
+
+impl Drop for SequenceServer {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn accept_next(listener: &TcpListener, shutdown: &Receiver<()>) -> Option<TcpStream> {
+    loop {
+        if shutdown.try_recv().is_ok() {
+            return None;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => return Some(stream),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("fixture accept failed: {error}"),
+        }
     }
 }
 

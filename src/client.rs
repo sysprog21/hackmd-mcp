@@ -1033,7 +1033,7 @@ impl From<HackmdError> for rmcp::model::CallToolResult {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration};
 
     const NOTES: &str = r#"[{"id":"note-id","title":"Note"}]"#;
 
@@ -1554,23 +1554,15 @@ mod tests {
 
     #[tokio::test]
     async fn maps_network_and_timeout_failures() {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").expect("temporary listener should bind to loopback");
-        let address = listener
-            .local_addr()
-            .expect("temporary address should be available");
-        drop(listener);
-        let network_client = HackmdClient::new(Config::for_loopback_test_no_retry(
-            &format!("http://{address}/v1"),
-            "fixture-token",
-        ))
-        .expect("network fixture client should build");
+        let disconnect = SequenceServer::spawn_disconnect();
+        let network_client = disconnect.client_without_retry("fixture-token");
         assert!(matches!(
             network_client
                 .request_json::<Value>(Method::GET, &["me"], NO_BODY)
                 .await,
             Err(HackmdError::Network { .. })
         ));
+        assert_eq!(disconnect.finish().len(), 1);
 
         let server =
             SequenceServer::spawn_delayed(200, r#"{"ok":true}"#, Duration::from_millis(100));
