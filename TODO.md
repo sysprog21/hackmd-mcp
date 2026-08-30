@@ -221,10 +221,6 @@ dependency, or background task without a bound and an invalidation rule.
   `hackmd_check_note_sync`, use a demonstrated conditional GET when available;
   otherwise fetch once and hash while reading. Never report `in_sync` from TTL
   alone.
-- [ ] Make edits differential locally: parse and validate the patch against the
-  cached/current body, skip no-op PATCH requests, and send HackMD the full body
-  only because API v1 requires it. Preserve strict unique-context matching and
-  always perform bounded readback before advancing cache or sync state.
 - [ ] Persist state and cache updates transactionally from the caller's point of
   view: a failed remote write cannot advance the baseline; a successful remote
   write with failed local persistence must return a recovery error containing

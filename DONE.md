@@ -2,6 +2,12 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Apply note edits differentially against one freshly fetched current body.
+  The strict patch parser rejects missing, wrong, and ambiguous context; no-op
+  patches stop after the single GET, while changes send the API-required full
+  body once and require bounded matching readback. Exact request-budget and
+  conflict tests verify that invalid/no-op edits never issue PATCH requests.
+
 - [x] Evaluate `fastrand` and `httpdate` against existing public runtime/HTTP
   facilities. Retain them: standard Tokio/reqwest APIs provide neither a
   maintained full-jitter RNG nor RFC HTTP-date parsing, and hand-written
