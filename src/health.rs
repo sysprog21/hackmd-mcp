@@ -51,7 +51,12 @@ struct ApiProbeCheck {
 }
 
 /// Builds a machine-readable startup diagnostic. The optional API operation is
-/// GET /me; this function never mutates a remote HackMD resource.
+/// GET /me; this function never mutates a remote `HackMD` resource.
+///
+/// # Errors
+///
+/// Returns a configuration error when local settings are invalid, or a client
+/// error when `probe_api` is enabled and the read-only API probe cannot run.
 pub async fn run_self_check(
     probe_api: bool,
 ) -> Result<SelfCheckReport, Box<dyn std::error::Error>> {

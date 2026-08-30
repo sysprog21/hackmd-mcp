@@ -150,9 +150,7 @@ impl SequenceServer {
             );
             while let Some(mut stream) = accept_next(&listener, &shutdown_rx) {
                 read_request(&mut stream);
-                if stream.write_all(response.as_bytes()).is_err() {
-                    continue;
-                }
+                let _ = stream.write_all(response.as_bytes());
             }
         });
         ready_rx.recv().expect("fixture thread should become ready");
@@ -234,7 +232,12 @@ fn accept_next(listener: &TcpListener, shutdown: &Receiver<()>) -> Option<TcpStr
             return None;
         }
         match listener.accept() {
-            Ok((stream, _)) => return Some(stream),
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("fixture stream should be blocking");
+                return Some(stream);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(1));
             }
@@ -250,7 +253,18 @@ fn read_request(stream: &mut TcpStream) -> String {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
-        let count = stream.read(&mut buffer).expect("request should read");
+        let count = match stream.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => panic!("request should read: {error}"),
+        };
         assert!(count > 0, "connection closed before full request arrived");
         request.extend_from_slice(&buffer[..count]);
         let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {

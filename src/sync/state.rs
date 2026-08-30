@@ -194,7 +194,7 @@ impl StateStore {
                 match serde_json::from_slice(&bytes) {
                     Ok(state) => states.push(state),
                     Err(_) => {
-                        tracing::warn!(path = %path.display(), "skipping malformed tracked sidecar")
+                        tracing::warn!(path = %path.display(), "skipping malformed tracked sidecar");
                     }
                 }
             }
@@ -309,12 +309,11 @@ impl StateStore {
                 continue;
             }
             let bytes = fs::read(&path)?;
-            let state: TrackedNoteState = match serde_json::from_slice(&bytes) {
-                Ok(state) => state,
-                Err(_) => {
-                    tracing::warn!(path = %path.display(), "skipping malformed tracked sidecar");
-                    continue;
-                }
+            let state: TrackedNoteState = if let Ok(state) = serde_json::from_slice(&bytes) {
+                state
+            } else {
+                tracing::warn!(path = %path.display(), "skipping malformed tracked sidecar");
+                continue;
             };
             if state.local_file_identity.canonical_path == canonical {
                 let paths = self.paths_for(&state.workspace, &state.internal_id);

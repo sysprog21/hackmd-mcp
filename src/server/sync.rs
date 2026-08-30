@@ -31,7 +31,7 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<ListTrackedNotesInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::sync::tracking::list_tracked_notes(&self.files, input) {
+        match crate::sync::tracking::list_tracked_notes(&self.files, &input) {
             Ok(output) => reply::structured(
                 format!(
                     "Found {} tracked HackMD note(s); returned {}",
@@ -58,7 +58,7 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<UntrackNoteInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::sync::tracking::untrack_note(&self.files, input) {
+        match crate::sync::tracking::untrack_note(&self.files, &input) {
             Ok(output) => reply::structured(
                 format!("Stopped tracking HackMD note {}", output.note_id),
                 &output,

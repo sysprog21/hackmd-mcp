@@ -30,7 +30,7 @@ pub(crate) struct ListNotesInput {
     /// Require every supplied tag, matched case-insensitively.
     #[serde(default)]
     pub(crate) tags: Vec<String>,
-    /// Bypass the 60-second workspace cache and fetch a new list from HackMD.
+    /// Bypass the 60-second workspace cache and fetch a new list from `HackMD`.
     #[serde(default)]
     pub(crate) refresh: bool,
     /// Deterministic note ordering (default `last_changed_desc`).

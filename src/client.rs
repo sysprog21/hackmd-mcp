@@ -610,16 +610,16 @@ impl NotesCache {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !bypass_cache && !self.ttl.is_zero() {
             state.access_clock = state.access_clock.wrapping_add(1);
             let access = state.access_clock;
-            if let Some(cached) = state.entries.get_mut(workspace) {
-                if cached.stored.elapsed() < self.ttl {
-                    cached.last_access = access;
-                    tracing::debug!(cache_event = "hit", "HackMD note-list cache");
-                    return CacheLookup::Hit(Arc::clone(&cached.notes));
-                }
+            if let Some(cached) = state.entries.get_mut(workspace)
+                && cached.stored.elapsed() < self.ttl
+            {
+                cached.last_access = access;
+                tracing::debug!(cache_event = "hit", "HackMD note-list cache");
+                return CacheLookup::Hit(Arc::clone(&cached.notes));
             }
             if state.entries.remove(workspace).is_some() {
                 tracing::debug!(
@@ -658,7 +658,7 @@ impl NotesCache {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut accepted = false;
         if state
             .flights
@@ -666,53 +666,52 @@ impl NotesCache {
             .is_some_and(|current| Arc::ptr_eq(current, flight))
         {
             state.flights.remove(workspace);
-            if state.generation == generation {
-                if let Some(notes) = notes {
-                    accepted = true;
-                    if !self.ttl.is_zero() {
-                        let now = tokio::time::Instant::now();
-                        let expired = state
+            if state.generation == generation
+                && let Some(notes) = notes
+            {
+                accepted = true;
+                if !self.ttl.is_zero() {
+                    let now = tokio::time::Instant::now();
+                    let expired = state
+                        .entries
+                        .iter()
+                        .filter(|&(_key, cached)| cached.stored.elapsed() >= self.ttl)
+                        .map(|(key, _cached)| key.clone())
+                        .collect::<Vec<_>>();
+                    for key in expired {
+                        state.entries.remove(&key);
+                        tracing::debug!(
+                            cache_event = "eviction",
+                            reason = "expired",
+                            "HackMD note-list cache"
+                        );
+                    }
+                    if !state.entries.contains_key(workspace)
+                        && state.entries.len() >= MAX_CACHED_WORKSPACES
+                        && let Some(lru) = state
                             .entries
                             .iter()
-                            .filter_map(|(key, cached)| {
-                                (cached.stored.elapsed() >= self.ttl).then(|| key.clone())
-                            })
-                            .collect::<Vec<_>>();
-                        for key in expired {
-                            state.entries.remove(&key);
-                            tracing::debug!(
-                                cache_event = "eviction",
-                                reason = "expired",
-                                "HackMD note-list cache"
-                            );
-                        }
-                        if !state.entries.contains_key(workspace)
-                            && state.entries.len() >= MAX_CACHED_WORKSPACES
-                            && let Some(lru) = state
-                                .entries
-                                .iter()
-                                .min_by_key(|(_, cached)| cached.last_access)
-                                .map(|(key, _)| key.clone())
-                        {
-                            state.entries.remove(&lru);
-                            tracing::debug!(
-                                cache_event = "eviction",
-                                reason = "capacity",
-                                "HackMD note-list cache"
-                            );
-                        }
-                        state.access_clock = state.access_clock.wrapping_add(1);
-                        let access = state.access_clock;
-                        state.entries.insert(
-                            workspace.clone(),
-                            CachedNotes {
-                                stored: now,
-                                last_access: access,
-                                notes: Arc::clone(notes),
-                            },
+                            .min_by_key(|(_, cached)| cached.last_access)
+                            .map(|(key, _)| key.clone())
+                    {
+                        state.entries.remove(&lru);
+                        tracing::debug!(
+                            cache_event = "eviction",
+                            reason = "capacity",
+                            "HackMD note-list cache"
                         );
-                        tracing::debug!(cache_event = "fill", "HackMD note-list cache");
                     }
+                    state.access_clock = state.access_clock.wrapping_add(1);
+                    let access = state.access_clock;
+                    state.entries.insert(
+                        workspace.clone(),
+                        CachedNotes {
+                            stored: now,
+                            last_access: access,
+                            notes: Arc::clone(notes),
+                        },
+                    );
+                    tracing::debug!(cache_event = "fill", "HackMD note-list cache");
                 }
             }
         }
@@ -727,7 +726,7 @@ impl NotesCache {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.generation = state.generation.wrapping_add(1);
         if !state.entries.is_empty() {
             tracing::debug!(

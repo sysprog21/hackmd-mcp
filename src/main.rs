@@ -7,7 +7,7 @@ struct Cli {
     /// Print a JSON startup/configuration health report and exit.
     #[arg(long)]
     self_check: bool,
-    /// Include a read-only authenticated HackMD /me request in --self-check.
+    /// Include a read-only authenticated `HackMD` /me request in --self-check.
     #[arg(long, requires = "self_check")]
     probe_api: bool,
 }

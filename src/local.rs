@@ -168,10 +168,8 @@ impl LocalFiles {
         create_parent_dirs: bool,
     ) -> Result<(), LocalAccessError> {
         let Some((dir, relative)) = self.confined(path)? else {
-            if create_parent_dirs {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
+            if create_parent_dirs && let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
             }
             return crate::sync::state::write_local_atomic(path, contents)
                 .map_err(|error| LocalAccessError::Io(io::Error::other(error)));

@@ -15,6 +15,10 @@ use crate::{
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent MCP wire options must remain backward compatible"
+)]
 pub(crate) struct PullNoteInput {
     #[serde(default)]
     pub(crate) workspace: Workspace,
@@ -103,6 +107,7 @@ pub(crate) async fn pull_note(
     let size_bytes = body.len();
     validate_body_size(size_bytes, input.confirm_large_file)?;
     files.write_atomic(&destination, body.as_bytes(), input.create_parent_dirs)?;
+    let destination = destination.canonicalize().map_err(LocalAccessError::Io)?;
     let state = TrackedNoteState::capture(
         note.note_id.clone(),
         note.workspace.clone(),

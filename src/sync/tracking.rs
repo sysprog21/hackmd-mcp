@@ -44,7 +44,7 @@ pub(crate) struct ListTrackedNotesOutput {
 pub(crate) struct UntrackNoteInput {
     #[serde(default)]
     pub(crate) workspace: Workspace,
-    /// Internal HackMD note ID shown by `hackmd_list_tracked_notes`.
+    /// Internal `HackMD` note ID shown by `hackmd_list_tracked_notes`.
     pub(crate) note_id: String,
     /// Required because private baseline and sidecar files will be deleted.
     #[serde(default)]
@@ -74,7 +74,7 @@ pub(crate) enum TrackingError {
 
 pub(crate) fn list_tracked_notes(
     files: &LocalFiles,
-    input: ListTrackedNotesInput,
+    input: &ListTrackedNotesInput,
 ) -> Result<ListTrackedNotesOutput, TrackingError> {
     validate_limit(input.limit)?;
     let mut notes = files
@@ -101,7 +101,7 @@ pub(crate) fn list_tracked_notes(
 
 pub(crate) fn untrack_note(
     files: &LocalFiles,
-    input: UntrackNoteInput,
+    input: &UntrackNoteInput,
 ) -> Result<UntrackNoteOutput, TrackingError> {
     if input.note_id.trim().is_empty() {
         return Err(TrackingError::EmptyNoteId);
@@ -159,7 +159,7 @@ mod tests {
 
         let output = list_tracked_notes(
             &files,
-            ListTrackedNotesInput {
+            &ListTrackedNotesInput {
                 limit: 20,
                 offset: 0,
             },
@@ -178,7 +178,7 @@ mod tests {
         let (directory, files, local_path) = tracked_files();
         let refused = untrack_note(
             &files,
-            UntrackNoteInput {
+            &UntrackNoteInput {
                 workspace: Workspace::Personal,
                 note_id: "note-id".to_owned(),
                 confirm: false,
@@ -188,7 +188,7 @@ mod tests {
 
         let output = untrack_note(
             &files,
-            UntrackNoteInput {
+            &UntrackNoteInput {
                 workspace: Workspace::Personal,
                 note_id: "note-id".to_owned(),
                 confirm: true,
@@ -226,7 +226,7 @@ mod tests {
 
         let output = untrack_note(
             &files,
-            UntrackNoteInput {
+            &UntrackNoteInput {
                 workspace: Workspace::Personal,
                 note_id: "note-id".to_owned(),
                 confirm: true,
@@ -243,7 +243,7 @@ mod tests {
         assert!(matches!(
             list_tracked_notes(
                 &files,
-                ListTrackedNotesInput {
+                &ListTrackedNotesInput {
                     limit: 101,
                     offset: 0
                 }
@@ -253,7 +253,7 @@ mod tests {
         assert!(matches!(
             untrack_note(
                 &files,
-                UntrackNoteInput {
+                &UntrackNoteInput {
                     workspace: Workspace::Personal,
                     note_id: " ".to_owned(),
                     confirm: true,
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(
             list_tracked_notes(
                 &files,
-                ListTrackedNotesInput {
+                &ListTrackedNotesInput {
                     limit: 20,
                     offset: 0
                 }
