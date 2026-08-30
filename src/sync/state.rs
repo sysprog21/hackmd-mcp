@@ -182,7 +182,13 @@ impl StateStore {
         for entry in entries {
             let path = entry?.path();
             if path.extension().and_then(|value| value.to_str()) == Some("json") {
-                states.push(serde_json::from_slice(&fs::read(path)?)?);
+                let bytes = fs::read(&path)?;
+                match serde_json::from_slice(&bytes) {
+                    Ok(state) => states.push(state),
+                    Err(_) => {
+                        tracing::warn!(path = %path.display(), "skipping malformed tracked sidecar")
+                    }
+                }
             }
         }
         Ok(states)
@@ -239,11 +245,26 @@ impl StateStore {
         let Ok(key) = fs::read_to_string(self.index_path(canonical)) else {
             return Ok(None);
         };
-        let paths = self.paths_for_key(key.trim());
-        let Ok(sidecar) = fs::read(&paths.sidecar) else {
+        let key = key.trim();
+        if !valid_state_key(key) {
             return Ok(None);
+        }
+        let paths = self.paths_for_key(key);
+        let sidecar = match fs::read(&paths.sidecar) {
+            Ok(sidecar) => sidecar,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => {
+                return Err(StateError::CorruptTrackedState {
+                    sidecar_path: paths.sidecar,
+                    local_path: canonical.to_path_buf(),
+                });
+            }
         };
-        let state: TrackedNoteState = serde_json::from_slice(&sidecar)?;
+        let state: TrackedNoteState =
+            serde_json::from_slice(&sidecar).map_err(|_| StateError::CorruptTrackedState {
+                sidecar_path: paths.sidecar.clone(),
+                local_path: canonical.to_path_buf(),
+            })?;
         if state.local_file_identity.canonical_path != canonical {
             return Ok(None);
         }
@@ -261,9 +282,11 @@ impl StateStore {
         local_path: &Path,
     ) -> Result<LoadedTrackedState, StateError> {
         let canonical = fs::canonicalize(local_path)?;
-        if let Some(loaded) = self.load_via_index(&canonical)? {
-            return Ok(loaded);
-        }
+        let indexed_error = match self.load_via_index(&canonical) {
+            Ok(Some(loaded)) => return Ok(loaded),
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
         let tracked = self.root.join("tracked");
         let entries = fs::read_dir(tracked).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -277,13 +300,20 @@ impl StateStore {
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            let state: TrackedNoteState = serde_json::from_slice(&fs::read(&path)?)?;
+            let bytes = fs::read(&path)?;
+            let state: TrackedNoteState = match serde_json::from_slice(&bytes) {
+                Ok(state) => state,
+                Err(_) => {
+                    tracing::warn!(path = %path.display(), "skipping malformed tracked sidecar");
+                    continue;
+                }
+            };
             if state.local_file_identity.canonical_path == canonical {
                 let paths = self.paths_for(&state.workspace, &state.internal_id);
                 return Self::load_verified(state, paths);
             }
         }
-        Err(StateError::NotTracked)
+        Err(indexed_error.unwrap_or(StateError::NotTracked))
     }
 
     fn load_verified(
@@ -367,6 +397,31 @@ fn encode_component(value: &str) -> String {
     encoded
 }
 
+fn valid_state_key(key: &str) -> bool {
+    if !(key.starts_with("personal--") || key.starts_with("team--")) {
+        return false;
+    }
+    let bytes = key.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            index += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
 fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<(), StateError> {
     let parent = path.parent().ok_or(StateError::InvalidStatePath)?;
     create_private_dir_all(parent)?;
@@ -432,6 +487,15 @@ pub(crate) enum StateError {
     Io(#[from] io::Error),
     #[error("local state serialization failed")]
     Serialize(#[from] serde_json::Error),
+    #[error(
+        "tracked sidecar {} for {} is corrupt; re-pull the note or untrack this record",
+        sidecar_path.display(),
+        local_path.display()
+    )]
+    CorruptTrackedState {
+        sidecar_path: PathBuf,
+        local_path: PathBuf,
+    },
     #[error("tracked sidecar identity does not match its filename")]
     StateIdentityMismatch,
     #[error(
@@ -518,6 +582,97 @@ mod tests {
             store.load_for_local_path(&other),
             Err(StateError::NotTracked)
         ));
+    }
+
+    #[test]
+    fn malformed_index_keys_and_unrelated_sidecars_do_not_block_scan_recovery() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let store = StateStore::new(directory.path().join("state"));
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").expect("local fixture should write");
+        let state = TrackedNoteState::capture(
+            "note/id".to_owned(),
+            Workspace::Personal,
+            local_path.clone(),
+            "baseline",
+            Some(1),
+        )
+        .expect("fixture state should capture");
+        store
+            .persist_from_sync(&state, "baseline")
+            .expect("state should persist");
+
+        let canonical = fs::canonicalize(&local_path).expect("path should canonicalize");
+        fs::write(store.index_path(&canonical), "../../outside")
+            .expect("malformed hint should write");
+        fs::write(store.root().join("tracked/broken.json"), b"not json")
+            .expect("unrelated corrupt sidecar should write");
+
+        let loaded = store
+            .load_for_local_path(&local_path)
+            .expect("scan should ignore both corrupt hints");
+        assert_eq!(loaded.state.internal_id, "note/id");
+    }
+
+    #[test]
+    fn corrupt_indexed_sidecar_has_a_focused_error_after_fallback_scan() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let store = StateStore::new(directory.path().join("state"));
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").expect("local fixture should write");
+        let state = TrackedNoteState::capture(
+            "note-id".to_owned(),
+            Workspace::Personal,
+            local_path.clone(),
+            "baseline",
+            Some(1),
+        )
+        .expect("fixture state should capture");
+        store
+            .persist_from_sync(&state, "baseline")
+            .expect("state should persist");
+        fs::write(
+            store.paths_for(&Workspace::Personal, "note-id").sidecar,
+            b"not json",
+        )
+        .expect("sidecar should corrupt");
+
+        assert!(matches!(
+            store.load_for_local_path(&local_path),
+            Err(StateError::CorruptTrackedState { local_path: path, .. }) if path == fs::canonicalize(local_path).expect("path should canonicalize")
+        ));
+    }
+
+    #[test]
+    fn corrupt_indexed_sidecar_falls_back_to_another_valid_record() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let store = StateStore::new(directory.path().join("state"));
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").expect("local fixture should write");
+
+        for note_id in ["fallback", "indexed"] {
+            let state = TrackedNoteState::capture(
+                note_id.to_owned(),
+                Workspace::Personal,
+                local_path.clone(),
+                "baseline",
+                Some(1),
+            )
+            .expect("fixture state should capture");
+            store
+                .persist_from_sync(&state, "baseline")
+                .expect("state should persist");
+        }
+        fs::write(
+            store.paths_for(&Workspace::Personal, "indexed").sidecar,
+            b"not json",
+        )
+        .expect("indexed sidecar should corrupt");
+
+        let loaded = store
+            .load_for_local_path(&local_path)
+            .expect("scan should recover the valid alternative");
+        assert_eq!(loaded.state.internal_id, "fallback");
     }
 
     #[cfg(unix)]

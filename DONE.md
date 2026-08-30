@@ -177,6 +177,13 @@
   pathname and reopen it through ambient authority; an adversarial Unix test
   swaps inside/outside symlinks during repeated reads and writes and proves the
   outside tree is never accessed. Reject relative configured roots at startup.
+- [x] Isolate tracked-state corruption. Validate every by-path hint as one
+  generated encoded key before deriving filenames, treat malformed hints as
+  misses, scan past unrelated malformed JSON sidecars, and recover through a
+  valid alternative record when an indexed sidecar is corrupt. If no recovery
+  exists, return a focused error naming the requested local path and its broken
+  sidecar; real filesystem I/O failures remain visible rather than being
+  mistaken for malformed JSON.
 - [x] Add paginated `hackmd_list_tracked_notes` for discovering private sync
   records without reading working files or contacting HackMD. Add confirmed,
   local-only `hackmd_untrack_note` keyed by workspace and internal note ID; it

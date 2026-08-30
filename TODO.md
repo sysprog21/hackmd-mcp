@@ -191,13 +191,6 @@ test (see P3) for each and record the answer here.
 ## P2 — complete daily HackMD workflow
 
 ## P2.5 — local Markdown sync
-- [ ] Make tracked-state recovery isolate corruption. A malformed by-path hint
-  or the sidecar it names currently returns a JSON/I/O error instead of falling
-  back to the verified sidecar scan, and one malformed unrelated sidecar can
-  abort that scan. Validate index keys as a single encoded component, treat a
-  bad hint as a cache miss, continue past unrelated corrupt sidecars, and
-  return a focused corruption error only when the sidecar for the requested
-  canonical path is itself invalid.
 
 ## P3 — efficiency and reliability
 
