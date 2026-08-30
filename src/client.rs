@@ -1217,7 +1217,7 @@ impl From<HackmdError> for rmcp::model::CallToolResult {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{fmt::Write as _, sync::Arc, time::Duration};
 
     const NOTES: &str = r#"[{"id":"note-id","title":"Note"}]"#;
 
@@ -1336,6 +1336,84 @@ mod tests {
 
         assert_eq!(first.expect("first list should succeed").len(), 1);
         assert_eq!(second.expect("second list should succeed").len(), 1);
+        server.finish();
+    }
+
+    /// Manual, threshold-free baseline for the list hot path. Run with:
+    /// `cargo test benchmark_10k_note_list_cache_and_filter -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "manual allocation and latency baseline"]
+    async fn benchmark_10k_note_list_cache_and_filter() {
+        let mut body = String::with_capacity(1_500_000);
+        body.push('[');
+        for index in 0..10_000 {
+            if index != 0 {
+                body.push(',');
+            }
+            write!(
+                body,
+                r#"{{"id":"note-{index}","title":"Roadmap {index}","description":"Rust benchmark","tags":["rust"],"lastChangedAt":{index}}}"#
+            )
+            .expect("writing JSON into a String should succeed");
+        }
+        body.push(']');
+
+        let server =
+            SequenceServer::spawn_scenarios([
+                Scenario::new("GET", "/v1/notes", 200, &body).delay(Duration::from_millis(25))
+            ]);
+        let client = Arc::new(server.client_with_cache());
+        let miss_started = std::time::Instant::now();
+        let mut callers = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let client = Arc::clone(&client);
+            callers.spawn(async move { client.list_notes(&Workspace::Personal, false).await });
+        }
+        while let Some(result) = callers.join_next().await {
+            assert_eq!(
+                result
+                    .expect("benchmark caller should join")
+                    .expect("benchmark list should succeed")
+                    .len(),
+                10_000
+            );
+        }
+        let miss_elapsed = miss_started.elapsed();
+
+        let filter_started = std::time::Instant::now();
+        let page = crate::note::list::list_notes(
+            &client,
+            crate::note::list::ListNotesInput {
+                workspace: Workspace::Personal,
+                limit: 100,
+                offset: 4_900,
+                query: Some("roadmap".to_owned()),
+                tags: vec!["RUST".to_owned()],
+                refresh: false,
+                sort: crate::note::list::NoteSort::TitleAsc,
+            },
+        )
+        .await
+        .expect("benchmark filter should succeed");
+        let filter_elapsed = filter_started.elapsed();
+        assert_eq!(page.meta.total, 10_000);
+        assert_eq!(page.meta.count, 100);
+
+        let state = client
+            .notes
+            .state
+            .lock()
+            .expect("benchmark cache mutex should lock");
+        eprintln!(
+            "{{\"notes\":10000,\"concurrent_callers\":16,\"requests\":{},\"cache_hits\":{},\"cache_misses\":{},\"estimated_retained_bytes\":{},\"coalesced_miss_us\":{},\"cached_filter_sort_us\":{}}}",
+            1,
+            state.hits,
+            state.misses,
+            state.total_bytes,
+            miss_elapsed.as_micros(),
+            filter_elapsed.as_micros()
+        );
+        drop(state);
         server.finish();
     }
 

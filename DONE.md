@@ -2,6 +2,13 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Add an ignored, threshold-free 10,000-note benchmark with 16 concurrent
+  callers. It reports the coalesced miss and cached filter/sort durations, exact
+  one-request budget, cache hit/miss counters, and estimated retained allocation
+  bytes as one JSON record. The first debug all-feature baseline retained
+  5,987,804 bytes and completed one coalesced fetch plus a 100-item filtered page;
+  no timing threshold is enforced before stable CI measurements exist.
+
 - [x] Complete the declarative HTTP-fixture migration across sync, server, and
   health tests. Scenario contracts now own request budgets, paths, retry/readback
   sequences, response headers, and write bodies. Remove the response-only tuple

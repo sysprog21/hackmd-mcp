@@ -200,11 +200,6 @@ dependency, or background task without a bound and an invalidation rule.
   statuses into `DONE.md` with the date. Implement
   `If-None-Match` or `If-Modified-Since` only after a live `304` is demonstrated;
   otherwise record the cache as inapplicable and retain fresh body GETs.
-- [ ] Add a benchmark fixture with 10,000 note summaries and concurrent callers.
-  Track list-cache hit latency, miss coalescing, filtering/sorting time, request
-  count, and allocations. Set regression thresholds only after three stable CI
-  baselines; do not use wall-clock assertions in unit tests.
-
 ### P1 — cached tracking and differential note operations
 
 - [ ] After the P0 live-header task demonstrates a usable remote validator, add
