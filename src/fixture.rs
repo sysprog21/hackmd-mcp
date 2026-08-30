@@ -18,16 +18,6 @@ use crate::{
 pub(crate) const FIXTURE_TOKEN: &str = "fixture-token";
 const FIXTURE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Asserts the exact HTTP method/path sequence without coupling tests to
-/// transport headers that `reqwest` may legitimately change.
-pub(crate) fn assert_request_sequence(requests: &[String], expected: &[&str]) {
-    let actual = requests
-        .iter()
-        .map(|request| request.lines().next().unwrap_or(""))
-        .collect::<Vec<_>>();
-    assert_eq!(actual, expected, "unexpected HackMD API request budget");
-}
-
 type FixtureHeaders = &'static [(&'static str, &'static str)];
 
 const EMPTY_HEADERS: FixtureHeaders = &[];
@@ -174,10 +164,6 @@ pub(crate) struct SequenceServer {
 }
 
 impl SequenceServer {
-    pub(crate) fn spawn<const N: usize>(responses: [(u16, &str); N]) -> Self {
-        Self::spawn_with_headers(responses.map(|(status, body)| (status, body, EMPTY_HEADERS)))
-    }
-
     /// Accepts one complete request and closes the connection without a
     /// response, producing a deterministic transport error without releasing a
     /// port that another parallel fixture could claim.
@@ -206,21 +192,6 @@ impl SequenceServer {
             thread: Some(thread),
             expected: None,
         }
-    }
-
-    pub(crate) fn spawn_with_headers<const N: usize>(
-        responses: [(u16, &str, FixtureHeaders); N],
-    ) -> Self {
-        Self::spawn_with_mode(
-            responses
-                .into_iter()
-                .map(|(status, body, headers)| {
-                    fixture_response(status, body, headers, Duration::ZERO)
-                })
-                .collect(),
-            false,
-            None,
-        )
     }
 
     pub(crate) fn spawn_scenarios<const N: usize>(scenarios: [Scenario; N]) -> Self {
@@ -350,17 +321,6 @@ impl SequenceServer {
     pub(crate) fn client_without_retry(&self, token: &str) -> HackmdClient {
         HackmdClient::new(Config::for_loopback_test_no_retry(&self.api_url, token))
             .expect("fixture client should build")
-    }
-
-    /// The single request this fixture was expected to serve.
-    pub(crate) fn finish_one(self) -> String {
-        let mut requests = self.finish();
-        assert_eq!(
-            requests.len(),
-            1,
-            "fixture should serve exactly one request"
-        );
-        requests.remove(0)
     }
 
     pub(crate) fn finish(mut self) -> Vec<String> {

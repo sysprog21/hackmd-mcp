@@ -101,26 +101,34 @@ mod tests {
     use std::fs;
 
     use super::{CheckNoteSyncInput, SyncStatus, check_note_sync};
-    use crate::fixture::assert_request_sequence;
+    use crate::fixture::{Scenario, SequenceServer};
     #[tokio::test]
     async fn classifies_all_four_sync_states_without_writes() {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "baseline").expect("local fixture should write");
-        let fixture = crate::fixture::SequenceServer::spawn([
-            (
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
                 200,
                 r#"{"id":"id","title":"Note","content":"baseline","lastChangedAt":1}"#,
             ),
-            (
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
                 200,
                 r#"{"id":"id","title":"Note","content":"remote","lastChangedAt":2}"#,
             ),
-            (
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
                 200,
                 r#"{"id":"id","title":"Note","content":"baseline","lastChangedAt":1}"#,
             ),
-            (
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
                 200,
                 r#"{"id":"id","title":"Note","content":"remote","lastChangedAt":2}"#,
             ),
@@ -150,15 +158,7 @@ mod tests {
             statuses.push(output.status);
         }
         assert_eq!(statuses.len(), 4);
-        assert_request_sequence(
-            &fixture.finish(),
-            &[
-                "GET /v1/notes/id HTTP/1.1",
-                "GET /v1/notes/id HTTP/1.1",
-                "GET /v1/notes/id HTTP/1.1",
-                "GET /v1/notes/id HTTP/1.1",
-            ],
-        );
+        fixture.finish();
         assert_eq!(
             fs::read_to_string(&local_path).expect("local should remain readable"),
             "local"
@@ -170,7 +170,9 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "same body").expect("local fixture should write");
-        let fixture = crate::fixture::SequenceServer::spawn([(
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/id",
             200,
             r#"{"id":"id","title":"Note","content":"same body","lastChangedAt":99}"#,
         )]);
@@ -181,6 +183,6 @@ mod tests {
             .expect("timestamp-only check should succeed");
         assert_eq!(output.status, SyncStatus::InSync);
         assert_eq!(output.remote_timestamp, "99");
-        assert_request_sequence(&fixture.finish(), &["GET /v1/notes/id HTTP/1.1"]);
+        fixture.finish();
     }
 }

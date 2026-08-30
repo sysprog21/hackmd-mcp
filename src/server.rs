@@ -117,6 +117,7 @@ mod tests {
     use super::HackmdServer;
     use crate::client::HackmdClient;
     use crate::config::Config;
+    use crate::fixture::{Scenario, SequenceServer};
     use crate::server::account::{EmptyInput, profile_result, teams_result};
     use rmcp::{ServerHandler, ServiceExt, model::CallToolRequestParams};
     use serde_json::json;
@@ -328,18 +329,19 @@ mod tests {
 
     #[tokio::test]
     async fn retried_success_and_final_tool_error_include_bounded_metadata() {
-        const RETRY_AFTER: &[(&str, &str)] = &[("Retry-After", "0")];
         let retry = crate::config::RetryConfig {
             max_retries: 1,
             initial_backoff: std::time::Duration::from_millis(1),
             max_backoff: std::time::Duration::from_millis(2),
         };
-        let success_fixture = crate::fixture::SequenceServer::spawn_with_headers([
-            (429, r#"{"error":"rate limited"}"#, RETRY_AFTER),
-            (
+        let success_fixture = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/me", 429, r#"{"error":"rate limited"}"#)
+                .response_header("Retry-After", "0"),
+            Scenario::new(
+                "GET",
+                "/v1/me",
                 200,
                 r#"{"id":"u","name":"User","email":"u@example.com","userPath":"user"}"#,
-                &[],
             ),
         ]);
         let (client, server_task) = protocol_client(Config::for_loopback_test_with_retry(
@@ -365,9 +367,9 @@ mod tests {
         stop_protocol(client, server_task).await;
         success_fixture.finish();
 
-        let error_fixture = crate::fixture::SequenceServer::spawn([
-            (500, r#"{"error":"transient"}"#),
-            (500, r#"{"error":"still failing"}"#),
+        let error_fixture = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/me", 500, r#"{"error":"transient"}"#),
+            Scenario::new("GET", "/v1/me", 500, r#"{"error":"still failing"}"#),
         ]);
         let (client, server_task) = protocol_client(Config::for_loopback_test_with_retry(
             &error_fixture.api_url,
@@ -390,11 +392,26 @@ mod tests {
 
     #[tokio::test]
     async fn asynchronous_readback_reports_bounded_attempt_metadata() {
-        let fixture = crate::fixture::SequenceServer::spawn([
-            (200, r#"{"id":"note-id","title":"Title","content":"old"}"#),
-            (202, ""),
-            (200, r#"{"id":"note-id","title":"Title","content":"old"}"#),
-            (200, r#"{"id":"note-id","title":"Title","content":"new"}"#),
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Title","content":"old"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Title","content":"old"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Title","content":"new"}"#,
+            ),
         ]);
         let (client, server_task) = protocol_client(Config::for_loopback_test(
             &fixture.api_url,
@@ -423,12 +440,22 @@ mod tests {
                 > 0.0
         );
         stop_protocol(client, server_task).await;
-        assert_eq!(fixture.finish().len(), 4);
+        fixture.finish();
 
-        let failed = crate::fixture::SequenceServer::spawn([
-            (200, r#"{"id":"note-id","title":"Title","content":"old"}"#),
-            (202, ""),
-            (500, r#"{"error":"readback failed"}"#),
+        let failed = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Title","content":"old"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                500,
+                r#"{"error":"readback failed"}"#,
+            ),
         ]);
         let (client, server_task) = protocol_client(Config::for_loopback_test_no_retry(
             &failed.api_url,
@@ -451,7 +478,7 @@ mod tests {
             1
         );
         stop_protocol(client, server_task).await;
-        assert_eq!(failed.finish().len(), 3);
+        failed.finish();
     }
 
     #[tokio::test]
@@ -482,7 +509,9 @@ mod tests {
 
     #[tokio::test]
     async fn edit_conflict_is_a_tool_error_and_never_patches() {
-        let fixture = crate::fixture::SequenceServer::spawn([(
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/note-id",
             200,
             r#"{"id":"note-id","title":"Title","content":"old"}"#,
         )]);
@@ -504,9 +533,7 @@ mod tests {
                 .text,
             "patch targets notes/other.md, expected notes/note-id.md"
         );
-        let requests = fixture.finish();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with("GET /v1/notes/note-id HTTP/1.1\r\n"));
+        fixture.finish();
     }
 
     #[test]
@@ -687,7 +714,9 @@ mod tests {
 
     #[tokio::test]
     async fn in_process_list_call_covers_team_route_search_and_pagination() {
-        let fixture = crate::fixture::SequenceServer::spawn([(
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/teams/core%2Fteam/notes",
             200,
             r#"[
                 {"id":"a","title":"Roadmap A","description":"Rust work","tags":["rust"],"lastChangedAt":3},
@@ -723,16 +752,21 @@ mod tests {
         assert_eq!(structured["has_more"], false);
         assert_eq!(structured["notes"][0]["id"], "b");
         stop_protocol(client, server_task).await;
-        let requests = fixture.finish();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with("GET /v1/teams/core%2Fteam/notes HTTP/1.1\r\n"));
+        fixture.finish();
     }
 
     #[tokio::test]
     async fn in_process_edit_calls_cover_no_op_and_conflict_without_patch() {
-        let fixture = crate::fixture::SequenceServer::spawn([
-            (200, r#"{"id":"same","title":"Same","content":"same"}"#),
-            (
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/same",
+                200,
+                r#"{"id":"same","title":"Same","content":"same"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/conflict",
                 200,
                 r#"{"id":"conflict","title":"Conflict","content":"actual"}"#,
             ),
@@ -777,9 +811,6 @@ mod tests {
             "patch hunk context was not found"
         );
         stop_protocol(client, server_task).await;
-        let requests = fixture.finish();
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].starts_with("GET /v1/notes/same HTTP/1.1\r\n"));
-        assert!(requests[1].starts_with("GET /v1/notes/conflict HTTP/1.1\r\n"));
+        fixture.finish();
     }
 }

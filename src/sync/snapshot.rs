@@ -86,9 +86,19 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "local working").expect("local fixture should write");
-        let fixture = crate::fixture::SequenceServer::spawn([
-            (200, r#"{"id":"id","title":"Note","content":"remote one"}"#),
-            (200, r#"{"id":"id","title":"Note","content":"remote two"}"#),
+        let fixture = crate::fixture::SequenceServer::spawn_scenarios([
+            crate::fixture::Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"remote one"}"#,
+            ),
+            crate::fixture::Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"remote two"}"#,
+            ),
         ]);
         let client = fixture.client();
         let files = crate::fixture::tracked_files(directory.path(), "id", &local_path, "baseline");

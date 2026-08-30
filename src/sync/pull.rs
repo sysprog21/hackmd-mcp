@@ -219,10 +219,14 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let destination = directory.path().join("nested/note.md");
         let state_dir = directory.path().join("state");
-        let fixture = crate::fixture::SequenceServer::spawn([(
-            200,
-            r##"{"id":"note/id","title":"Remote","content":"# Exact\n\nBody\n","lastChangedAt":123}"##,
-        )]);
+        let fixture = crate::fixture::SequenceServer::spawn_scenarios([
+            crate::fixture::Scenario::new(
+                "GET",
+                "/v1/notes/note%2Fid",
+                200,
+                r##"{"id":"note/id","title":"Remote","content":"# Exact\n\nBody\n","lastChangedAt":123}"##,
+            ),
+        ]);
         let client = fixture.client();
         let files = crate::fixture::unconfined_files(state_dir.clone());
         let output = pull_note(
@@ -286,8 +290,7 @@ mod tests {
                 .expect("hash should be text")
                 .starts_with("sha256:")
         );
-        let requests = fixture.finish();
-        assert!(requests[0].starts_with("GET /v1/notes/note%2Fid HTTP/1.1\r\n"));
+        fixture.finish();
     }
 
     #[tokio::test]

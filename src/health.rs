@@ -120,11 +120,16 @@ async fn self_check(
 #[cfg(test)]
 mod tests {
     use super::self_check;
-    use crate::config::Config;
+    use crate::{
+        config::Config,
+        fixture::{Scenario, SequenceServer},
+    };
 
     #[tokio::test]
     async fn optional_api_probe_uses_read_only_me_and_reports_no_identity_or_token() {
-        let fixture = crate::fixture::SequenceServer::spawn([(
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/me",
             200,
             r#"{"id":"secret-user-id","name":"Alice","userPath":"alice"}"#,
         )]);
@@ -144,7 +149,6 @@ mod tests {
         let json = serde_json::to_string(&report).expect("report should serialize");
         assert!(!json.contains("secret-token"));
         assert!(!json.contains("secret-user-id"));
-        let request = fixture.finish_one();
-        assert!(request.starts_with("GET /v1/me HTTP/1.1\r\n"));
+        fixture.finish();
     }
 }

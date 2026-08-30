@@ -2,6 +2,13 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Complete the declarative HTTP-fixture migration across sync, server, and
+  health tests. Scenario contracts now own request budgets, paths, retry/readback
+  sequences, response headers, and write bodies. Remove the response-only tuple
+  constructors, raw request-sequence helper, and single-request extractor;
+  retain only explicit repeating and disconnect modes for their distinct
+  failure semantics.
+
 - [x] Migrate all bounded note and folder HTTP tests to declarative `Scenario`
   steps, including discovery, encoded item routes, async readbacks, folder-order
   merge bodies, trash/restore, and streaming multipart body markers. Preserve

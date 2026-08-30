@@ -222,13 +222,6 @@ dependency, or background task without a bound and an invalidation rule.
 
 ### P2 — consolidate test coverage
 
-- [ ] Finish migrating sync/server workflow HTTP tests to `Scenario`. Encode
-  method/path and meaningful auth/content/body expectations in the declaration
-  instead of inspecting raw requests afterward.
-  Once `rg 'SequenceServer::spawn(_with_headers|_delayed)?' src` has no ordinary
-  response-only call sites, remove the tuple constructors and
-  `assert_request_sequence`; retain explicit repeating/disconnect helpers only
-  for unbounded-visibility and transport-failure behavior.
 - [ ] Convert duplicated personal/team and status-code tests into table-driven
   cases. Retain separate tests only where route shape, permissions, or API
   behavior genuinely differs. Test names must describe the invariant rather

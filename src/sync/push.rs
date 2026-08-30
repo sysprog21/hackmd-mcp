@@ -411,7 +411,7 @@ mod tests {
     use crate::{
         client::HackmdClient,
         config::Config,
-        fixture::assert_request_sequence,
+        fixture::{Scenario, SequenceServer},
         models::Workspace,
         sync::{BODY_MAX_BYTES, BODY_WARNING_BYTES},
     };
@@ -478,9 +478,11 @@ mod tests {
         fs::write(&state_root, "blocks directory recreation")
             .expect("blocking state file should write");
 
-        let fixture = crate::fixture::SequenceServer::spawn([
-            (202, ""),
-            (
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
                 200,
                 r#"{"id":"note-id","title":"Note","content":"local edit","lastChangedAt":2}"#,
             ),
@@ -505,13 +507,7 @@ mod tests {
             Err(PushNoteError::StatePersistenceAfterWrite { note_id, .. })
                 if note_id == "note-id"
         ));
-        assert_request_sequence(
-            &fixture.finish(),
-            &[
-                "PATCH /v1/notes/note-id HTTP/1.1",
-                "GET /v1/notes/note-id HTTP/1.1",
-            ],
-        );
+        fixture.finish();
     }
 
     #[tokio::test]
@@ -525,7 +521,12 @@ mod tests {
             .state()
             .load_for_local_path(&local_path)
             .expect("tracked state should load");
-        let fixture = crate::fixture::SequenceServer::spawn([(400, r#"{"error":"rejected"}"#)]);
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "PATCH",
+            "/v1/notes/note-id",
+            400,
+            r#"{"error":"rejected"}"#,
+        )]);
 
         let result = push_resolved(
             &fixture.client_without_retry("fixture-token"),
@@ -551,7 +552,7 @@ mod tests {
                 .baseline_body,
             "baseline"
         );
-        assert_request_sequence(&fixture.finish(), &["PATCH /v1/notes/note-id HTTP/1.1"]);
+        fixture.finish();
     }
 
     #[tokio::test]
@@ -562,13 +563,20 @@ mod tests {
 
         // One read, one PATCH, one read-back: the safe strategy compares
         // against the body it already fetched rather than fetching it twice.
-        let fixture = crate::fixture::SequenceServer::spawn([
-            (
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
                 200,
                 r#"{"id":"note-id","title":"Note","content":"baseline"}"#,
             ),
-            (202, ""),
-            (
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, "")
+                .expect_body("the complete local body", |body| {
+                    body == r#"{"content":"local edit"}"#
+                }),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
                 200,
                 r#"{"id":"note-id","title":"Note","content":"local edit","lastChangedAt":2}"#,
             ),
@@ -586,16 +594,7 @@ mod tests {
         .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::Pushed);
         assert!(output.pushed);
-        let requests = fixture.finish();
-        assert_request_sequence(
-            &requests,
-            &[
-                "GET /v1/notes/note-id HTTP/1.1",
-                "PATCH /v1/notes/note-id HTTP/1.1",
-                "GET /v1/notes/note-id HTTP/1.1",
-            ],
-        );
-        assert!(requests[1].ends_with(r#"{"content":"local edit"}"#));
+        fixture.finish();
         let loaded = files
             .state()
             .load_for_local_path(&local_path)
@@ -611,7 +610,9 @@ mod tests {
         fs::write(&local_path, "local edit").expect("local fixture should write");
         fs::write(local_path.with_extension("remote.md"), "prior snapshot")
             .expect("snapshot fixture should write");
-        let fixture = crate::fixture::SequenceServer::spawn([(
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/note-id",
             200,
             r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
         )]);
@@ -646,7 +647,7 @@ mod tests {
         let diff = output.diff_summary.expect("diff summary should exist");
         assert!(diff.contains("LOCAL CHANGES"));
         assert!(diff.contains("REMOTE CHANGES"));
-        assert_request_sequence(&fixture.finish(), &["GET /v1/notes/note-id HTTP/1.1"]);
+        fixture.finish();
     }
 
     #[test]
@@ -679,7 +680,9 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "baseline").expect("local fixture should write");
-        let fixture = crate::fixture::SequenceServer::spawn([(
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/note-id",
             200,
             r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
         )]);
@@ -695,7 +698,7 @@ mod tests {
         .expect("comparison should succeed")
         .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::RemoteChanged);
-        assert_request_sequence(&fixture.finish(), &["GET /v1/notes/note-id HTTP/1.1"]);
+        fixture.finish();
     }
 
     #[tokio::test]
@@ -703,7 +706,9 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "baseline").expect("local fixture should write");
-        let fixture = crate::fixture::SequenceServer::spawn([(
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/note-id",
             200,
             r#"{"id":"note-id","title":"Note","content":"baseline"}"#,
         )]);
@@ -720,7 +725,7 @@ mod tests {
         .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::NothingToPush);
         assert!(!output.pushed);
-        assert_request_sequence(&fixture.finish(), &["GET /v1/notes/note-id HTTP/1.1"]);
+        fixture.finish();
     }
 
     #[tokio::test]
@@ -746,13 +751,17 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "forced local").expect("local fixture should write");
-        let fixture = crate::fixture::SequenceServer::spawn([
-            (
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
                 200,
                 r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
             ),
-            (202, ""),
-            (
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
                 200,
                 r#"{"id":"note-id","title":"Note","content":"forced local","lastChangedAt":3}"#,
             ),
@@ -769,15 +778,7 @@ mod tests {
         .expect("overwrite should succeed")
         .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::Pushed);
-        let requests = fixture.finish();
-        assert_request_sequence(
-            &requests,
-            &[
-                "GET /v1/notes/note-id HTTP/1.1",
-                "PATCH /v1/notes/note-id HTTP/1.1",
-                "GET /v1/notes/note-id HTTP/1.1",
-            ],
-        );
+        fixture.finish();
     }
 
     #[test]
