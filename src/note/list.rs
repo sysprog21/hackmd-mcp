@@ -110,7 +110,7 @@ fn filter_sort_page(notes: &[NoteResponse], input: &ListNotesInput) -> ListNotes
         .iter()
         .map(|tag| normalize(tag))
         .collect::<Vec<_>>();
-    let mut notes = notes
+    let mut matching_notes = notes
         .iter()
         .filter(|note| {
             normalized_query
@@ -122,11 +122,50 @@ fn filter_sort_page(notes: &[NoteResponse], input: &ListNotesInput) -> ListNotes
                         .any(|candidate| normalize(candidate) == *required)
                 })
         })
-        .map(|note| note_summary(note.clone(), input.workspace.clone()))
         .collect::<Vec<_>>();
-    notes.sort_by(|left, right| compare_notes(left, right, input.sort));
+    matching_notes.sort_by(|left, right| compare_notes(left, right, input.sort));
 
-    page_summaries(notes, input.offset, input.limit)
+    let total = matching_notes.len();
+    let page_capacity = total.saturating_sub(input.offset).min(input.limit);
+    let mut notes = Vec::with_capacity(page_capacity);
+    notes.extend(
+        matching_notes
+            .into_iter()
+            .skip(input.offset)
+            .take(input.limit)
+            .map(|note| note_summary_ref(note, &input.workspace)),
+    );
+    let count = notes.len();
+    let end = input.offset.saturating_add(count);
+    let has_more = end < total;
+    ListNotesOutput {
+        meta: PageMeta {
+            total,
+            count,
+            offset: input.offset,
+            has_more,
+            next_offset: has_more.then_some(end),
+        },
+        notes,
+    }
+}
+
+fn note_summary_ref(note: &NoteResponse, workspace: &Workspace) -> NoteSummary {
+    NoteSummary {
+        id: note.id.clone(),
+        short_id: note.short_id.clone(),
+        title: note.title.clone(),
+        description: note.description.clone(),
+        tags: note.tags.clone(),
+        workspace: workspace.clone(),
+        created_at: note.created_at,
+        last_changed_at: note.last_changed_at,
+        last_visit: note.last_visit,
+        publish_link: note.publish_link.clone(),
+        permalink: note.permalink.clone(),
+        read_permission: note.read_permission,
+        write_permission: note.write_permission,
+    }
 }
 
 pub(crate) fn note_summary(note: NoteResponse, workspace: Workspace) -> NoteSummary {
@@ -177,7 +216,7 @@ fn matches_query(note: &NoteResponse, query: &str) -> bool {
             .any(|value| normalize(value).contains(query))
 }
 
-fn compare_notes(left: &NoteSummary, right: &NoteSummary, sort: NoteSort) -> Ordering {
+fn compare_notes(left: &NoteResponse, right: &NoteResponse, sort: NoteSort) -> Ordering {
     let primary = match sort {
         NoteSort::LastChangedDesc => right.last_changed_at.cmp(&left.last_changed_at),
         NoteSort::LastChangedAsc => left.last_changed_at.cmp(&right.last_changed_at),
@@ -290,6 +329,22 @@ mod tests {
         assert!(summary.get("folderPaths").is_none());
         assert_eq!(summary["shortId"], "short-a");
         assert_eq!(value["next_offset"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn materializes_only_the_requested_page() {
+        let notes = (0..1_000)
+            .map(|index| note(&format!("id-{index:04}"), "title", index, &["tag"]))
+            .collect::<Vec<_>>();
+        let mut input = input();
+        input.offset = 400;
+        input.limit = 3;
+
+        let output = filter_sort_page(&notes, &input);
+
+        assert_eq!(output.meta.total, 1_000);
+        assert_eq!(output.notes.len(), 3);
+        assert_eq!(output.notes.capacity(), 3);
     }
 
     #[tokio::test]

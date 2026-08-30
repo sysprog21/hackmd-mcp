@@ -256,6 +256,12 @@
 
 ## P3 — efficiency and reliability
 
+- [x] Project filtered note lists without cloning every full `NoteResponse`.
+  Filtering and deterministic sorting now retain borrowed records, then clone
+  only the owned fields in the requested page into an exactly sized result
+  allocation. A 1,000-note regression test verifies the page cardinality and
+  capacity; list responses continue to omit note content and folder paths.
+
 - [x] Remove parallel fixture races. The network-error test previously bound
   and released an ephemeral port before connecting; another parallel fixture
   could claim that port, consume the wrong request, and make both tests fail.

@@ -204,15 +204,18 @@ dependency, or background task without a bound and an invalidation rule.
 
 ### P1 — cached tracking and differential note operations
 
-- [ ] Add a bounded `NoteSnapshotCache` keyed by `(Workspace, internal_id)`.
-  Store only content, content hash, remote timestamp, insertion time, and a
+- [ ] After the P0 live-header task demonstrates a usable remote validator, add
+  a bounded `NoteSnapshotCache` keyed by `(Workspace, internal_id)`. Store only
+  content, content hash, validator, remote timestamp, insertion time, and a
   generation. Configure both TTL and total content bytes; use LRU eviction and
-  single-flight fills. Zero-byte capacity must disable it cleanly.
-- [ ] Define snapshot invalidation before implementation: any note write evicts
-  that note before network I/O; delete/restore and workspace-changing writes
-  also invalidate relevant list entries; pull/push may populate a snapshot only
-  from a successful readback; stale in-flight fills must lose to a newer
-  generation. Add race tests for all four cases.
+  single-flight fills. Zero-byte capacity must disable it cleanly. If HackMD
+  offers no validator, record the cache as inapplicable and retain one fresh
+  GET per correctness-sensitive operation; never serve TTL-only note content.
+- [ ] Before enabling the snapshot cache, define invalidation: any note write
+  evicts that note before network I/O; delete/restore and workspace-changing
+  writes also invalidate relevant list entries; pull/push may populate a
+  snapshot only from a successful readback; stale in-flight fills must lose to
+  a newer generation. Add race tests for all four cases.
 - [ ] Extend tracked state with the last verified remote timestamp and content
   hash, retaining backward-compatible loading for existing sidecars. On
   `hackmd_check_note_sync`, use a demonstrated conditional GET when available;
@@ -264,11 +267,6 @@ dependency, or background task without a bound and an invalidation rule.
   pass borrowed `str`/`Path` values through classification, allocate conflict
   diffs only for conflicts, and bound diff construction before formatting it.
   Prove unchanged behavior with large-body boundary tests.
-- [ ] Stop cloning each full `NoteResponse` when projecting filtered results;
-  build `NoteSummary` from borrowed fields and allocate only returned owned
-  fields. After deterministic ordering, retain only the requested page without
-  keeping an oversized backing allocation. Never deserialize or cache content
-  that list endpoints do not provide.
 - [ ] Review long-lived `String`, `Vec`, and `Arc` fields with a heap profiler.
   Change representation only where the baseline shows retained memory; avoid
   speculative `Box<str>`/`Arc<str>` churn that merely moves allocations.
