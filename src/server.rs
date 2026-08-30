@@ -389,6 +389,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn asynchronous_readback_reports_bounded_attempt_metadata() {
+        let fixture = crate::fixture::SequenceServer::spawn([
+            (200, r#"{"id":"note-id","title":"Title","content":"old"}"#),
+            (202, ""),
+            (200, r#"{"id":"note-id","title":"Title","content":"old"}"#),
+            (200, r#"{"id":"note-id","title":"Title","content":"new"}"#),
+        ]);
+        let (client, server_task) = protocol_client(Config::for_loopback_test(
+            &fixture.api_url,
+            Some("fixture-token"),
+        ))
+        .await;
+        let result = client
+            .call_tool(call(
+                "hackmd_edit_note",
+                json!({
+                    "note_ref": "note-id",
+                    "patch": "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch"
+                }),
+            ))
+            .await
+            .expect("edit tool call should complete");
+
+        assert_eq!(result.is_error, Some(false));
+        let retry = &result.meta.expect("readback should emit metadata").0["retry"];
+        assert_eq!(retry["attempts"], 1);
+        assert_eq!(retry["readback_attempts"], 2);
+        assert!(
+            retry["readback_elapsed_seconds"]
+                .as_f64()
+                .expect("elapsed time should be numeric")
+                > 0.0
+        );
+        stop_protocol(client, server_task).await;
+        assert_eq!(fixture.finish().len(), 4);
+
+        let failed = crate::fixture::SequenceServer::spawn([
+            (200, r#"{"id":"note-id","title":"Title","content":"old"}"#),
+            (202, ""),
+            (500, r#"{"error":"readback failed"}"#),
+        ]);
+        let (client, server_task) = protocol_client(Config::for_loopback_test_no_retry(
+            &failed.api_url,
+            "fixture-token",
+        ))
+        .await;
+        let result = client
+            .call_tool(call(
+                "hackmd_edit_note",
+                json!({
+                    "note_ref": "note-id",
+                    "patch": "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch"
+                }),
+            ))
+            .await
+            .expect("failed readback should remain a tool response");
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.meta.expect("failed readback should emit metadata").0["retry"]["readback_attempts"],
+            1
+        );
+        stop_protocol(client, server_task).await;
+        assert_eq!(failed.finish().len(), 3);
+    }
+
+    #[tokio::test]
     async fn update_tool_explains_create_only_permissions() {
         let server = HackmdServer::new(
             Arc::new(

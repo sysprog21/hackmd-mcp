@@ -99,7 +99,7 @@ art), `hackmd-api-client-rs` (Rust client plus commit history).
 ## Contradictions to settle against the live API before shipping
 
 These come from sources that disagree. Do not encode a guess; add a guarded live
-test (see P3) for each and record the answer here.
+test for each and record the answer here.
 
 - Measured 2026-08-29: personal `DELETE /notes/{id}` moves the note into
   `GET /trash`, and `PUT /trash/{id}/restore` makes it readable again.
@@ -160,7 +160,8 @@ test (see P3) for each and record the answer here.
   `delete_note` collide.
 - `hackmd-agent-python` returns retry state to the agent in a `_meta` field
   (`was_rate_limited`, `total_attempts`, `total_wait_seconds`) and caches note
-  lists for 60 seconds, invalidating on write. Both are the shape P3 wants.
+  lists for 60 seconds, invalidating on write. Both behaviors are implemented;
+  preserve their request and metadata contracts while optimizing them.
 - `hackmd-api-client-rs` commit `3d2d8e1` corrected response models and added
   encoded path-segment, double-millisecond timestamp, error-body, and current
   endpoint contract tests; follow-up `4af0888` removed speculative raw/optional
@@ -177,25 +178,138 @@ test (see P3) for each and record the answer here.
   `hackmd.io/@X/slug` URL as a team URL. It is not: `@X` is equally a personal
   user path. Resolve `@X` against the `/me` `userPath` first, then the team list.
 
-## P0 — RMCP 3.x foundation
+## Active roadmap
 
-- [ ] Restore the stable-toolchain lint job. `cargo clippy --all-targets
-  --all-features -- -D warnings` fails on Rust/Clippy 1.97 because
-  `clippy::unused_async_trait_impl` no longer exists, yet `src/server.rs` still
-  names it in an `#[allow]`. Remove or version-proof that suppression and add a
-  check that the macro-generated `ServerHandler` implementation stays warning
-  free on both the declared 1.88 MSRV and current stable.
+The server already has the complete local-first workflow. New work must improve
+measured request count, latency, peak resident memory, or dependency footprint
+without weakening conflict detection. Before and after each item, record the
+same workload and toolchain in the PR description. Do not add a cache,
+dependency, or background task without a bound and an invalidation rule.
 
-## P1 — essential RMCP tools
+### P0 — efficient HackMD API communication
 
-## P2 — complete daily HackMD workflow
+- [ ] Add deterministic request-budget tests for every public workflow. Assert
+  exact request sequences for direct IDs and resolved URLs: get = one item GET,
+  no-op edit = one item GET, changed edit = GET + PATCH + bounded readback,
+  sync check = one remote probe, and safe push = GET + optional PATCH + bounded
+  readback. A request-count increase must fail CI.
+- [ ] Measure the response headers returned by personal and team note GET/list
+  endpoints in the guarded live suite. Record whether `ETag`, `Last-Modified`,
+  or conditional requests are supported. Implement `If-None-Match` or
+  `If-Modified-Since` only after a live `304` is demonstrated; otherwise keep
+  timestamp/hash validation and document why conditional HTTP is unavailable.
+- [ ] Avoid discovery calls when an input already contains an internal note ID
+  or a previously validated tracked-note identity. Keep URL/title/permalink
+  resolution on the workspace list cache, coalesce concurrent misses, and
+  invalidate before every write attempt because a failed write may have landed.
+- [ ] Add a benchmark fixture with 10,000 note summaries and concurrent callers.
+  Track list-cache hit latency, miss coalescing, filtering/sorting time, request
+  count, and allocations. Set regression thresholds only after three stable CI
+  baselines; do not use wall-clock assertions in unit tests.
 
-## P2.5 — local Markdown sync
+### P1 — cached tracking and differential note operations
 
-## P3 — efficiency and reliability
+- [ ] Add a bounded `NoteSnapshotCache` keyed by `(Workspace, internal_id)`.
+  Store only content, content hash, remote timestamp, insertion time, and a
+  generation. Configure both TTL and total content bytes; use LRU eviction and
+  single-flight fills. Zero-byte capacity must disable it cleanly.
+- [ ] Define snapshot invalidation before implementation: any note write evicts
+  that note before network I/O; delete/restore and workspace-changing writes
+  also invalidate relevant list entries; pull/push may populate a snapshot only
+  from a successful readback; stale in-flight fills must lose to a newer
+  generation. Add race tests for all four cases.
+- [ ] Extend tracked state with the last verified remote timestamp and content
+  hash, retaining backward-compatible loading for existing sidecars. On
+  `hackmd_check_note_sync`, use a demonstrated conditional GET when available;
+  otherwise fetch once and hash while reading. Never report `in_sync` from TTL
+  alone.
+- [ ] Centralize the three-way classification used by check and push into one
+  pure function over baseline/local/remote hashes. Read full bodies only for
+  the branches that need content or a conflict diff. Table-test `in_sync`,
+  local-only, remote-only, conflict, missing baseline, and timestamp-changed but
+  body-identical cases.
+- [ ] Make edits differential locally: parse and validate the patch against the
+  cached/current body, skip no-op PATCH requests, and send HackMD the full body
+  only because API v1 requires it. Preserve strict unique-context matching and
+  always perform bounded readback before advancing cache or sync state.
+- [ ] Persist state and cache updates transactionally from the caller's point of
+  view: a failed remote write cannot advance the baseline; a successful remote
+  write with failed local persistence must return a recovery error containing
+  the note ID and must evict cached state.
 
+### P2 — consolidate test coverage
 
-## P4 — remote use
+- [ ] Replace repeated ad-hoc HTTP response tuples with a scenario builder that
+  declares expected method, encoded path, selected headers, body predicate,
+  response, and optional delay. Keep accepted sockets explicitly blocking and
+  enforce one overall fixture deadline on every platform.
+- [ ] Convert duplicated personal/team and status-code tests into table-driven
+  cases. Retain separate tests only where route shape, permissions, or API
+  behavior genuinely differs. Test names must describe the invariant rather
+  than the implementation function.
+- [ ] Move cross-module workflow coverage to integration tests through the MCP
+  transport: resolve/get/edit, pull/check/push/conflict, folder placement, and
+  delete/restore. Unit tests should own parsers, validation boundaries, cache
+  races, state recovery, and pure sync classification; avoid asserting the same
+  behavior at three layers.
+- [ ] Split guarded live tests into read-only and destructive groups. Run the
+  read-only contract manually with a token and keep destructive tests behind
+  both the existing opt-in and an explicit confirmation variable. Every live
+  test must clean up resources and print created IDs on cleanup failure.
+- [ ] Add a coverage report in CI and ratchet changed-line coverage after the
+  initial baseline. Exclude generated macro code, but do not exclude error,
+  recovery, cache-eviction, or platform-specific branches. Coverage tooling
+  must remain CI-only rather than a runtime dependency.
+
+### P3 — reduce memory consumption
+
+- [ ] Establish reproducible peak-RSS and allocation baselines for startup,
+  listing 10,000 notes, a 10 MiB pull, safe push, and a three-way conflict. Run
+  release builds with default features and with `otel`; report both separately.
+- [ ] Enforce byte-based limits on every cache, not just entry counts. Account
+  for note bodies by capacity, cap workspace-summary caches independently, and
+  expose hit/miss/eviction counters without note titles, bodies, paths, or token
+  data.
+- [ ] Remove avoidable full-body copies in sync. Hash byte slices incrementally,
+  pass borrowed `str`/`Path` values through classification, allocate conflict
+  diffs only for conflicts, and bound diff construction before formatting it.
+  Prove unchanged behavior with large-body boundary tests.
+- [ ] Stop cloning each full `NoteResponse` when projecting filtered results;
+  build `NoteSummary` from borrowed fields and allocate only returned owned
+  fields. After deterministic ordering, retain only the requested page without
+  keeping an oversized backing allocation. Never deserialize or cache content
+  that list endpoints do not provide.
+- [ ] Review long-lived `String`, `Vec`, and `Arc` fields with a heap profiler.
+  Change representation only where the baseline shows retained memory; avoid
+  speculative `Box<str>`/`Arc<str>` churn that merely moves allocations.
+
+### P4 — eliminate unnecessary Rust dependencies
+
+- [ ] Add `cargo machete` (or an equivalent unused-direct-dependency check) to
+  CI and run `cargo tree -d` on dependency updates. Keep RustSec auditing. Pin
+  the CI tool version so a new lint cannot break `main` without review.
+- [ ] Audit each direct dependency by feature and call site. Document why
+  security-critical `cap-std`, protocol-critical `rmcp`, and TLS/HTTP `reqwest`
+  remain; remove unused default features and prove the default and `--all-features`
+  builds after every change.
+- [ ] Move test-only crates out of normal dependencies. In particular, determine
+  whether production atomic writes can replace `tempfile`; if not, document the
+  required production call sites. Keep `futures-util` dev-only or replace its
+  small test usage with standard-library/Tokio primitives.
+- [ ] Evaluate replacing `clap` derive with the smaller builder API or a minimal
+  parser for the three supported flags. Accept the change only if release binary
+  size and clean-build time improve materially while help/version/error behavior
+  remains covered by `tests/stdio.rs`.
+- [ ] Evaluate whether `fastrand` and `httpdate` can be removed using existing
+  runtime/HTTP facilities without weakening jitter or RFC date parsing. Do not
+  replace either with hand-rolled randomness or a partial date parser.
+- [ ] Keep OpenTelemetry optional and verify `cargo build --no-default-features`
+  contains no OTLP/tonic packages. Compare an `otel` build before attempting to
+  consolidate the four telemetry crates; preserve trace context and async export
+  tests if the feature remains.
+- [ ] For every proposed removal, capture `cargo tree`, clean build time, release
+  binary size, and test results before and after. Reject dependency churn that
+  only replaces one direct crate with an equal or larger transitive graph.
 
 ## Deliberately deferred
 

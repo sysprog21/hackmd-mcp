@@ -8,6 +8,8 @@ pub(crate) struct RetryMetadata {
     attempts: u8,
     total_waited_seconds: f64,
     was_rate_limited: bool,
+    readback_attempts: u8,
+    readback_elapsed_seconds: f64,
 }
 
 tokio::task_local! {
@@ -20,6 +22,14 @@ pub(crate) fn record_retry(waited: Duration, was_rate_limited: bool) {
         metadata.attempts = metadata.attempts.saturating_add(1);
         metadata.total_waited_seconds += waited.as_secs_f64();
         metadata.was_rate_limited |= was_rate_limited;
+    });
+}
+
+pub(crate) fn record_readback(attempts: u8, elapsed: Duration) {
+    let _result = RETRY_METADATA.try_with(|metadata| {
+        let mut metadata = metadata.borrow_mut();
+        metadata.readback_attempts = metadata.readback_attempts.saturating_add(attempts);
+        metadata.readback_elapsed_seconds += elapsed.as_secs_f64();
     });
 }
 
@@ -37,7 +47,7 @@ where
                 let mut response = future.await?;
                 let metadata = RETRY_METADATA.with(|metadata| {
                     let metadata = metadata.borrow();
-                    (metadata.attempts > 1).then(|| {
+                    (metadata.attempts > 1 || metadata.readback_attempts > 0).then(|| {
                         serde_json::to_value(&*metadata).expect("retry metadata serializes")
                     })
                 });

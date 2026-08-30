@@ -804,27 +804,51 @@ pub(crate) struct Readback<T> {
 /// that as failure has its error, and one that wants to report the current
 /// state has it without paying for another request.
 ///
-/// The window bounds the waiting, not the reads. Each `fetch` is a full client
-/// request, so it can burn its own timeout and retries (up to four attempts of
-/// 30 seconds by default) before the deadline is even consulted.
 pub(crate) async fn poll_readback<T, Fut>(
-    mut fetch: impl FnMut() -> Fut,
+    fetch: impl FnMut() -> Fut,
     accepted: impl Fn(&T) -> bool,
 ) -> Result<Readback<T>, HackmdError>
 where
     Fut: std::future::Future<Output = Result<T, HackmdError>>,
 {
-    let deadline = tokio::time::Instant::now() + READBACK_WINDOW;
-    let mut delay = READBACK_FIRST_DELAY;
+    poll_readback_with_policy(fetch, accepted, READBACK_WINDOW, READBACK_FIRST_DELAY).await
+}
+
+async fn poll_readback_with_policy<T, Fut>(
+    mut fetch: impl FnMut() -> Fut,
+    accepted: impl Fn(&T) -> bool,
+    window: Duration,
+    first_delay: Duration,
+) -> Result<Readback<T>, HackmdError>
+where
+    Fut: std::future::Future<Output = Result<T, HackmdError>>,
+{
+    let started = tokio::time::Instant::now();
+    let deadline = started + window;
+    let mut delay = first_delay;
+    let mut attempts = 0_u8;
     loop {
-        let value = fetch().await?;
+        attempts = attempts.saturating_add(1);
+        let Ok(result) = tokio::time::timeout_at(deadline, fetch()).await else {
+            crate::retry::record_readback(attempts, started.elapsed());
+            return Err(HackmdError::ReadbackTimeout);
+        };
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                crate::retry::record_readback(attempts, started.elapsed());
+                return Err(error);
+            }
+        };
         if accepted(&value) {
+            crate::retry::record_readback(attempts, started.elapsed());
             return Ok(Readback {
                 value,
                 confirmed: true,
             });
         }
         if tokio::time::Instant::now() + delay >= deadline {
+            crate::retry::record_readback(attempts, started.elapsed());
             return Ok(Readback {
                 value,
                 confirmed: false,
@@ -982,6 +1006,8 @@ pub(crate) enum HackmdError {
     UnknownTeam { team_path: String },
     #[error("{method} {path}: request timed out; check network connectivity and retry")]
     Timeout { method: String, path: String },
+    #[error("HackMD write read-back exceeded its bounded verification window")]
+    ReadbackTimeout,
     #[error("{method} {path}: network request failed; check connectivity and HACKMD_API_URL")]
     Network { method: String, path: String },
     #[error(
@@ -1698,6 +1724,38 @@ mod tests {
             Err(HackmdError::Upstream { .. })
         ));
         assert_eq!(post_server.finish().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn readback_policy_bounds_the_fetch_itself() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::poll_readback_with_policy(
+                std::future::pending::<Result<Value, HackmdError>>,
+                |_| true,
+                Duration::from_millis(10),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("the readback policy must bound a stuck fetch");
+
+        assert!(matches!(result, Err(HackmdError::ReadbackTimeout)));
+    }
+
+    #[tokio::test]
+    async fn readback_policy_returns_the_last_bounded_observation() {
+        let result = super::poll_readback_with_policy(
+            || std::future::ready(Ok::<_, HackmdError>("old")),
+            |value| *value == "new",
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("a completed fetch should remain observable");
+
+        assert_eq!(result.value, "old");
+        assert!(!result.confirmed);
     }
 
     #[test]

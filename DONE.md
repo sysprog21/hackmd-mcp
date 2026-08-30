@@ -1,5 +1,15 @@
 # Completed tasks
 
+## Active roadmap — efficiency and reliability
+
+- [x] Bound asynchronous write readback across network I/O as well as polling
+  delays. Stop immediately on a matching observation, preserve the last
+  non-matching observation at the deadline, return an actionable timeout when
+  a fetch itself exhausts the window, and record readback attempts plus elapsed
+  time in per-call retry metadata on success and failure. Coverage includes
+  empty 202/204 writes, delayed visibility, rate-limited retries, request
+  timeout, permanent mismatch, and failed readback.
+
 ## P0 — RMCP 3.x foundation
 
 - [x] Create the `hackmd-mcp` Cargo crate with `license = "MIT"` on a Rust
