@@ -107,7 +107,11 @@ pub(crate) async fn edit_note(
 #[cfg(test)]
 mod tests {
     use super::{EditNoteError, EditNoteInput, edit_note};
-    use crate::{fixture::SequenceServer, models::Workspace, note::patch::PatchError};
+    use crate::{
+        fixture::{SequenceServer, assert_request_sequence},
+        models::Workspace,
+        note::patch::PatchError,
+    };
 
     fn input(patch: &str) -> EditNoteInput {
         EditNoteInput {
@@ -155,10 +159,15 @@ mod tests {
         assert!(output.changed);
         assert_eq!(output.content, "new\n");
         let requests = server.finish();
-        assert!(requests[0].starts_with("GET /v1/notes/note-id HTTP/1.1\r\n"));
-        assert!(requests[1].starts_with("PATCH /v1/notes/note-id HTTP/1.1\r\n"));
+        assert_request_sequence(
+            &requests,
+            &[
+                "GET /v1/notes/note-id HTTP/1.1",
+                "PATCH /v1/notes/note-id HTTP/1.1",
+                "GET /v1/notes/note-id HTTP/1.1",
+            ],
+        );
         assert!(requests[1].ends_with(r#"{"content":"new\n"}"#));
-        assert!(requests[2].starts_with("GET /v1/notes/note-id HTTP/1.1\r\n"));
     }
 
     #[tokio::test]
@@ -171,7 +180,7 @@ mod tests {
             .expect("no-op should succeed")
             .expect("reference should resolve");
         assert!(!output.changed);
-        assert_eq!(server.finish().len(), 1);
+        assert_request_sequence(&server.finish(), &["GET /v1/notes/note-id HTTP/1.1"]);
     }
 
     #[tokio::test]

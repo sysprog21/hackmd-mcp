@@ -100,6 +100,7 @@ mod tests {
     use std::fs;
 
     use super::{CheckNoteSyncInput, SyncStatus, check_note_sync};
+    use crate::fixture::assert_request_sequence;
     #[tokio::test]
     async fn classifies_all_four_sync_states_without_writes() {
         let directory = tempfile::tempdir().expect("temp directory should create");
@@ -148,7 +149,15 @@ mod tests {
             statuses.push(output.status);
         }
         assert_eq!(statuses.len(), 4);
-        assert_eq!(fixture.finish().len(), 4);
+        assert_request_sequence(
+            &fixture.finish(),
+            &[
+                "GET /v1/notes/id HTTP/1.1",
+                "GET /v1/notes/id HTTP/1.1",
+                "GET /v1/notes/id HTTP/1.1",
+                "GET /v1/notes/id HTTP/1.1",
+            ],
+        );
         assert_eq!(
             fs::read_to_string(&local_path).expect("local should remain readable"),
             "local"

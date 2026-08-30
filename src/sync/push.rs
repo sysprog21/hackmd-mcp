@@ -336,6 +336,7 @@ mod tests {
     use crate::{
         client::HackmdClient,
         config::Config,
+        fixture::assert_request_sequence,
         models::Workspace,
         sync::{BODY_MAX_BYTES, BODY_WARNING_BYTES},
     };
@@ -418,8 +419,14 @@ mod tests {
         assert_eq!(output.status, PushStatus::Pushed);
         assert!(output.pushed);
         let requests = fixture.finish();
-        assert_eq!(requests.len(), 3);
-        assert!(requests[1].starts_with("PATCH /v1/notes/note-id HTTP/1.1\r\n"));
+        assert_request_sequence(
+            &requests,
+            &[
+                "GET /v1/notes/note-id HTTP/1.1",
+                "PATCH /v1/notes/note-id HTTP/1.1",
+                "GET /v1/notes/note-id HTTP/1.1",
+            ],
+        );
         assert!(requests[1].ends_with(r#"{"content":"local edit"}"#));
         let loaded = files
             .state()
@@ -471,7 +478,7 @@ mod tests {
         let diff = output.diff_summary.expect("diff summary should exist");
         assert!(diff.contains("LOCAL CHANGES"));
         assert!(diff.contains("REMOTE CHANGES"));
-        assert_eq!(fixture.finish().len(), 1);
+        assert_request_sequence(&fixture.finish(), &["GET /v1/notes/note-id HTTP/1.1"]);
     }
 
     #[test]
@@ -505,7 +512,7 @@ mod tests {
         .expect("comparison should succeed")
         .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::RemoteChanged);
-        assert_eq!(fixture.finish().len(), 1);
+        assert_request_sequence(&fixture.finish(), &["GET /v1/notes/note-id HTTP/1.1"]);
     }
 
     #[tokio::test]
@@ -530,7 +537,7 @@ mod tests {
         .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::NothingToPush);
         assert!(!output.pushed);
-        assert_eq!(fixture.finish().len(), 1);
+        assert_request_sequence(&fixture.finish(), &["GET /v1/notes/note-id HTTP/1.1"]);
     }
 
     #[tokio::test]
@@ -580,8 +587,14 @@ mod tests {
         .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::Pushed);
         let requests = fixture.finish();
-        assert!(requests[1].starts_with("PATCH /v1/notes/note-id HTTP/1.1\r\n"));
-        assert!(requests[2].starts_with("GET /v1/notes/note-id HTTP/1.1\r\n"));
+        assert_request_sequence(
+            &requests,
+            &[
+                "GET /v1/notes/note-id HTTP/1.1",
+                "PATCH /v1/notes/note-id HTTP/1.1",
+                "GET /v1/notes/note-id HTTP/1.1",
+            ],
+        );
     }
 
     #[test]

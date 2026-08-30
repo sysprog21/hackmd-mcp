@@ -17,6 +17,16 @@ use crate::{
 /// requests carry an Authorization header the assertions can inspect.
 pub(crate) const FIXTURE_TOKEN: &str = "fixture-token";
 
+/// Asserts the exact HTTP method/path sequence without coupling tests to
+/// transport headers that `reqwest` may legitimately change.
+pub(crate) fn assert_request_sequence(requests: &[String], expected: &[&str]) {
+    let actual = requests
+        .iter()
+        .map(|request| request.lines().next().unwrap_or(""))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "unexpected HackMD API request budget");
+}
+
 type FixtureHeaders = &'static [(&'static str, &'static str)];
 
 const EMPTY_HEADERS: FixtureHeaders = &[];

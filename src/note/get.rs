@@ -123,7 +123,9 @@ mod tests {
 
     use super::{GetNoteInput, normalize_note};
     use crate::{
-        client::HackmdClient, config::Config, dto::NoteResponse, models::Workspace,
+        dto::NoteResponse,
+        fixture::{SequenceServer, assert_request_sequence},
+        models::Workspace,
         note::reference::ResolvedNoteRef,
     };
 
@@ -181,9 +183,12 @@ mod tests {
 
     #[tokio::test]
     async fn direct_reference_fetches_item_without_listing() {
-        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
-        let error = super::get_note(
-            &client,
+        let fixture = SequenceServer::spawn([(
+            200,
+            r#"{"id":"internal-id","title":"Direct","content":"body"}"#,
+        )]);
+        let output = super::get_note(
+            &fixture.client(),
             GetNoteInput {
                 workspace: Workspace::Personal,
                 note_ref: "internal-id".to_owned(),
@@ -191,10 +196,44 @@ mod tests {
             },
         )
         .await
-        .expect_err("missing token should fail at the item request");
-        assert_eq!(
-            error.to_string(),
-            "GET /v1/notes/internal-id: HACKMD_API_TOKEN is not configured; set it in the server environment and restart the MCP server"
+        .expect("direct get should succeed")
+        .expect("direct reference should resolve");
+        assert_eq!(output.id, "internal-id");
+        assert_request_sequence(&fixture.finish(), &["GET /v1/notes/internal-id HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_reference_has_a_bounded_discovery_then_item_budget() {
+        let fixture = SequenceServer::spawn([
+            (200, r#"{"id":"user","name":"User","userPath":"alice"}"#),
+            (
+                200,
+                r#"[{"id":"resolved-id","title":"Note","permalink":"slug"}]"#,
+            ),
+            (
+                200,
+                r#"{"id":"resolved-id","title":"Note","content":"body"}"#,
+            ),
+        ]);
+        let output = super::get_note(
+            &fixture.client(),
+            GetNoteInput {
+                workspace: Workspace::Personal,
+                note_ref: "https://hackmd.io/@alice/slug".to_owned(),
+                refresh: false,
+            },
+        )
+        .await
+        .expect("scoped get should succeed")
+        .expect("scoped reference should resolve");
+        assert_eq!(output.id, "resolved-id");
+        assert_request_sequence(
+            &fixture.finish(),
+            &[
+                "GET /v1/me HTTP/1.1",
+                "GET /v1/notes HTTP/1.1",
+                "GET /v1/notes/resolved-id HTTP/1.1",
+            ],
         );
     }
 }

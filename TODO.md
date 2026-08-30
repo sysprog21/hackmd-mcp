@@ -188,11 +188,6 @@ dependency, or background task without a bound and an invalidation rule.
 
 ### P0 — efficient HackMD API communication
 
-- [ ] Add deterministic request-budget tests for every public workflow. Assert
-  exact request sequences for direct IDs and resolved URLs: get = one item GET,
-  no-op edit = one item GET, changed edit = GET + PATCH + bounded readback,
-  sync check = one remote probe, and safe push = GET + optional PATCH + bounded
-  readback. A request-count increase must fail CI.
 - [ ] Measure the response headers returned by personal and team note GET/list
   endpoints in the guarded live suite. Record whether `ETag`, `Last-Modified`,
   or conditional requests are supported. Implement `If-None-Match` or

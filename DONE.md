@@ -2,6 +2,13 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Enforce exact HackMD API request budgets for core note workflows with a
+  shared method/path sequence assertion: direct get performs one item GET;
+  scoped get performs profile discovery, one workspace list, and one item GET;
+  no-op edit performs one GET; changed edit and successful push perform GET,
+  PATCH, and bounded readback; sync checks and every safe-push no-op/conflict
+  branch perform exactly one remote probe. Request-route additions now fail the
+  owning workflow test.
 - [x] Bound asynchronous write readback across network I/O as well as polling
   delays. Stop immediately on a matching observation, preserve the last
   non-matching observation at the deadline, return an actionable timeout when
