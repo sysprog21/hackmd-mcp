@@ -2,6 +2,18 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Evaluate `fastrand` and `httpdate` against existing public runtime/HTTP
+  facilities. Retain them: standard Tokio/reqwest APIs provide neither a
+  maintained full-jitter RNG nor RFC HTTP-date parsing, and hand-written
+  substitutes would weaken retry behavior. `fastrand` also supplies confined
+  atomic-write suffixes; `httpdate` handles date-form `Retry-After` values.
+- [x] Verify the OpenTelemetry boundary. The no-default-feature graph contains
+  no OpenTelemetry, OTLP, or tonic packages; the feature build is 17,403,968
+  bytes versus 14,904,768 bytes by default. Keep the four optional direct crates
+  because they separately provide the trace trait, SDK/provider, OTLP exporter,
+  and tracing bridge used at their call sites; consolidation would only hide
+  required APIs behind another wrapper.
+
 - [x] Remove avoidable large-body copies from edit and sync push. Serialize
   borrowed Markdown directly, retain one reusable encoded request body across
   idempotent retries, and verify every retry sends the identical payload.

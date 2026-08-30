@@ -12,7 +12,7 @@ resolved graph.
 | `directories` | Selects the platform state directory when no explicit override is configured. |
 | `fastrand` | Supplies retry full jitter and collision-resistant atomic-write suffixes. The `std` default is required for process/thread-local randomness. |
 | `httpdate` | Parses standards-compliant HTTP-date `Retry-After` values; a partial local parser would weaken rate-limit handling. |
-| `opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk`, `tracing-opentelemetry` | Optional `otel` export only. OTLP disables defaults and enables only tonic gRPC and traces. |
+| `opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk`, `tracing-opentelemetry` | Optional `otel` export only. OTLP disables defaults and enables only tonic gRPC and traces. Each crate supplies a directly used API: trace trait, exporter, provider/runtime, and tracing bridge respectively; the default graph contains none of them or tonic. |
 | `reqwest` | TLS HackMD API client. Defaults are disabled; JSON payloads, streaming multipart images, Rustls, and response streaming are all used. |
 | `rmcp` | MCP protocol schemas, tool macros, server routing, and stdio transport. Defaults are disabled; client/worker support is dev-only for in-process protocol tests. |
 | `serde`, `serde_json` | Typed API/MCP/config wire formats and redacted structured diagnostics. |

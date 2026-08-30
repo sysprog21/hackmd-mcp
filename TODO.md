@@ -272,13 +272,6 @@ dependency, or background task without a bound and an invalidation rule.
 - [ ] Add `cargo machete` (or an equivalent unused-direct-dependency check) to
   CI and run `cargo tree -d` on dependency updates. Keep RustSec auditing. Pin
   the CI tool version so a new lint cannot break `main` without review.
-- [ ] Evaluate whether `fastrand` and `httpdate` can be removed using existing
-  runtime/HTTP facilities without weakening jitter or RFC date parsing. Do not
-  replace either with hand-rolled randomness or a partial date parser.
-- [ ] Keep OpenTelemetry optional and verify `cargo build --no-default-features`
-  contains no OTLP/tonic packages. Compare an `otel` build before attempting to
-  consolidate the four telemetry crates; preserve trace context and async export
-  tests if the feature remains.
 - [ ] For every proposed removal, capture `cargo tree`, clean build time, release
   binary size, and test results before and after. Reject dependency churn that
   only replaces one direct crate with an equal or larger transitive graph.
