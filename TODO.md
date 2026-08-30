@@ -193,10 +193,6 @@ dependency, or background task without a bound and an invalidation rule.
   or conditional requests are supported. Implement `If-None-Match` or
   `If-Modified-Since` only after a live `304` is demonstrated; otherwise keep
   timestamp/hash validation and document why conditional HTTP is unavailable.
-- [ ] Avoid discovery calls when an input already contains an internal note ID
-  or a previously validated tracked-note identity. Keep URL/title/permalink
-  resolution on the workspace list cache, coalesce concurrent misses, and
-  invalidate before every write attempt because a failed write may have landed.
 - [ ] Add a benchmark fixture with 10,000 note summaries and concurrent callers.
   Track list-cache hit latency, miss coalescing, filtering/sorting time, request
   count, and allocations. Set regression thresholds only after three stable CI
@@ -216,11 +212,6 @@ dependency, or background task without a bound and an invalidation rule.
   writes also invalidate relevant list entries; pull/push may populate a
   snapshot only from a successful readback; stale in-flight fills must lose to
   a newer generation. Add race tests for all four cases.
-- [ ] Extend tracked state with the last verified remote timestamp and content
-  hash, retaining backward-compatible loading for existing sidecars. On
-  `hackmd_check_note_sync`, use a demonstrated conditional GET when available;
-  otherwise fetch once and hash while reading. Never report `in_sync` from TTL
-  alone.
 
 ### P2 — consolidate test coverage
 

@@ -2,6 +2,21 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Avoid discovery requests for direct internal IDs and validated tracked
+  identities. Direct references resolve without API I/O; sync checks address
+  the sidecar's verified workspace/internal ID with exactly one fresh item GET.
+  Scoped URL aliases (short ID/permalink) continue through the bounded,
+  single-flight workspace-list cache; title lookup is deliberately unsupported
+  because it is ambiguous. Every attempted write invalidates the list cache
+  before and after I/O, including failed writes.
+- [x] Retain remote verification data in tracked state without a redundant
+  schema extension. Sidecars have recorded the verified baseline SHA-256 and
+  last observed remote timestamp since their introduction; state written before
+  the path index remains compatible through verified scan fallback. Sync check
+  fetches once, hashes the returned body, reuses the verified baseline digest,
+  and never reports `in_sync` from TTL or timestamp alone. Conditional GET
+  remains gated on live evidence.
+
 - [x] Preserve transactional push semantics across the remote/local boundary.
   A rejected or unconfirmed remote write leaves the baseline untouched; after
   confirmed readback, local persistence failures return a compact note-specific
