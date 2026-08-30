@@ -160,7 +160,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::{NoteResolution, ParsedNoteRef, parse_note_ref, resolve_note_ref, unique_matches};
-    use crate::{client::HackmdClient, config::Config, dto::NoteResponse, models::Workspace};
+    use crate::{
+        client::HackmdClient,
+        config::Config,
+        dto::NoteResponse,
+        fixture::{Scenario, SequenceServer},
+        models::Workspace,
+    };
 
     fn note(
         id: &str,
@@ -219,12 +225,16 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_urls_resolve_personal_user_path_before_team_paths() {
-        let fixture = crate::fixture::SequenceServer::spawn([
-            (
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/me",
                 200,
                 r#"{"id":"u","name":"User","email":"u@example.com","userPath":"alice"}"#,
             ),
-            (
+            Scenario::new(
+                "GET",
+                "/v1/notes",
                 200,
                 r#"[{"id":"personal-id","title":"Personal","permalink":"slug"}]"#,
             ),
@@ -243,18 +253,36 @@ mod tests {
         assert!(
             matches!(result, NoteResolution::Resolved { note } if note.workspace == Workspace::Personal && note.note_id == "personal-id")
         );
-        let requests = fixture.finish();
-        assert!(requests[0].starts_with("GET /v1/me HTTP/1.1\r\n"));
-        assert!(requests[1].starts_with("GET /v1/notes HTTP/1.1\r\n"));
+        fixture.finish();
     }
 
     #[tokio::test]
     async fn scoped_url_refresh_bypasses_a_cached_workspace_list() {
-        let fixture = crate::fixture::SequenceServer::spawn([
-            (200, r#"{"id":"u","name":"User","userPath":"alice"}"#),
-            (200, r#"[{"id":"old","title":"Old","permalink":"slug"}]"#),
-            (200, r#"{"id":"u","name":"User","userPath":"alice"}"#),
-            (200, r#"[{"id":"new","title":"New","permalink":"slug"}]"#),
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/me",
+                200,
+                r#"{"id":"u","name":"User","userPath":"alice"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes",
+                200,
+                r#"[{"id":"old","title":"Old","permalink":"slug"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/me",
+                200,
+                r#"{"id":"u","name":"User","userPath":"alice"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes",
+                200,
+                r#"[{"id":"new","title":"New","permalink":"slug"}]"#,
+            ),
         ]);
         let client = fixture.client_with_cache();
 
@@ -277,18 +305,30 @@ mod tests {
 
         assert!(matches!(first, NoteResolution::Resolved { note } if note.note_id == "old"));
         assert!(matches!(refreshed, NoteResolution::Resolved { note } if note.note_id == "new"));
-        assert_eq!(fixture.finish().len(), 4);
+        fixture.finish();
     }
 
     #[tokio::test]
     async fn scoped_team_slug_resolves_through_team_discovery() {
-        let fixture = crate::fixture::SequenceServer::spawn([
-            (
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/me",
                 200,
                 r#"{"id":"u","name":"User","email":"u@example.com","userPath":"alice"}"#,
             ),
-            (200, r#"[{"id":"t","name":"Core","path":"core"}]"#),
-            (200, r#"[{"id":"team-id","title":"Team","shortId":"slug"}]"#),
+            Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Core","path":"core"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams/core/notes",
+                200,
+                r#"[{"id":"team-id","title":"Team","shortId":"slug"}]"#,
+            ),
         ]);
         let client = fixture.client();
         let result = resolve_note_ref(
@@ -302,9 +342,7 @@ mod tests {
         assert!(
             matches!(result, NoteResolution::Resolved { note } if note.workspace == Workspace::Team { team_path: "core".to_owned() } && note.note_id == "team-id")
         );
-        let requests = fixture.finish();
-        assert!(requests[1].starts_with("GET /v1/teams HTTP/1.1\r\n"));
-        assert!(requests[2].starts_with("GET /v1/teams/core/notes HTTP/1.1\r\n"));
+        fixture.finish();
     }
 
     #[test]

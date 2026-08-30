@@ -2,6 +2,12 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Migrate all bounded note and folder HTTP tests to declarative `Scenario`
+  steps, including discovery, encoded item routes, async readbacks, folder-order
+  merge bodies, trash/restore, and streaming multipart body markers. Preserve
+  the explicit repeating responder only for eventual-visibility timeout tests.
+  The full 175-test all-feature suite passes.
+
 - [x] Migrate the client request, retry, and list-cache HTTP tests to declarative
   `Scenario` steps. Routes, encoded segments, selected authorization and content
   headers, request bodies, retry sequences, response headers, and delays are now

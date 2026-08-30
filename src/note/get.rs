@@ -124,7 +124,7 @@ mod tests {
     use super::{GetNoteInput, normalize_note};
     use crate::{
         dto::NoteResponse,
-        fixture::{SequenceServer, assert_request_sequence},
+        fixture::{Scenario, SequenceServer},
         models::Workspace,
         note::reference::ResolvedNoteRef,
     };
@@ -183,7 +183,9 @@ mod tests {
 
     #[tokio::test]
     async fn direct_reference_fetches_item_without_listing() {
-        let fixture = SequenceServer::spawn([(
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/internal-id",
             200,
             r#"{"id":"internal-id","title":"Direct","content":"body"}"#,
         )]);
@@ -199,18 +201,27 @@ mod tests {
         .expect("direct get should succeed")
         .expect("direct reference should resolve");
         assert_eq!(output.id, "internal-id");
-        assert_request_sequence(&fixture.finish(), &["GET /v1/notes/internal-id HTTP/1.1"]);
+        fixture.finish();
     }
 
     #[tokio::test]
     async fn scoped_reference_has_a_bounded_discovery_then_item_budget() {
-        let fixture = SequenceServer::spawn([
-            (200, r#"{"id":"user","name":"User","userPath":"alice"}"#),
-            (
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/me",
+                200,
+                r#"{"id":"user","name":"User","userPath":"alice"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes",
                 200,
                 r#"[{"id":"resolved-id","title":"Note","permalink":"slug"}]"#,
             ),
-            (
+            Scenario::new(
+                "GET",
+                "/v1/notes/resolved-id",
                 200,
                 r#"{"id":"resolved-id","title":"Note","content":"body"}"#,
             ),
@@ -227,13 +238,6 @@ mod tests {
         .expect("scoped get should succeed")
         .expect("scoped reference should resolve");
         assert_eq!(output.id, "resolved-id");
-        assert_request_sequence(
-            &fixture.finish(),
-            &[
-                "GET /v1/me HTTP/1.1",
-                "GET /v1/notes HTTP/1.1",
-                "GET /v1/notes/resolved-id HTTP/1.1",
-            ],
-        );
+        fixture.finish();
     }
 }

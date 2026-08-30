@@ -222,8 +222,7 @@ dependency, or background task without a bound and an invalidation rule.
 
 ### P2 — consolidate test coverage
 
-- [ ] Finish migrating HTTP tests to `Scenario` in two reviewable batches:
-  note/folder handlers, then sync/server workflows. In each batch, encode
+- [ ] Finish migrating sync/server workflow HTTP tests to `Scenario`. Encode
   method/path and meaningful auth/content/body expectations in the declaration
   instead of inspecting raw requests afterward.
   Once `rg 'SequenceServer::spawn(_with_headers|_delayed)?' src` has no ordinary

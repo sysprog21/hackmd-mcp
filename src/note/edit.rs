@@ -100,7 +100,7 @@ pub(crate) async fn edit_note(
 mod tests {
     use super::{EditNoteError, EditNoteInput, edit_note};
     use crate::{
-        fixture::{SequenceServer, assert_request_sequence},
+        fixture::{Scenario, SequenceServer},
         models::Workspace,
         note::patch::PatchError,
     };
@@ -137,10 +137,23 @@ mod tests {
 
     #[tokio::test]
     async fn changed_edit_gets_then_patches_full_updated_content() {
-        let server = SequenceServer::spawn([
-            (200, r#"{"id":"note-id","title":"Title","content":"old\n"}"#),
-            (202, ""),
-            (200, r#"{"id":"note-id","title":"Title","content":"new\n"}"#),
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Title","content":"old\n"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, "")
+                .expect_body("the complete updated content", |body| {
+                    body == r#"{"content":"new\n"}"#
+                }),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Title","content":"new\n"}"#,
+            ),
         ]);
         let patch =
             "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch";
@@ -150,34 +163,31 @@ mod tests {
             .expect("reference should resolve");
         assert!(output.changed);
         assert_eq!(output.content, "new\n");
-        let requests = server.finish();
-        assert_request_sequence(
-            &requests,
-            &[
-                "GET /v1/notes/note-id HTTP/1.1",
-                "PATCH /v1/notes/note-id HTTP/1.1",
-                "GET /v1/notes/note-id HTTP/1.1",
-            ],
-        );
-        assert!(requests[1].ends_with(r#"{"content":"new\n"}"#));
+        server.finish();
     }
 
     #[tokio::test]
     async fn no_op_edit_gets_once_and_never_patches() {
-        let server =
-            SequenceServer::spawn([(200, r#"{"id":"note-id","title":"Title","content":"same"}"#)]);
+        let server = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/note-id",
+            200,
+            r#"{"id":"note-id","title":"Title","content":"same"}"#,
+        )]);
         let patch = "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n same\n*** End Patch";
         let output = edit_note(&server.client(), input(patch))
             .await
             .expect("no-op should succeed")
             .expect("reference should resolve");
         assert!(!output.changed);
-        assert_request_sequence(&server.finish(), &["GET /v1/notes/note-id HTTP/1.1"]);
+        server.finish();
     }
 
     #[tokio::test]
     async fn patch_conflict_returns_distinct_error_without_patch_request() {
-        let server = SequenceServer::spawn([(
+        let server = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/note-id",
             200,
             r#"{"id":"note-id","title":"Title","content":"actual"}"#,
         )]);
@@ -208,7 +218,12 @@ mod tests {
             ),
         ];
         for (body, patch, expected) in cases {
-            let server = SequenceServer::spawn([(200, body)]);
+            let server = SequenceServer::spawn_scenarios([Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                body,
+            )]);
             let message = edit_note(&server.client(), input(patch))
                 .await
                 .expect_err("patch must conflict")
@@ -220,10 +235,20 @@ mod tests {
 
     #[tokio::test]
     async fn team_edit_uses_team_item_route_and_team_patch_path() {
-        let server = SequenceServer::spawn([
-            (200, r#"{"id":"note-id","title":"Title","content":"old"}"#),
-            (202, ""),
-            (200, r#"{"id":"note-id","title":"Title","content":"new"}"#),
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/teams/core/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Title","content":"old"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/teams/core/notes/note-id", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/teams/core/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Title","content":"new"}"#,
+            ),
         ]);
         let patch = "*** Begin Patch\n*** Update File: teams/core/notes/note-id.md\n@@\n-old\n+new\n*** End Patch";
         let output = edit_note(
@@ -241,9 +266,6 @@ mod tests {
         .expect("team edit should succeed")
         .expect("reference should resolve");
         assert_eq!(output.patch_path, "teams/core/notes/note-id.md");
-        let requests = server.finish();
-        assert!(requests[0].starts_with("GET /v1/teams/core/notes/note-id HTTP/1.1\r\n"));
-        assert!(requests[1].starts_with("PATCH /v1/teams/core/notes/note-id HTTP/1.1\r\n"));
-        assert!(requests[2].starts_with("GET /v1/teams/core/notes/note-id HTTP/1.1\r\n"));
+        server.finish();
     }
 }

@@ -364,7 +364,13 @@ mod tests {
         SetFolderOrderInput, UpdateFolderInput, create_folder, delete_folder, list_folders,
         set_folder_order, update_folder,
     };
-    use crate::{client::HackmdClient, config::Config, dto::PatchField, models::Workspace};
+    use crate::{
+        client::HackmdClient,
+        config::Config,
+        dto::PatchField,
+        fixture::{Scenario, SequenceServer},
+        models::Workspace,
+    };
 
     #[test]
     fn update_fields_distinguish_absent_null_and_value() {
@@ -387,8 +393,15 @@ mod tests {
 
     #[tokio::test]
     async fn root_create_omits_parent_and_team_create_is_preflighted() {
-        let personal =
-            crate::fixture::SequenceServer::spawn([(201, r#"{"id":"root/id","name":"Root"}"#)]);
+        let personal = SequenceServer::spawn_scenarios([Scenario::new(
+            "POST",
+            "/v1/folders",
+            201,
+            r#"{"id":"root/id","name":"Root"}"#,
+        )
+        .expect_body("a root folder without parentFolderId", |body| {
+            body == r#"{"name":"Root"}"#
+        })]);
         let output = create_folder(
             &personal.client(),
             CreateFolderInput {
@@ -403,14 +416,24 @@ mod tests {
         .await
         .expect("root folder should create");
         assert_eq!(output.folder.id, "root/id");
-        let requests = personal.finish();
-        assert!(requests[0].starts_with("POST /v1/folders HTTP/1.1\r\n"));
-        assert!(requests[0].ends_with(r#"{"name":"Root"}"#));
-        assert!(!requests[0].contains("parentFolderId"));
+        personal.finish();
 
-        let team = crate::fixture::SequenceServer::spawn([
-            (200, r#"[{"id":"t","name":"Team","path":"team/path"}]"#),
-            (201, r#"{"id":"nested","name":"Nested"}"#),
+        let team = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Team","path":"team/path"}]"#,
+            ),
+            Scenario::new(
+                "POST",
+                "/v1/teams/team%2Fpath/folders",
+                201,
+                r#"{"id":"nested","name":"Nested"}"#,
+            )
+            .expect_body("the nested folder and encoded parent", |body| {
+                body == r#"{"name":"Nested","parentFolderId":"parent/id"}"#
+            }),
         ]);
         create_folder(
             &team.client(),
@@ -427,17 +450,27 @@ mod tests {
         )
         .await
         .expect("known team folder should create");
-        let requests = team.finish();
-        assert!(requests[0].starts_with("GET /v1/teams HTTP/1.1\r\n"));
-        assert!(requests[1].starts_with("POST /v1/teams/team%2Fpath/folders HTTP/1.1\r\n"));
-        assert!(requests[1].ends_with(r#"{"name":"Nested","parentFolderId":"parent/id"}"#));
+        team.finish();
     }
 
     #[tokio::test]
     async fn update_clears_nullable_metadata_then_reads_encoded_folder_back() {
-        let fixture = crate::fixture::SequenceServer::spawn([
-            (202, ""),
-            (200, r#"{"id":"folder/id","name":"Moved"}"#),
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "PATCH",
+                "/v1/teams/team%2Fpath/folders/folder%2Fid",
+                202,
+                "",
+            )
+            .expect_body("the cleared description", |body| {
+                body == r#"{"description":null}"#
+            }),
+            Scenario::new(
+                "GET",
+                "/v1/teams/team%2Fpath/folders/folder%2Fid",
+                200,
+                r#"{"id":"folder/id","name":"Moved"}"#,
+            ),
         ]);
         let input = serde_json::from_value(json!({
             "workspace": {"kind": "team", "team_path": "team/path"},
@@ -448,22 +481,25 @@ mod tests {
         update_folder(&fixture.client(), input)
             .await
             .expect("folder update should read back");
-        let requests = fixture.finish();
-        assert!(
-            requests[0].starts_with("PATCH /v1/teams/team%2Fpath/folders/folder%2Fid HTTP/1.1\r\n")
-        );
-        assert!(requests[0].ends_with(r#"{"description":null}"#));
-        assert!(
-            requests[1].starts_with("GET /v1/teams/team%2Fpath/folders/folder%2Fid HTTP/1.1\r\n")
-        );
+        fixture.finish();
     }
 
     #[tokio::test]
     async fn update_polls_until_async_change_is_visible() {
-        let fixture = crate::fixture::SequenceServer::spawn([
-            (202, ""),
-            (200, r#"{"id":"folder","name":"Old"}"#),
-            (200, r#"{"id":"folder","name":"New"}"#),
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new("PATCH", "/v1/teams/team/folders/folder", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/teams/team/folders/folder",
+                200,
+                r#"{"id":"folder","name":"Old"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams/team/folders/folder",
+                200,
+                r#"{"id":"folder","name":"New"}"#,
+            ),
         ]);
         let input = serde_json::from_value(json!({
             "workspace": {"kind": "team", "team_path": "team"},
@@ -475,7 +511,7 @@ mod tests {
             .await
             .expect("eventual folder update should succeed");
         assert_eq!(output.folder.name, "New");
-        assert_eq!(fixture.finish().len(), 3);
+        fixture.finish();
     }
 
     #[tokio::test]
@@ -509,7 +545,9 @@ mod tests {
 
     #[tokio::test]
     async fn nonempty_delete_requires_confirmation_without_mutation() {
-        let fixture = crate::fixture::SequenceServer::spawn([(
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/folders",
             200,
             r#"[{"id":"parent","name":"Parent"},{"id":"child","name":"Child","parentFolderId":"parent"}]"#,
         )]);
@@ -526,14 +564,22 @@ mod tests {
         assert!(!output.deleted);
         assert_eq!(output.child_count, 1);
         assert!(output.confirmation_required);
-        assert_eq!(fixture.finish().len(), 1);
+        fixture.finish();
     }
 
     #[tokio::test]
     async fn folder_order_merge_preserves_unrelated_entries() {
-        let fixture = crate::fixture::SequenceServer::spawn([
-            (200, r#"{"root":["old"],"other":["keep"]}"#),
-            (204, ""),
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/folders/folder-order",
+                200,
+                r#"{"root":["old"],"other":["keep"]}"#,
+            ),
+            Scenario::new("PUT", "/v1/folders/folder-order", 204, "")
+                .expect_body("the merged folder order", |body| {
+                    body == r#"{"order":{"other":["keep"],"root":["b","a"]}}"#
+                }),
         ]);
         let output = set_folder_order(
             &fixture.client(),
@@ -546,15 +592,14 @@ mod tests {
         .await
         .expect("order should update");
         assert_eq!(output.parent, "root");
-        let requests = fixture.finish();
-        assert!(requests[0].starts_with("GET /v1/folders/folder-order HTTP/1.1\r\n"));
-        assert!(requests[1].starts_with("PUT /v1/folders/folder-order HTTP/1.1\r\n"));
-        assert!(requests[1].ends_with(r#"{"order":{"other":["keep"],"root":["b","a"]}}"#));
+        fixture.finish();
     }
 
     #[tokio::test]
     async fn folder_list_is_slim_and_explicitly_paginated() {
-        let fixture = crate::fixture::SequenceServer::spawn([(
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/folders",
             200,
             r#"[
                 {"id":"a","name":"A","createdAt":1,"updatedAt":2},

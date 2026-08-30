@@ -287,7 +287,12 @@ mod tests {
     use serde_json::json;
 
     use super::{CreateNoteInput, CrudError, UpdateNoteInput, create_note, update_note};
-    use crate::{client::HackmdClient, config::Config, dto::PatchField, fixture::SequenceServer};
+    use crate::{
+        client::HackmdClient,
+        config::Config,
+        dto::PatchField,
+        fixture::{Scenario, SequenceServer},
+    };
 
     #[test]
     fn update_distinguishes_missing_folder_from_explicit_root() {
@@ -326,8 +331,15 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_update_is_read_back() {
-        let server =
-            SequenceServer::spawn([(202, ""), (200, r#"{"id":"note/id","title":"Updated"}"#)]);
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("PATCH", "/v1/notes/note%2Fid", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note%2Fid",
+                200,
+                r#"{"id":"note/id","title":"Updated"}"#,
+            ),
+        ]);
         let client = server.client();
         let input = serde_json::from_value(json!({
             "note_ref": "note/id",
@@ -342,9 +354,7 @@ mod tests {
             output.response.expect("readback should exist").title,
             "Updated"
         );
-        let requests = server.finish();
-        assert!(requests[0].starts_with("PATCH /v1/notes/note%2Fid HTTP/1.1\r\n"));
-        assert!(requests[1].starts_with("GET /v1/notes/note%2Fid HTTP/1.1\r\n"));
+        server.finish();
     }
 
     #[tokio::test]
@@ -401,11 +411,24 @@ mod tests {
 
     #[tokio::test]
     async fn create_folder_placement_falls_back_when_post_drops_it() {
-        let server = SequenceServer::spawn([
-            (201, r#"{"id":"new-id","title":"New"}"#),
-            (200, r#"{"id":"new-id","title":"New"}"#),
-            (202, ""),
-            (
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("POST", "/v1/notes", 201, r#"{"id":"new-id","title":"New"}"#)
+                .expect_body("the note and requested folder", |body| {
+                    body == r#"{"title":"New","parentFolderId":"folder-id"}"#
+                }),
+            Scenario::new(
+                "GET",
+                "/v1/notes/new-id",
+                200,
+                r#"{"id":"new-id","title":"New"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/new-id", 202, "")
+                .expect_body("the compatibility folder placement", |body| {
+                    body == r#"{"parentFolderId":"folder-id"}"#
+                }),
+            Scenario::new(
+                "GET",
+                "/v1/notes/new-id",
                 200,
                 r#"{"id":"new-id","title":"New","folderPaths":[{"id":"folder-id","name":"Folder"}]}"#,
             ),
@@ -424,21 +447,17 @@ mod tests {
         assert!(output.folder_placement_requested);
         assert!(output.folder_placement_confirmed);
         assert!(output.compatibility_patch_applied);
-        let requests = server.finish();
-        assert!(requests[0].starts_with("POST /v1/notes HTTP/1.1\r\n"));
-        assert!(requests[0].ends_with(r#"{"title":"New","parentFolderId":"folder-id"}"#));
-        assert!(requests[1].starts_with("GET /v1/notes/new-id HTTP/1.1\r\n"));
-        assert!(requests[2].starts_with("PATCH /v1/notes/new-id HTTP/1.1\r\n"));
-        assert!(requests[2].ends_with(r#"{"parentFolderId":"folder-id"}"#));
-        assert!(requests[3].starts_with("GET /v1/notes/new-id HTTP/1.1\r\n"));
+        server.finish();
         assert_eq!(output.note.folder_paths[0].id, "folder-id");
     }
 
     #[tokio::test]
     async fn create_skips_compatibility_patch_when_post_assigns_folder() {
-        let server = SequenceServer::spawn([
-            (201, r#"{"id":"new-id","title":"New"}"#),
-            (
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("POST", "/v1/notes", 201, r#"{"id":"new-id","title":"New"}"#),
+            Scenario::new(
+                "GET",
+                "/v1/notes/new-id",
                 200,
                 r#"{"id":"new-id","title":"New","folderPaths":[{"id":"folder-id","name":"Folder"}]}"#,
             ),
@@ -453,15 +472,30 @@ mod tests {
             .await
             .expect("POST-assigned folder should succeed");
         assert!(!output.compatibility_patch_applied);
-        assert_eq!(server.finish().len(), 2);
+        server.finish();
     }
 
     #[tokio::test]
     async fn folder_placement_failure_reports_already_created_note_id() {
-        let server = SequenceServer::spawn([
-            (201, r#"{"id":"recoverable-id","title":"New"}"#),
-            (200, r#"{"id":"recoverable-id","title":"New"}"#),
-            (500, r#"{"error":"fixture"}"#),
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "POST",
+                "/v1/notes",
+                201,
+                r#"{"id":"recoverable-id","title":"New"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/recoverable-id",
+                200,
+                r#"{"id":"recoverable-id","title":"New"}"#,
+            ),
+            Scenario::new(
+                "PATCH",
+                "/v1/notes/recoverable-id",
+                500,
+                r#"{"error":"fixture"}"#,
+            ),
         ]);
         let client = HackmdClient::new(Config::for_loopback_test_no_retry(
             &server.api_url,
@@ -476,7 +510,7 @@ mod tests {
             .await
             .expect_err("placement failure should be reported")
             .to_string();
-        let _captured = server.finish();
+        server.finish();
         assert!(
             message.starts_with("note recoverable-id was created, but folder placement failed:")
         );

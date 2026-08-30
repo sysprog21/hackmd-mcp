@@ -45,11 +45,17 @@ pub(crate) async fn get_history(
 mod tests {
     use super::{HistoryInput, get_history};
     use crate::note::list::ListNotesError;
-    use crate::{client::HackmdClient, config::Config, fixture::SequenceServer};
+    use crate::{
+        client::HackmdClient,
+        config::Config,
+        fixture::{Scenario, SequenceServer},
+    };
 
     #[tokio::test]
     async fn accepts_bare_history_and_preserves_api_order_and_last_visit() {
-        let fixture = SequenceServer::spawn([(
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/history",
             200,
             r#"[
                 {"id":"newest","title":"Newest","lastVisit":30},
@@ -73,12 +79,14 @@ mod tests {
             output.notes[0].workspace,
             crate::models::Workspace::Team { ref team_path } if team_path == "core"
         ));
-        assert!(fixture.finish()[0].starts_with("GET /v1/history HTTP/1.1\r\n"));
+        fixture.finish();
     }
 
     #[tokio::test]
     async fn accepts_wrapped_history_and_validates_limit_before_network() {
-        let fixture = SequenceServer::spawn([(
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/history",
             200,
             r#"{"history":[{"id":"one","title":"One","lastVisit":1}]}"#,
         )]);

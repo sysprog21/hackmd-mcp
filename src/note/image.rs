@@ -164,16 +164,26 @@ mod tests {
 
     /// A PNG signature followed by a marker the multipart assertions can find.
     const PNG_FIXTURE: &[u8] = b"\x89PNG\r\n\x1a\nfixture-image";
-    use crate::{client::HackmdClient, config::Config, models::Workspace};
+    use crate::{
+        client::HackmdClient,
+        config::Config,
+        fixture::{Scenario, SequenceServer},
+        models::Workspace,
+    };
 
     #[tokio::test]
     async fn uploads_streaming_multipart_and_returns_only_link() {
         let mut image = tempfile::NamedTempFile::new().expect("temp image should create");
         image.write_all(PNG_FIXTURE).expect("image should write");
-        let fixture = crate::fixture::SequenceServer::spawn([(
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "POST",
+            "/v1/notes/note%2Fid/images",
             201,
             r#"{"data":{"link":"https://hackmd.io/_uploads/image.png"}}"#,
-        )]);
+        )
+        .expect_body("multipart image bytes and field", |body| {
+            body.contains("name=\"image\"") && body.contains("fixture-image")
+        })]);
         let client = fixture.client();
         let output = upload_note_image(
             &client,
@@ -190,11 +200,7 @@ mod tests {
         .expect("upload should succeed")
         .expect("direct note should resolve");
         assert_eq!(output.link, "https://hackmd.io/_uploads/image.png");
-        let requests = fixture.finish();
-        assert!(requests[0].starts_with("POST /v1/notes/note%2Fid/images HTTP/1.1\r\n"));
-        assert!(requests[0].contains("multipart/form-data; boundary="));
-        assert!(requests[0].contains("name=\"image\""));
-        assert!(requests[0].contains("fixture-image"));
+        fixture.finish();
     }
 
     #[tokio::test]
@@ -290,7 +296,12 @@ mod tests {
     async fn payload_too_large_has_a_resize_hint() {
         let mut image = tempfile::NamedTempFile::new().expect("temp image should create");
         image.write_all(PNG_FIXTURE).expect("image should write");
-        let fixture = crate::fixture::SequenceServer::spawn([(413, r#"{"error":"too large"}"#)]);
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "POST",
+            "/v1/notes/id/images",
+            413,
+            r#"{"error":"too large"}"#,
+        )]);
         let client = fixture.client();
         let error = upload_note_image(
             &client,

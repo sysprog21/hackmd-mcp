@@ -78,16 +78,22 @@ pub(crate) async fn restore_note(
 #[cfg(test)]
 mod tests {
     use super::{ListTrashInput, RestoreNoteInput, TrashError, list_trash, restore_note};
-    use crate::{client::HackmdClient, config::Config, fixture::SequenceServer};
+    use crate::{
+        client::HackmdClient,
+        config::Config,
+        fixture::{Scenario, SequenceServer},
+    };
 
     #[tokio::test]
     async fn list_trash_is_slim_paginated_and_accepts_empty_lists() {
-        let fixture = SequenceServer::spawn([
-            (
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/trash",
                 200,
                 r#"[{"id":"a","title":"A","content":"secret","lastChangedAt":2},{"id":"b","title":"B","lastChangedAt":1}]"#,
             ),
-            (200, "[]"),
+            Scenario::new("GET", "/v1/trash", 200, "[]"),
         ]);
         let client = fixture.client();
         let page = list_trash(
@@ -117,17 +123,20 @@ mod tests {
         .expect("empty trash should succeed");
         assert_eq!(empty.meta.total, 0);
         assert_eq!(empty.meta.next_offset, None);
-        assert!(
-            fixture
-                .finish()
-                .iter()
-                .all(|request| request.starts_with("GET /v1/trash HTTP/1.1\r\n"))
-        );
+        fixture.finish();
     }
 
     #[tokio::test]
     async fn restore_encodes_id_and_accepts_empty_or_json_responses() {
-        let fixture = SequenceServer::spawn([(202, ""), (200, r#"{"restored":true}"#)]);
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new("PUT", "/v1/trash/folder%2Fid/restore", 202, ""),
+            Scenario::new(
+                "PUT",
+                "/v1/trash/other/restore",
+                200,
+                r#"{"restored":true}"#,
+            ),
+        ]);
         let client = fixture.client();
         let accepted = restore_note(
             &client,
@@ -148,9 +157,7 @@ mod tests {
         .await
         .expect("JSON restore should succeed");
         assert_eq!(json.response.expect("response")["restored"], true);
-        let requests = fixture.finish();
-        assert!(requests[0].starts_with("PUT /v1/trash/folder%2Fid/restore HTTP/1.1\r\n"));
-        assert!(requests[1].starts_with("PUT /v1/trash/other/restore HTTP/1.1\r\n"));
+        fixture.finish();
     }
 
     #[tokio::test]
