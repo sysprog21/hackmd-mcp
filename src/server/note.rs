@@ -1,5 +1,5 @@
-//! Tools that act on notes: the list, one note, its history, its trash, and
-//! images attached to it.
+//! Tools that act on notes: the note lists, one note, its trash, and images
+//! attached to it.
 
 use rmcp::{handler::server::wrapper::Parameters, tool, tool_router};
 
@@ -9,10 +9,9 @@ use crate::{
         crud::{CreateNoteInput, DeleteNoteInput, UpdateNoteInput},
         edit::EditNoteInput,
         get::GetNoteInput,
-        history::HistoryInput,
         image::UploadNoteImageInput,
         list::ListNotesInput,
-        trash::{ListTrashInput, RestoreNoteInput},
+        trash::RestoreNoteInput,
     },
     reply,
 };
@@ -21,7 +20,7 @@ use crate::{
 impl HackmdServer {
     #[tool(
         name = "hackmd_list_notes",
-        description = "List personal or team HackMD notes with local metadata filtering, deterministic sorting, and pagination. This does not search note content; refresh=true bypasses the 60-second list cache and costs one API request.",
+        description = "List HackMD notes with metadata filtering, sorting, and pagination. source picks the list: workspace (default; a personal or team workspace's notes), history (recently viewed, account-wide), or trash (trashed personal notes). This never searches note bodies. refresh=true bypasses the 60-second workspace cache.",
         annotations(
             title = "List HackMD Notes",
             read_only_hint = true,
@@ -48,7 +47,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_get_note",
-        description = "Get one HackMD note with full content, normalized metadata, folder_ids, and the exact patch_path for safe edits. For @owner/slug references, refresh=true bypasses the 60-second list cache.",
+        description = "Get one HackMD note with full content, normalized metadata, folder_ids, and the exact patch_path hackmd_edit_note needs. For @owner/slug references, refresh=true bypasses the 60-second caches.",
         annotations(
             title = "Get HackMD Note",
             read_only_hint = true,
@@ -62,10 +61,7 @@ impl HackmdServer {
         Parameters(input): Parameters<GetNoteInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::note::get::get_note(&self.client, input).await {
-            Ok(Ok(note)) => reply::success(
-                format!("Fetched HackMD note {}", note.id),
-                serde_json::json!({"note": note}),
-            ),
+            Ok(Ok(note)) => reply::structured(format!("Fetched HackMD note {}", note.id), &note),
             Ok(Err(resolution)) => reply::unresolved(&resolution),
             Err(error) => reply::error(error.to_string()),
         }
@@ -73,7 +69,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_create_note",
-        description = "Create a HackMD note in a personal or team workspace. Folder placement is read back after POST; a compatibility PATCH runs only if the API dropped parentFolderId.",
+        description = "Create a HackMD note in a personal or team workspace and return its metadata and patch_path (not the body). Folder placement is read back after POST; a compatibility PATCH runs only if the API dropped parentFolderId.",
         annotations(
             title = "Create HackMD Note",
             read_only_hint = false,
@@ -87,17 +83,16 @@ impl HackmdServer {
         Parameters(input): Parameters<CreateNoteInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::note::crud::create_note(&self.client, input).await {
-            Ok(output) => reply::success(
-                format!("Created HackMD note {}", output.note.id),
-                serde_json::json!({"result": output}),
-            ),
+            Ok(output) => {
+                reply::structured(format!("Created HackMD note {}", output.note.id), &output)
+            }
             Err(error) => reply::error(error.to_string()),
         }
     }
 
     #[tool(
         name = "hackmd_update_note",
-        description = "Fallback note update for metadata or an explicit full content replacement. Prefer hackmd_edit_note for normal body edits because content here overwrites the complete unversioned body. For @owner/slug references, refresh=true bypasses the list cache.",
+        description = "Update note metadata, or replace the whole body with content. Prefer hackmd_edit_note for body edits: content here overwrites the complete unversioned body. For @owner/slug references, refresh=true bypasses the 60-second caches.",
         annotations(
             title = "Update HackMD Note",
             read_only_hint = false,
@@ -111,10 +106,9 @@ impl HackmdServer {
         Parameters(input): Parameters<UpdateNoteInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::note::crud::update_note(&self.client, input).await {
-            Ok(Ok(output)) => reply::success(
-                format!("HackMD accepted the update for note {}", output.note_id),
-                serde_json::json!({"result": output}),
-            ),
+            Ok(Ok(output)) => {
+                reply::structured(format!("Updated HackMD note {}", output.note.id), &output)
+            }
             Ok(Err(resolution)) => reply::unresolved(&resolution),
             Err(error) => reply::error(error.to_string()),
         }
@@ -122,7 +116,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_delete_note",
-        description = "Delete a HackMD note. Personal deletion moves it to recoverable trash; team restore is not exposed. This remains destructive. For @owner/slug references, refresh=true bypasses the list cache.",
+        description = "Delete a HackMD note. A personal note moves to trash, where hackmd_restore_note can bring it back; team deletion has no restore. For @owner/slug references, refresh=true bypasses the 60-second caches.",
         annotations(
             title = "Delete HackMD Note",
             read_only_hint = false,
@@ -136,45 +130,17 @@ impl HackmdServer {
         Parameters(input): Parameters<DeleteNoteInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::note::crud::delete_note(&self.client, input).await {
-            Ok(Ok(output)) => reply::success(
-                format!("Deleted HackMD note {}", output.note_id),
-                serde_json::json!({"result": output}),
-            ),
+            Ok(Ok(output)) => {
+                reply::structured(format!("Deleted HackMD note {}", output.note_id), &output)
+            }
             Ok(Err(resolution)) => reply::unresolved(&resolution),
             Err(error) => reply::error(error.to_string()),
         }
     }
 
     #[tool(
-        name = "hackmd_list_trash",
-        description = "List trashed personal HackMD notes with slim metadata and client-side pagination.",
-        annotations(
-            title = "List Trashed HackMD Notes",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    pub(crate) async fn list_trash(
-        &self,
-        Parameters(input): Parameters<ListTrashInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::note::trash::list_trash(&self.client, input).await {
-            Ok(output) => reply::structured(
-                format!(
-                    "Found {} trashed HackMD note(s); returned {}",
-                    output.meta.total, output.meta.count
-                ),
-                &output,
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
         name = "hackmd_restore_note",
-        description = "Restore a personal HackMD note from trash by internal note ID.",
+        description = "Restore a personal HackMD note from trash by internal note ID, as listed by hackmd_list_notes with source: trash.",
         annotations(
             title = "Restore Trashed HackMD Note",
             read_only_hint = false,
@@ -188,17 +154,16 @@ impl HackmdServer {
         Parameters(input): Parameters<RestoreNoteInput>,
     ) -> rmcp::model::CallToolResult {
         match crate::note::trash::restore_note(&self.client, input).await {
-            Ok(output) => reply::success(
-                format!("Restored HackMD note {}", output.note_id),
-                serde_json::json!({"result": output}),
-            ),
+            Ok(output) => {
+                reply::structured(format!("Restored HackMD note {}", output.note_id), &output)
+            }
             Err(error) => reply::error(error.to_string()),
         }
     }
 
     #[tool(
         name = "hackmd_edit_note",
-        description = "Default tool for normal HackMD body edits. Applies one strict Codex patch to the current content only when every hunk context is unique; prefer this over hackmd_update_note for body changes. For @owner/slug references, refresh=true bypasses the list cache.",
+        description = "Default tool for HackMD body edits. Applies one patch to the current body only when every hunk's context matches exactly once, then confirms the write by reading it back. Format:\n*** Begin Patch\n*** Update File: <patch_path from hackmd_get_note>\n@@ optional anchor line\n context line\n-removed line\n+added line\n*** End Patch\nText after @@ is an anchor that must equal exactly one line, ignoring leading and trailing whitespace; the hunk then applies after it, and an addition-only hunk is inserted directly below it. A line range such as @@ -3,4 +3,5 @@ is not an anchor.\nFor @owner/slug references, refresh=true bypasses the 60-second caches.",
         annotations(
             title = "Edit HackMD Note Safely",
             read_only_hint = false,
@@ -218,7 +183,7 @@ impl HackmdServer {
                 } else {
                     format!("HackMD note {} is unchanged", output.note_id)
                 };
-                reply::success(summary, serde_json::json!({"result": output}))
+                reply::structured(summary, &output)
             }
             Ok(Err(resolution)) => reply::unresolved(&resolution),
             Err(error) => reply::error(error.to_string()),
@@ -226,35 +191,8 @@ impl HackmdServer {
     }
 
     #[tool(
-        name = "hackmd_get_history",
-        description = "Get recently viewed HackMD notes in API history order with slim metadata and client-side pagination.",
-        annotations(
-            title = "Get HackMD Browse History",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    pub(crate) async fn get_history(
-        &self,
-        Parameters(input): Parameters<HistoryInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::note::history::get_history(&self.client, input).await {
-            Ok(output) => reply::structured(
-                format!(
-                    "Found {} HackMD history item(s); returned {}",
-                    output.meta.total, output.meta.count
-                ),
-                &output,
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
         name = "hackmd_upload_note_image",
-        description = "Upload a local image to a personal-workspace note and return only its HackMD CDN link. Files above 5 MiB require confirmation; files above 10 MiB are refused. For @owner/slug references, refresh=true bypasses the list cache.",
+        description = "Upload a local image to a personal-workspace note and return only its HackMD CDN link. Files above 5 MiB require confirmation; files above 10 MiB are refused. For @owner/slug references, refresh=true bypasses the 60-second caches.",
         annotations(
             title = "Upload HackMD Note Image",
             read_only_hint = false,

@@ -20,10 +20,17 @@ const IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UploadNoteImageInput {
-    #[serde(default)]
+    /// Accepted, as on every other tool, so older callers are not rejected
+    /// outright; a team here is refused like any team note. Not advertised.
+    #[serde(default, rename = "team_path", alias = "workspace")]
+    #[schemars(skip)]
     pub(crate) workspace: Workspace,
+    /// Internal ID of a personal note, `hackmd.io/<id>`, or a
+    /// `hackmd.io/@owner/slug` URL. Only personal notes accept uploads, so a
+    /// URL that names a team note is refused.
     pub(crate) note_ref: String,
-    /// Bypass cached note lists when resolving an `@owner/slug` URL.
+    /// Bypass the 60-second account and note-list caches when resolving an
+    /// `@owner/slug` URL.
     #[serde(default)]
     pub(crate) refresh: bool,
     /// Absolute path to a local image file.
@@ -168,7 +175,6 @@ mod tests {
         client::HackmdClient,
         config::Config,
         fixture::{Scenario, SequenceServer},
-        models::Workspace,
     };
 
     #[tokio::test]
@@ -189,7 +195,7 @@ mod tests {
             &client,
             &files(),
             UploadNoteImageInput {
-                workspace: Workspace::Personal,
+                workspace: crate::models::Workspace::Personal,
                 note_ref: "note/id".to_owned(),
                 refresh: false,
                 image_path: image.path().to_path_buf(),
@@ -211,7 +217,7 @@ mod tests {
             .expect("file should write");
         let client = HackmdClient::new(Config::for_tests()).expect("client should build");
         let input = UploadNoteImageInput {
-            workspace: Workspace::Personal,
+            workspace: crate::models::Workspace::Personal,
             note_ref: "note-id".to_owned(),
             refresh: false,
             image_path: secret.path().to_path_buf(),
@@ -245,7 +251,7 @@ mod tests {
             .set_len(IMAGE_MAX_BYTES + 1)
             .expect("sparse image should resize");
         let input = UploadNoteImageInput {
-            workspace: Workspace::Personal,
+            workspace: crate::models::Workspace::Personal,
             note_ref: "id".to_owned(),
             refresh: false,
             image_path: oversized.path().to_path_buf(),
@@ -262,7 +268,7 @@ mod tests {
             .set_len(IMAGE_WARNING_BYTES + 1)
             .expect("sparse image should resize");
         let warning_input = UploadNoteImageInput {
-            workspace: Workspace::Personal,
+            workspace: crate::models::Workspace::Personal,
             note_ref: "id".to_owned(),
             refresh: false,
             image_path: warning.path().to_path_buf(),
@@ -272,24 +278,61 @@ mod tests {
             upload_note_image(&client, &files(), warning_input).await,
             Err(UploadNoteImageError::ConfirmationRequired { .. })
         ));
+    }
 
-        let mut team_image = tempfile::NamedTempFile::new().expect("temp image should create");
-        team_image
-            .write_all(PNG_FIXTURE)
-            .expect("image should write");
-        let team_input = UploadNoteImageInput {
-            workspace: Workspace::Team {
-                team_path: "core".to_owned(),
-            },
-            note_ref: "id".to_owned(),
+    #[tokio::test]
+    async fn an_older_team_workspace_argument_is_accepted_then_refused() {
+        let mut image = tempfile::NamedTempFile::new().expect("temp image should create");
+        image.write_all(PNG_FIXTURE).expect("image should write");
+        let input: UploadNoteImageInput = serde_json::from_value(serde_json::json!({
+            "workspace": {"kind": "team", "team_path": "core"},
+            "note_ref": "id",
+            "image_path": image.path()
+        }))
+        .expect("the older workspace argument should still parse");
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        assert!(matches!(
+            upload_note_image(&client, &files(), input).await,
+            Err(UploadNoteImageError::TeamUnsupported)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_url_naming_a_team_note_is_refused_before_upload() {
+        let mut image = tempfile::NamedTempFile::new().expect("temp image should create");
+        image.write_all(PNG_FIXTURE).expect("image should write");
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/me",
+                200,
+                r#"{"id":"u","name":"User","userPath":"alice"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Core","path":"core"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams/core/notes",
+                200,
+                r#"[{"id":"team-id","title":"Team","shortId":"slug"}]"#,
+            ),
+        ]);
+        let input = UploadNoteImageInput {
+            workspace: crate::models::Workspace::Personal,
+            note_ref: "https://hackmd.io/@core/slug".to_owned(),
             refresh: false,
-            image_path: team_image.path().to_path_buf(),
+            image_path: image.path().to_path_buf(),
             confirm_large_file: false,
         };
         assert!(matches!(
-            upload_note_image(&client, &files(), team_input).await,
+            upload_note_image(&fixture.client(), &files(), input).await,
             Err(UploadNoteImageError::TeamUnsupported)
         ));
+        fixture.finish();
     }
 
     #[tokio::test]
@@ -307,7 +350,7 @@ mod tests {
             &client,
             &files(),
             UploadNoteImageInput {
-                workspace: Workspace::Personal,
+                workspace: crate::models::Workspace::Personal,
                 note_ref: "id".to_owned(),
                 refresh: false,
                 image_path: image.path().to_path_buf(),

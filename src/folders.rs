@@ -17,8 +17,9 @@ use crate::{
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FolderWorkspaceInput {
-    /// Personal account or team workspace.
-    #[serde(default)]
+    /// Team path (from `hackmd_get_me`) of a team workspace; omit for the
+    /// personal workspace.
+    #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
     /// Maximum folders returned (default 20, maximum 100).
     #[serde(default = "default_limit")]
@@ -31,19 +32,10 @@ pub(crate) struct FolderWorkspaceInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct FolderRefInput {
-    /// Personal account or team workspace.
-    #[serde(default)]
-    pub(crate) workspace: Workspace,
-    /// Internal folder ID.
-    pub(crate) folder_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct CreateFolderInput {
-    /// Personal account or team workspace.
-    #[serde(default)]
+    /// Team path (from `hackmd_get_me`) of a team workspace; omit for the
+    /// personal workspace.
+    #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
     /// Non-empty display name.
     #[schemars(length(min = 1))]
@@ -58,9 +50,11 @@ pub(crate) struct CreateFolderInput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpdateFolderInput {
-    /// Personal account or team workspace.
-    #[serde(default)]
+    /// Team path (from `hackmd_get_me`) of a team workspace; omit for the
+    /// personal workspace.
+    #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
+    /// Internal folder ID from `hackmd_list_folders`.
     pub(crate) folder_id: String,
     /// New non-empty name; unlike other fields, name cannot be null.
     pub(crate) name: Option<String>,
@@ -76,8 +70,8 @@ pub(crate) struct UpdateFolderInput {
     #[serde(default, deserialize_with = "deserialize_patch_field")]
     #[schemars(with = "Option<String>")]
     color: PatchField,
-    /// Reserved for API compatibility; omit because `HackMD` ignores folder
-    /// moves.
+    /// Not supported: `HackMD` reports folder moves as successful while
+    /// leaving the parent unchanged, so any value here is refused.
     #[serde(default, deserialize_with = "deserialize_patch_field")]
     #[schemars(with = "Option<String>")]
     parent_folder_id: PatchField,
@@ -86,9 +80,11 @@ pub(crate) struct UpdateFolderInput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DeleteFolderInput {
-    /// Personal account or team workspace.
-    #[serde(default)]
+    /// Team path (from `hackmd_get_me`) of a team workspace; omit for the
+    /// personal workspace.
+    #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
+    /// Internal folder ID from `hackmd_list_folders`.
     pub(crate) folder_id: String,
     /// Required only when the folder has child folders.
     #[serde(default)]
@@ -98,8 +94,9 @@ pub(crate) struct DeleteFolderInput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SetFolderOrderInput {
-    /// Personal account or team workspace.
-    #[serde(default)]
+    /// Team path (from `hackmd_get_me`) of a team workspace; omit for the
+    /// personal workspace.
+    #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
     /// Parent folder ID. Omit or use null to order top-level folders.
     pub(crate) parent_folder_id: Option<String>,
@@ -109,6 +106,7 @@ pub(crate) struct SetFolderOrderInput {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct FolderListOutput {
+    #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
     #[serde(flatten)]
     pub(crate) meta: PageMeta,
@@ -127,12 +125,14 @@ pub(crate) struct FolderSummary {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct FolderOutput {
+    #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
     pub(crate) folder: FolderResponse,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DeleteFolderOutput {
+    #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
     pub(crate) folder_id: String,
     pub(crate) deleted: bool,
@@ -142,6 +142,7 @@ pub(crate) struct DeleteFolderOutput {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct FolderOrderOutput {
+    #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
     pub(crate) parent: String,
     pub(crate) folder_ids: Vec<String>,
@@ -219,19 +220,6 @@ pub(crate) async fn list_folders(
     })
 }
 
-pub(crate) async fn get_folder(
-    client: &HackmdClient,
-    input: FolderRefInput,
-) -> Result<FolderOutput, FolderError> {
-    let folder = client
-        .get_folder(&input.workspace, &input.folder_id)
-        .await?;
-    Ok(FolderOutput {
-        workspace: input.workspace,
-        folder,
-    })
-}
-
 pub(crate) async fn create_folder(
     client: &HackmdClient,
     input: CreateFolderInput,
@@ -280,7 +268,6 @@ pub(crate) async fn update_folder(
         description: input.description.into_request(),
         icon: input.icon.into_request(),
         color: input.color.into_request(),
-        parent_folder_id: None,
     };
     payload.validate()?;
     client
@@ -314,10 +301,6 @@ fn folder_matches_update(folder: &FolderResponse, update: &UpdateFolderRequest) 
             .color
             .as_ref()
             .is_none_or(|color| folder.color == *color)
-        && update
-            .parent_folder_id
-            .as_ref()
-            .is_none_or(|parent| folder.parent_folder_id == *parent)
 }
 
 pub(crate) async fn delete_folder(

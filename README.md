@@ -36,10 +36,12 @@ take precedence over `.env`. The server reads only these keys:
 - `HACKMD_API_TOKEN` — required when a tool contacts HackMD.
 - `HACKMD_API_URL` — optional HTTPS HackMD Enterprise endpoint; defaults to
   `https://api.hackmd.io/v1`.
-- `HACKMD_MCP_STATE_DIR` — optional private sync-state directory.
+- `HACKMD_MCP_STATE_DIR` — optional private sync-state directory. Honored only from
+  the inherited environment, never from `.env`: the directory holds full note bodies,
+  and a `.env` in someone else's repository must not be able to redirect them.
 - `HACKMD_MCP_WORKSPACE_ROOT` — optional tree that `hackmd_pull_note`,
-  `hackmd_push_note`, `hackmd_check_note_sync`, `hackmd_save_remote_snapshot`, and
-  `hackmd_upload_note_image` are confined to. It must be absolute. Set it and a note
+  `hackmd_push_note`, `hackmd_check_note_sync`, and `hackmd_upload_note_image` are
+  confined to. It must be absolute. Set it and a note
   that tells an agent to access outside that tree is rejected; capability-relative
   operations stay confined if a symlink is swapped concurrently. Unset, any absolute
   path is accepted.

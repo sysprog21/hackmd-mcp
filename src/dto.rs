@@ -198,7 +198,9 @@ pub(crate) enum PayloadError {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+/// Read in `HackMD`'s camel case, written out in snake case like every other
+/// tool field.
+#[serde(rename_all(deserialize = "camelCase", serialize = "snake_case"))]
 pub(crate) struct ProfileResponse {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -211,8 +213,10 @@ pub(crate) struct ProfileResponse {
     pub(crate) upgraded: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+/// Read in `HackMD`'s camel case, written out in snake case like every other
+/// tool field.
+#[serde(rename_all(deserialize = "camelCase", serialize = "snake_case"))]
 pub(crate) struct TeamResponse {
     pub(crate) id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -236,7 +240,9 @@ pub(crate) struct TeamResponse {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+/// Read in `HackMD`'s camel case, written out in snake case like every other
+/// tool field.
+#[serde(rename_all(deserialize = "camelCase", serialize = "snake_case"))]
 pub(crate) struct SimpleUserProfileResponse {
     pub(crate) name: String,
     pub(crate) user_path: String,
@@ -245,7 +251,9 @@ pub(crate) struct SimpleUserProfileResponse {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+/// Read in `HackMD`'s camel case, written out in snake case like every other
+/// tool field.
+#[serde(rename_all(deserialize = "camelCase", serialize = "snake_case"))]
 pub(crate) struct NoteResponse {
     pub(crate) id: String,
     pub(crate) title: String,
@@ -333,7 +341,9 @@ impl HistoryResponse {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+/// Read in `HackMD`'s camel case, written out in snake case like every other
+/// tool field.
+#[serde(rename_all(deserialize = "camelCase", serialize = "snake_case"))]
 pub(crate) struct FolderPathResponse {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -346,7 +356,9 @@ pub(crate) struct FolderPathResponse {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+/// Read in `HackMD`'s camel case, written out in snake case like every other
+/// tool field.
+#[serde(rename_all(deserialize = "camelCase", serialize = "snake_case"))]
 pub(crate) struct FolderResponse {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -398,9 +410,6 @@ pub(crate) struct UpdateFolderRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[allow(clippy::option_option, reason = "outer None omits; inner None clears")]
     pub(crate) color: Option<Option<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[allow(clippy::option_option, reason = "outer None omits; inner None clears")]
-    pub(crate) parent_folder_id: Option<Option<String>>,
 }
 
 impl UpdateFolderRequest {
@@ -409,7 +418,6 @@ impl UpdateFolderRequest {
             && self.description.is_none()
             && self.icon.is_none()
             && self.color.is_none()
-            && self.parent_folder_id.is_none()
         {
             Err(PayloadError::EmptyFolderPatch)
         } else {

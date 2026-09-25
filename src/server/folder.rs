@@ -5,8 +5,8 @@ use rmcp::{handler::server::wrapper::Parameters, tool, tool_router};
 use super::HackmdServer;
 use crate::{
     folders::{
-        CreateFolderInput, DeleteFolderInput, FolderRefInput, FolderWorkspaceInput,
-        SetFolderOrderInput, UpdateFolderInput,
+        CreateFolderInput, DeleteFolderInput, FolderWorkspaceInput, SetFolderOrderInput,
+        UpdateFolderInput,
     },
     reply,
 };
@@ -34,30 +34,6 @@ impl HackmdServer {
                     "Found {} HackMD folder(s); returned {}",
                     output.meta.total, output.meta.count
                 ),
-                &output,
-            ),
-            Err(error) => reply::error(error.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_get_folder",
-        description = "Get one folder by internal ID in a personal or team HackMD workspace.",
-        annotations(
-            title = "Get HackMD Folder",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    pub(crate) async fn get_folder(
-        &self,
-        Parameters(input): Parameters<FolderRefInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::folders::get_folder(&self.client, input).await {
-            Ok(output) => reply::structured(
-                format!("Fetched HackMD folder {}", output.folder.id),
                 &output,
             ),
             Err(error) => reply::error(error.to_string()),
@@ -114,7 +90,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_delete_folder",
-        description = "Delete a folder. A non-empty folder is unchanged unless the same request supplies confirm: true.",
+        description = "Delete a folder. A folder with child folders is left unchanged unless the same request supplies confirm: true. Notes are not counted: HackMD list endpoints do not report folder membership, so check hackmd_get_note folder_ids first if that matters.",
         annotations(
             title = "Delete HackMD Folder",
             read_only_hint = false,

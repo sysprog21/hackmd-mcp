@@ -16,9 +16,9 @@ cargo test --test stdio                           # one integration target
 `make check` covers the tests only; clippy is a separate gate and both must pass. `make` alone
 builds the release binary and `make clean` removes `target/`.
 
-Live suite (`tests/live-smoke.rs`) is destructive and `#[ignore]`d. It needs a dedicated
-throwaway account and the environment gates named at the top of that file; do not copy the
-command here, it drifts.
+The live suites (`tests/live-readonly.rs`, `tests/live-destructive.rs`) are `#[ignore]`d. The
+destructive one needs a dedicated throwaway account and the environment gates named at the top
+of that file; do not copy the command here, it drifts.
 
 `otel` is the only non-default feature; it swaps in an OTLP span exporter, gated at runtime
 by `HACKMD_MCP_OTEL=1`.
@@ -32,14 +32,20 @@ Three layers, each with its own error enum, converted at the boundary:
    name the fix, not just the code. Nothing above it touches `reqwest`.
 2. Per-tool modules hold the input struct, the output struct, the domain error, and the tests
    for all of them. `src/note/` covers a single note or the note list (`crud`, `get`, `edit`,
-   `list`, `history`, `trash`, `image`, `patch`, `reference`); `src/sync/` covers the
-   local-first sync tools and their state store (`pull`, `push`, `check`, `snapshot`,
-   `state`); `folders.rs` stands alone. One tool family per file; `server.rs` only dispatches.
+   `list`, `trash`, `image`, `patch`, `reference`); `src/sync/` covers the local-first sync
+   tools and their state store (`pull`, `push`, `check`, `tracking`, `state`); `folders.rs`
+   stands alone. One tool family per file; `server.rs` only dispatches.
 3. `src/server/{account,note,folder,sync}.rs` declare the `#[tool]`s, one named router per
    family, combined by `HackmdServer::router`. `server.rs` itself holds only the wiring:
    construction, the `ServerHandler` impl, and the shared reply helpers. Each tool carries its
-   RMCP annotations and converts results through `reply::{success, error}`; handler bodies stay
-   at match-and-format length.
+   RMCP annotations and converts results through `reply::{structured, unresolved, error}`;
+   handler bodies stay at match-and-format length. A success carries a one-line summary, the
+   output as JSON text, and the same output as flat `structuredContent` (no wrapper key), so a
+   client that reads only `content` still sees the data.
+4. The surface is 19 tools, kept small on purpose. Account-wide lists are `source` values on
+   `hackmd_list_notes` (`history`, `trash`), teams come back with `hackmd_get_me`, and a
+   conflicted push writes its own `*.remote.md` snapshot. Prefer a parameter on an existing
+   tool over a new tool with the same shape.
 
 Filenames carry no underscores: that is why related tools are grouped into directories rather
 than named `pull_note.rs`.
@@ -48,16 +54,26 @@ Cross-cutting pieces:
 
 - `models::Workspace` is an internally tagged enum (`personal` / `team{team_path}`). One tool
   family serves both route shapes; the personal-vs-team split is a single `match` on segments
-  inside the client. Do not add parallel team tools.
+  inside the client. Do not add parallel team tools. On the wire it is a flat, nullable team
+  path: tools take it as `team_path` (the older tagged `workspace` object is still read) and
+  report it the same way. `Workspace`'s own serde and schema impls carry that; only sync
+  state keeps writing the tagged form, via `#[serde(with = "crate::models::tagged")]`, so
+  sidecars stay readable by older builds.
+- Tool output is snake_case throughout, and names a workspace `team_path`, `null` for
+  personal. Response DTOs read `HackMD`'s camelCase and write
+  snake_case (`rename_all(deserialize = "camelCase", serialize = "snake_case")`); request
+  DTOs stay camelCase because the API reads them.
 - `note::reference::resolve_note_ref` accepts an internal ID or an `https://hackmd.io/@owner/slug`
   URL and returns `NoteResolution::{Resolved, NotFound, Ambiguous}`. Non-resolution is a
   successful tool result carrying candidates, not a tool error, so the agent can pick. That is
   why write paths return `Result<Result<Output, NoteResolution>, Error>`.
-- `note::get::patch_path` mints `notes/{id}.md` or `teams/{team_path}/notes/{id}.md`
+- `note::patch::patch_path` mints `notes/{id}.md` or `teams/{team_path}/notes/{id}.md`
   deliberately unencoded. `hackmd_edit_note` refuses any patch whose `*** Update File:` header
   does not match exactly, so a patch written against one note can never land on another.
 - `note::patch` implements the `*** Begin Patch` format directly. Hunk context must match exactly
-  once; ambiguous or missing context is an error rather than a guess.
+  once; ambiguous or missing context is an error rather than a guess. Text after `@@` is an
+  anchor that must match exactly one line; the hunk is then matched only from that line on,
+  and an anchored addition-only hunk goes directly below it.
 - `sync::state` keeps a `by-path/<hash>` pointer from each tracked file to its sidecar, so a
   lookup is one read rather than a scan. It is a hint only: the loader verifies what it finds
   and falls back to scanning, which is also what keeps state from older builds loadable.
@@ -72,23 +88,38 @@ Cross-cutting pieces:
 - Sync is baseline three-way: `sync::check` compares local, baseline, and remote to yield
   `in_sync | local_changed | remote_changed | conflict`. `sync::push` in `safe` strategy
   re-reads the remote right before writing and downgrades to a conflict result (with a diff
-  summary and snapshot path) rather than overwriting. `overwrite` requires `confirm: true`.
+  summary and a freshly written `*.remote.md` snapshot) rather than overwriting. `overwrite`
+  requires `confirm: true`. A merged push passes the conflict's `remote_body_hash` back as
+  `expected_remote_hash`, which stands in for the baseline only while the remote still has that
+  exact body. Push takes its target from the sidecar; `note_ref` is only an
+  optional cross-check. The sidecar records the hash of the `*.remote.md` a conflict last
+  wrote (`remote_snapshot_hash`), and a later conflict replaces that file only while it still
+  has exactly that content, so a user's own file is never overwritten. The hash is saved with
+  `StateStore::update_sidecar` (the baseline is not rewritten), and `persist_from_sync`
+  carries it forward for the same note and file. Safe push always classifies against the baseline first; `expected_remote_hash`
+  only lets a genuine two-sided conflict through, never a remote-only change. Pull checks
+  its destination again after fetching, just before the write. `sync::pull` refuses non-`.md` destinations and will not overwrite a
+  tracked file whose edits were never pushed unless `discard_local_changes: true`.
 - `retry.rs` uses a `tokio::task_local` so client-layer retries surface in the MCP
   result `_meta.retry` without threading a counter through every signature.
-- `client::NotesCache` keeps a workspace's note list for 60 seconds and drops every entry on
+- `client/cache.rs` holds both client caches. `NotesCache` keeps a workspace's note list for 60 seconds and drops every entry on
   any note write. This reverses the deferral recorded in commit `0a61e3b`: URL-based note
   references list the whole workspace, so an agent working through links paid for the same
-  list repeatedly. Tests disable it (`Config::for_loopback_test` sets a zero TTL) so their
-  request counts stay meaningful.
+  list repeatedly. `AccountCache` keeps `userPath` and the team list for the same TTL,
+  so an `@owner/slug` lookup does not also pay two discovery requests; `refresh` bypasses
+  both. Tests disable them (`Config::for_loopback_test` sets a zero TTL) so their request
+  counts stay meaningful.
 - `paging.rs` owns the limit/offset contract for every list tool: `HackMD` returns whole
   collections, so filtering, sorting, and paging all happen locally.
 - `client::poll_readback` absorbs `HackMD`'s asynchronous write visibility. Any read-back after
   a write goes through it rather than trusting a single immediate GET.
 - `local::LocalFiles` owns everything on this machine: the `StateStore` and the optional
-  `HACKMD_MCP_WORKSPACE_ROOT` confinement. The server constructs it and passes it to the
-  five tools that touch local paths; `HackmdClient` is HTTP only and knows nothing about
-  the filesystem. Any new tool that accepts a caller-supplied path calls `files.allow`
-  before doing anything else.
+  `HACKMD_MCP_WORKSPACE_ROOT` confinement. The root is canonicalized and opened once at
+  startup, and both the policy check and every capability operation use that one handle; a
+  root moved or replaced afterwards is refused until restart. The
+  server passes it to the four tools that touch local paths; `HackmdClient` is HTTP only and
+  knows nothing about the filesystem. Any new tool that accepts a caller-supplied path calls
+  `files.allow` before doing anything else.
 - `observability.rs` sends JSON tracing to stderr only. Stdout belongs to the MCP transport;
   a stray `println!` corrupts the protocol and `tests/stdio.rs` will catch it.
 

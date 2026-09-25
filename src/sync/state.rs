@@ -16,11 +16,17 @@ use crate::models::Workspace;
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct TrackedNoteState {
     pub(crate) internal_id: String,
+    #[serde(with = "crate::models::tagged")]
     pub(crate) workspace: Workspace,
     pub(crate) local_path: PathBuf,
     pub(crate) baseline_body_hash: String,
     pub(crate) last_observed_remote_timestamp: String,
     pub(crate) local_file_identity: LocalFileIdentity,
+    /// Hash of the `*.remote.md` a conflicted push last wrote. A later
+    /// conflict replaces that file only while it still has exactly this
+    /// content, so a file the user wrote or edited is never overwritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_snapshot_hash: Option<String>,
 }
 
 impl TrackedNoteState {
@@ -41,6 +47,7 @@ impl TrackedNoteState {
             local_path,
             baseline_body_hash: body_hash(baseline_body),
             last_observed_remote_timestamp: timestamp_text(remote_timestamp),
+            remote_snapshot_hash: None,
         })
     }
 
@@ -99,10 +106,12 @@ pub(crate) fn body_digest(body: &str) -> [u8; 32] {
 
 /// Stable identity captured for the local Markdown file.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+///
+/// Sidecars written by older builds also carry `device_id` and `file_id`.
+/// Nothing ever read them, and every atomic rename changes the inode anyway,
+/// so they are no longer written; loading simply ignores them.
 pub(crate) struct LocalFileIdentity {
     pub(crate) canonical_path: PathBuf,
-    pub(crate) device_id: Option<u64>,
-    pub(crate) file_id: Option<u64>,
 }
 
 /// Local state layout. Constructing it never touches the filesystem.
@@ -170,16 +179,25 @@ impl StateStore {
     ) -> Result<(), StateError> {
         let key = state_key(&state.workspace, &state.internal_id);
         let paths = self.paths_for_key(&key);
-        if let Ok(previous) = fs::read(&paths.sidecar).and_then(|bytes| {
-            serde_json::from_slice::<TrackedNoteState>(&bytes).map_err(io::Error::other)
-        }) && previous.local_file_identity.canonical_path
-            != state.local_file_identity.canonical_path
-        {
-            self.remove_hint_if_matches(&previous.local_file_identity.canonical_path, &key)?;
+        let previous = fs::read(&paths.sidecar)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<TrackedNoteState>(&bytes).ok());
+        let mut state = state.clone();
+        if let Some(previous) = previous {
+            if previous.local_file_identity.canonical_path
+                == state.local_file_identity.canonical_path
+            {
+                // Same note, same file: the conflict snapshot beside it is
+                // still the one this tool wrote, whoever captured this state.
+                if state.remote_snapshot_hash.is_none() {
+                    state.remote_snapshot_hash = previous.remote_snapshot_hash;
+                }
+            } else {
+                self.remove_hint_if_matches(&previous.local_file_identity.canonical_path, &key)?;
+            }
         }
         write_private_atomic(&paths.baseline, baseline_body.as_bytes())?;
-        let sidecar = serde_json::to_vec_pretty(state)?;
-        write_private_atomic(&paths.sidecar, &sidecar)?;
+        self.update_sidecar(&state)?;
 
         // A hint, not a source of truth: the loader verifies what it finds and
         // falls back to a scan, so a stale or missing pointer costs speed and
@@ -190,6 +208,31 @@ impl StateStore {
             key.as_bytes(),
         )?;
         Ok(())
+    }
+
+    /// Rewrites only the sidecar of a record that is already persisted, for a
+    /// field outside the baseline pair such as the snapshot hash. The baseline
+    /// and its hash are untouched, so the pair stays consistent, and a body of
+    /// up to 50 MiB is not rewritten to change one field.
+    pub(crate) fn update_sidecar(&self, state: &TrackedNoteState) -> Result<(), StateError> {
+        let paths = self.paths_for(&state.workspace, &state.internal_id);
+        write_private_atomic(&paths.sidecar, &serde_json::to_vec_pretty(state)?)?;
+        Ok(())
+    }
+
+    /// The record naming `local_path`, if any, without reading or verifying
+    /// its baseline: enough to compare a file against the recorded hash, not
+    /// to sync from.
+    pub(crate) fn record_for(
+        &self,
+        local_path: &Path,
+    ) -> Result<Option<TrackedNoteState>, StateError> {
+        let canonical = match fs::canonicalize(local_path) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(StateError::Io(error)),
+        };
+        Ok(self.find(&canonical)?.map(|(state, _)| state))
     }
 
     /// Reads every tracked sidecar without touching the working Markdown or
@@ -265,7 +308,10 @@ impl StateStore {
     /// Follows the by-path pointer, if one is there and still describes this
     /// file. `None` means the caller should scan, which also covers state
     /// written before the index existed.
-    fn load_via_index(&self, canonical: &Path) -> Result<Option<LoadedTrackedState>, StateError> {
+    fn find_via_index(
+        &self,
+        canonical: &Path,
+    ) -> Result<Option<(TrackedNoteState, StatePaths)>, StateError> {
         let Ok(key) = fs::read_to_string(self.index_path(canonical)) else {
             return Ok(None);
         };
@@ -292,51 +338,51 @@ impl StateStore {
         if state.local_file_identity.canonical_path != canonical {
             return Ok(None);
         }
-        Self::load_verified(state, paths).map(Some)
+        Ok(Some((state, paths)))
     }
 
-    /// Finds the tracked note whose recorded file is `local_path`.
-    ///
-    /// The by-path pointer answers this in one read; failing that, the sidecars
-    /// are scanned and their canonical paths compared. Neither derives a
+    /// Scans every sidecar for the one recording `canonical`, for state the
+    /// index does not point at.
+    fn find_by_scan(
+        &self,
+        canonical: &Path,
+    ) -> Result<Option<(TrackedNoteState, StatePaths)>, StateError> {
+        Ok(self
+            .list_tracked()?
+            .into_iter()
+            .find(|state| state.local_file_identity.canonical_path == canonical)
+            .map(|state| {
+                let paths = self.paths_for(&state.workspace, &state.internal_id);
+                (state, paths)
+            }))
+    }
+
+    /// The record whose file is `canonical`: the by-path pointer answers in
+    /// one read, and failing that the sidecars are scanned. Neither derives a
     /// filename from the path, so a note stays tracked when the caller reaches
-    /// it through a symlink or a differently spelled path.
+    /// it through a symlink or a differently spelled path. A pointer at a
+    /// sidecar that cannot be read is reported only if the scan finds nothing.
+    fn find(&self, canonical: &Path) -> Result<Option<(TrackedNoteState, StatePaths)>, StateError> {
+        let indexed_error = match self.find_via_index(canonical) {
+            Ok(Some(found)) => return Ok(Some(found)),
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
+        match self.find_by_scan(canonical)? {
+            Some(found) => Ok(Some(found)),
+            None => indexed_error.map_or(Ok(None), Err),
+        }
+    }
+
+    /// Finds the tracked note whose recorded file is `local_path`, with its
+    /// baseline read and verified against the recorded hash.
     pub(crate) fn load_for_local_path(
         &self,
         local_path: &Path,
     ) -> Result<LoadedTrackedState, StateError> {
         let canonical = fs::canonicalize(local_path)?;
-        let indexed_error = match self.load_via_index(&canonical) {
-            Ok(Some(loaded)) => return Ok(loaded),
-            Ok(None) => None,
-            Err(error) => Some(error),
-        };
-        let tracked = self.root.join("tracked");
-        let entries = fs::read_dir(tracked).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                StateError::NotTracked
-            } else {
-                StateError::Io(error)
-            }
-        })?;
-        for entry in entries {
-            let path = entry?.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let bytes = fs::read(&path)?;
-            let state: TrackedNoteState = if let Ok(state) = serde_json::from_slice(&bytes) {
-                state
-            } else {
-                tracing::warn!(path = %path.display(), "skipping malformed tracked sidecar");
-                continue;
-            };
-            if state.local_file_identity.canonical_path == canonical {
-                let paths = self.paths_for(&state.workspace, &state.internal_id);
-                return Self::load_verified(state, paths);
-            }
-        }
-        Err(indexed_error.unwrap_or(StateError::NotTracked))
+        let (state, paths) = self.find(&canonical)?.ok_or(StateError::NotTracked)?;
+        Self::load_verified(state, paths)
     }
 
     fn load_verified(
@@ -394,25 +440,9 @@ pub(crate) fn write_local_atomic(path: &Path, contents: &[u8]) -> Result<(), Sta
 }
 
 pub(crate) fn local_file_identity(path: &Path) -> Result<LocalFileIdentity, StateError> {
-    let canonical_path = fs::canonicalize(path)?;
-    let metadata = fs::metadata(&canonical_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(LocalFileIdentity {
-            canonical_path,
-            device_id: Some(metadata.dev()),
-            file_id: Some(metadata.ino()),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(LocalFileIdentity {
-            canonical_path,
-            device_id: None,
-            file_id: None,
-        })
-    }
+    Ok(LocalFileIdentity {
+        canonical_path: fs::canonicalize(path)?,
+    })
 }
 
 struct StatePaths {
@@ -582,10 +612,70 @@ mod tests {
             last_observed_remote_timestamp: "2026-08-29T00:00:00Z".to_owned(),
             local_file_identity: LocalFileIdentity {
                 canonical_path: PathBuf::from("/tmp/note.md"),
-                device_id: Some(1),
-                file_id: Some(2),
             },
+            remote_snapshot_hash: None,
         }
+    }
+
+    #[test]
+    fn sidecars_from_older_builds_still_load() {
+        let legacy = serde_json::json!({
+            "internal_id": "note/id",
+            "workspace": {"kind": "personal"},
+            "local_path": "/tmp/note.md",
+            "baseline_body_hash": "sha256:fixture",
+            "last_observed_remote_timestamp": "2026-08-29T00:00:00Z",
+            "local_file_identity": {
+                "canonical_path": "/tmp/note.md",
+                "device_id": 1,
+                "file_id": 2
+            }
+        });
+        assert_eq!(
+            serde_json::from_value::<TrackedNoteState>(legacy)
+                .expect("legacy sidecar should deserialize"),
+            fixture_state(Workspace::Personal)
+        );
+    }
+
+    #[test]
+    fn a_fresh_capture_of_the_same_file_keeps_the_snapshot_hash() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let store = StateStore::new(directory.path().join("state"));
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").expect("local fixture should write");
+        let capture = || {
+            TrackedNoteState::capture(
+                "note/id".to_owned(),
+                Workspace::Personal,
+                local_path.clone(),
+                "baseline",
+                Some(1),
+            )
+            .expect("fixture state should capture")
+        };
+        store
+            .persist_from_sync(&capture(), "baseline")
+            .expect("state should persist");
+        let mut with_snapshot = capture();
+        with_snapshot.remote_snapshot_hash = Some("sha256:snapshot".to_owned());
+        store
+            .update_sidecar(&with_snapshot)
+            .expect("sidecar should update");
+
+        // A re-pull or an advance captures afresh, without the hash.
+        store
+            .persist_from_sync(&capture(), "baseline")
+            .expect("state should persist again");
+        assert_eq!(
+            store
+                .load_for_local_path(&local_path)
+                .expect("state should load")
+                .state
+                .remote_snapshot_hash
+                .as_deref(),
+            Some("sha256:snapshot")
+        );
     }
 
     #[test]

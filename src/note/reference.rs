@@ -10,12 +10,14 @@ use crate::{
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct ResolvedNoteRef {
+    #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
     pub(crate) note_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct NoteCandidate {
+    #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
     pub(crate) note_id: String,
     pub(crate) title: String,
@@ -64,19 +66,14 @@ pub(crate) async fn resolve_note_ref(
             note: ResolvedNoteRef { workspace, note_id },
         }),
         ParsedNoteRef::Scoped { owner, slug } => {
-            let profile = client.get_me().await?;
-            let workspace = if owner == profile.user_path {
+            let workspace = if *owner == *client.user_path(refresh).await? {
                 Workspace::Personal
+            } else if client.has_team(&owner, refresh).await? {
+                Workspace::Team { team_path: owner }
             } else {
-                let teams = client.list_teams().await?;
-                let Some(team) = teams.into_iter().find(|team| team.path == owner) else {
-                    return Ok(NoteResolution::NotFound {
-                        query: format!("@{owner}/{slug}"),
-                    });
-                };
-                Workspace::Team {
-                    team_path: team.path,
-                }
+                return Ok(NoteResolution::NotFound {
+                    query: format!("@{owner}/{slug}"),
+                });
             };
             let notes = client.list_notes(&workspace, refresh).await?;
             Ok(unique_matches(&workspace, &slug, &notes, |note, query| {
@@ -306,6 +303,60 @@ mod tests {
         assert!(matches!(first, NoteResolution::Resolved { note } if note.note_id == "old"));
         assert!(matches!(refreshed, NoteResolution::Resolved { note } if note.note_id == "new"));
         fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn repeated_scoped_urls_reuse_the_cached_account_and_lists() {
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/me",
+                200,
+                r#"{"id":"u","name":"User","userPath":"alice"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Core","path":"core"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams/core/notes",
+                200,
+                r#"[{"id":"team-id","title":"Team","shortId":"slug"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes",
+                200,
+                r#"[{"id":"mine","title":"Mine","permalink":"slug"}]"#,
+            ),
+        ]);
+        let client = fixture.client_with_cache();
+        let resolve =
+            |url: &'static str| resolve_note_ref(&client, Workspace::Personal, url, false);
+
+        for _ in 0..2 {
+            let team = resolve("https://hackmd.io/@core/slug")
+                .await
+                .expect("team URL should resolve");
+            assert!(matches!(team, NoteResolution::Resolved { note } if note.note_id == "team-id"));
+        }
+        // The cached user_path answers without another /me.
+        let mine = resolve("https://hackmd.io/@alice/slug")
+            .await
+            .expect("personal URL should resolve");
+        assert!(matches!(mine, NoteResolution::Resolved { note } if note.note_id == "mine"));
+        // A fresh cached team list also answers "not a member".
+        assert!(matches!(
+            resolve("https://hackmd.io/@stranger/slug")
+                .await
+                .expect("unknown owner should resolve to not found"),
+            NoteResolution::NotFound { .. }
+        ));
+
+        assert_eq!(fixture.finish().len(), 4, "one request per resource");
     }
 
     #[tokio::test]

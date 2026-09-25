@@ -12,14 +12,18 @@ use crate::{
         PayloadError, SuggestEditPermission, UpdateNoteRequest, deserialize_patch_field,
     },
     models::Workspace,
-    note::reference::{NoteRefError, NoteResolution},
+    note::{
+        get::{NoteDetail, normalize_note},
+        reference::{NoteRefError, NoteResolution, ResolvedNoteRef},
+    },
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateNoteInput {
-    /// Personal account or team in which to create the note.
-    #[serde(default)]
+    /// Team path (from `hackmd_get_me`) of a team workspace; omit for the
+    /// personal workspace.
+    #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
     /// Optional note title; `HackMD` content front matter or a leading H1 may
     /// take precedence.
@@ -52,23 +56,32 @@ pub(crate) struct CreateNoteInput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpdateNoteInput {
-    /// Workspace used for a direct internal note ID; scoped URLs resolve their
-    /// own workspace.
-    #[serde(default)]
+    /// Team path (from `hackmd_get_me`) when a direct internal note ID belongs
+    /// to a team; omit for personal notes. `@owner/slug` URLs name their own
+    /// workspace.
+    #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
     /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
     pub(crate) note_ref: String,
-    /// Bypass cached note lists when resolving an `@owner/slug` URL.
+    /// Bypass the 60-second account and note-list caches when resolving an
+    /// `@owner/slug` URL.
     #[serde(default)]
     pub(crate) refresh: bool,
+    /// New title. `HackMD` may still derive the title from the body's first
+    /// heading.
     pub(crate) title: Option<String>,
     /// Explicit full-body replacement. Prefer `hackmd_edit_note` for normal
     /// content edits.
     pub(crate) content: Option<String>,
+    /// Complete replacement tag list.
     pub(crate) tags: Option<Vec<String>>,
+    /// New description.
     pub(crate) description: Option<String>,
+    /// New custom URL slug.
     pub(crate) permalink: Option<String>,
+    /// Who may read the note.
     pub(crate) read_permission: Option<NotePermission>,
+    /// Who may edit the note; may not exceed `read_permission`.
     pub(crate) write_permission: Option<NotePermission>,
     /// Folder ID, or null to move the note to the workspace root.
     #[serde(default, deserialize_with = "deserialize_patch_field")]
@@ -83,20 +96,23 @@ pub(crate) struct UpdateNoteInput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DeleteNoteInput {
-    /// Workspace used for a direct internal note ID; scoped URLs resolve their
-    /// own workspace.
-    #[serde(default)]
+    /// Team path (from `hackmd_get_me`) when a direct internal note ID belongs
+    /// to a team; omit for personal notes. `@owner/slug` URLs name their own
+    /// workspace.
+    #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
     /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
     pub(crate) note_ref: String,
-    /// Bypass cached note lists when resolving an `@owner/slug` URL.
+    /// Bypass the 60-second account and note-list caches when resolving an
+    /// `@owner/slug` URL.
     #[serde(default)]
     pub(crate) refresh: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct CreateNoteOutput {
-    pub(crate) note: NoteResponse,
+    /// The created note as read back, without its body.
+    pub(crate) note: NoteDetail,
     pub(crate) folder_placement_requested: bool,
     /// Whether the note was actually read back inside the requested folder.
     /// False means `HackMD` accepted the placement but never showed it.
@@ -106,18 +122,15 @@ pub(crate) struct CreateNoteOutput {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct UpdateNoteOutput {
-    pub(crate) workspace: Workspace,
-    pub(crate) note_id: String,
-    pub(crate) accepted: bool,
-    pub(crate) response: Option<NoteResponse>,
+    /// The updated note as read back, without its body.
+    pub(crate) note: NoteDetail,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DeleteNoteOutput {
+    #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
     pub(crate) note_id: String,
-    pub(crate) deleted: bool,
-    pub(crate) response: Option<Value>,
 }
 
 #[derive(Debug, Error)]
@@ -132,6 +145,8 @@ pub(crate) enum CrudError {
     Reference(#[from] NoteRefError),
     #[error(transparent)]
     Api(#[from] HackmdError),
+    #[error("HackMD accepted the update for note {note_id}, but read-back content did not match")]
+    ReadbackMismatch { note_id: String },
     #[error("note {note_id} was created, but folder placement failed: {source}")]
     FolderPlacement {
         note_id: String,
@@ -212,7 +227,13 @@ pub(crate) async fn create_note(
     // the folder_ids the caller reads out of it.
     let folder_placement_confirmed = folder.as_ref().is_some_and(|id| placed_in(&note, id));
     Ok(CreateNoteOutput {
-        note,
+        note: without_content(
+            ResolvedNoteRef {
+                workspace: input.workspace,
+                note_id,
+            },
+            note,
+        ),
         folder_placement_requested: folder.is_some(),
         folder_placement_confirmed,
         compatibility_patch_applied,
@@ -250,13 +271,35 @@ pub(crate) async fn update_note(
     client
         .update_note(&note.workspace, &note.note_id, &payload)
         .await?;
-    let response = client.get_note(&note.workspace, &note.note_id).await?;
+
+    // Only a body replacement is compared. Metadata is not: `HackMD` derives a
+    // title from the body's first heading, so a supplied title can legitimately
+    // read back different, and waiting on it would only stall.
+    let readback = crate::client::poll_readback(
+        || client.get_note(&note.workspace, &note.note_id),
+        |readback| {
+            payload
+                .content
+                .as_deref()
+                .is_none_or(|content| readback.content.as_deref() == Some(content))
+        },
+    )
+    .await?;
+    if !readback.confirmed {
+        return Err(CrudError::ReadbackMismatch {
+            note_id: note.note_id,
+        });
+    }
     Ok(Ok(UpdateNoteOutput {
-        workspace: note.workspace,
-        note_id: note.note_id,
-        accepted: true,
-        response: Some(response),
+        note: without_content(note, readback.value),
     }))
+}
+
+fn without_content(reference: ResolvedNoteRef, note: NoteResponse) -> NoteDetail {
+    NoteDetail {
+        content: None,
+        ..normalize_note(reference, note)
+    }
 }
 
 pub(crate) async fn delete_note(
@@ -273,12 +316,10 @@ pub(crate) async fn delete_note(
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
-    let response = client.delete_note(&note.workspace, &note.note_id).await?;
+    client.delete_note(&note.workspace, &note.note_id).await?;
     Ok(Ok(DeleteNoteOutput {
         workspace: note.workspace,
         note_id: note.note_id,
-        deleted: true,
-        response,
     }))
 }
 
@@ -350,10 +391,8 @@ mod tests {
             .await
             .expect("update should succeed")
             .expect("direct reference should resolve");
-        assert_eq!(
-            output.response.expect("readback should exist").title,
-            "Updated"
-        );
+        assert_eq!(output.note.title, "Updated");
+        assert_eq!(output.note.patch_path, "notes/note/id.md");
         server.finish();
     }
 
@@ -406,7 +445,7 @@ mod tests {
         assert!(output.folder_placement_requested);
         assert!(!output.folder_placement_confirmed);
         assert!(output.compatibility_patch_applied);
-        assert!(output.note.folder_paths.is_empty());
+        assert!(output.note.folder_ids.is_empty());
     }
 
     #[tokio::test]
@@ -448,7 +487,7 @@ mod tests {
         assert!(output.folder_placement_confirmed);
         assert!(output.compatibility_patch_applied);
         server.finish();
-        assert_eq!(output.note.folder_paths[0].id, "folder-id");
+        assert_eq!(output.note.folder_ids, ["folder-id"]);
     }
 
     #[tokio::test]

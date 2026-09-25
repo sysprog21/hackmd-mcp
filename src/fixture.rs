@@ -3,7 +3,10 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -30,6 +33,9 @@ struct FixtureResponse {
     body: String,
     headers: Vec<(String, String)>,
     delay: Duration,
+    /// Runs on the server thread after the request arrives and before the
+    /// response goes out, to stage something happening mid-request.
+    before: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 type BodyPredicate = Box<dyn Fn(&str) -> bool + Send + Sync>;
@@ -61,6 +67,7 @@ impl Scenario {
                 body: body.to_owned(),
                 headers: Vec::new(),
                 delay: Duration::ZERO,
+                before: None,
             },
         }
     }
@@ -78,6 +85,13 @@ impl Scenario {
         predicate: impl Fn(&str) -> bool + Send + Sync + 'static,
     ) -> Self {
         self.expected.body = Some((description.to_owned(), Box::new(predicate)));
+        self
+    }
+
+    /// Runs `action` while this request is in flight: after it arrives, before
+    /// the response is sent.
+    pub(crate) fn before_response(mut self, action: impl Fn() + Send + Sync + 'static) -> Self {
+        self.response.before = Some(Arc::new(action));
         self
     }
 
@@ -108,6 +122,7 @@ fn fixture_response(
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
             .collect(),
         delay,
+        before: None,
     }
 }
 
@@ -245,6 +260,9 @@ impl SequenceServer {
                     return;
                 };
                 captured.push(read_request(&mut stream, deadline));
+                if let Some(action) = &response.before {
+                    action();
+                }
                 let extra_headers =
                     response
                         .headers
@@ -453,13 +471,30 @@ pub(crate) fn tracked_files(
     local_path: &Path,
     baseline: &str,
 ) -> LocalFiles {
+    tracked_files_in(
+        Workspace::Personal,
+        state_root,
+        note_id,
+        local_path,
+        baseline,
+    )
+}
+
+/// [`tracked_files`] for a note in `workspace`.
+pub(crate) fn tracked_files_in(
+    workspace: Workspace,
+    state_root: &Path,
+    note_id: &str,
+    local_path: &Path,
+    baseline: &str,
+) -> LocalFiles {
     let files = unconfined_files(state_root.join("state"));
     files
         .state()
         .persist_from_sync(
             &TrackedNoteState::capture(
                 note_id.to_owned(),
-                Workspace::Personal,
+                workspace,
                 local_path.to_path_buf(),
                 baseline,
                 Some(1),

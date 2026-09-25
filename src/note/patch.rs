@@ -22,6 +22,10 @@ pub(crate) enum PatchError {
     ContextNotFound,
     #[error("patch hunk context matched multiple locations")]
     AmbiguousContext,
+    #[error("patch hunk anchor @@ {0} matches no line")]
+    AnchorNotFound(String),
+    #[error("patch hunk anchor @@ {0} matches more than one line")]
+    AmbiguousAnchor(String),
 }
 
 #[derive(Debug)]
@@ -30,8 +34,13 @@ struct FilePatch {
     hunks: Vec<Hunk>,
 }
 
+/// One `@@` section. Text after `@@` is an anchor: a line the note must
+/// contain exactly once, compared with surrounding whitespace ignored, and
+/// after which the hunk applies. It is how a caller
+/// disambiguates context that also appears earlier in the note.
 #[derive(Debug)]
 struct Hunk {
+    anchor: Option<String>,
     lines: Vec<HunkLine>,
 }
 
@@ -139,18 +148,41 @@ fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
     }
 
     let mut hunks = Vec::new();
-    let mut current: Option<Vec<HunkLine>> = None;
+    let mut current: Option<Hunk> = None;
+
+    // A bare empty line is an empty context line whose leading space was
+    // trimmed, which editors and models both do routinely. It only counts
+    // between two hunk lines: blank padding before a hunk's first line or after
+    // its last cannot demand blank lines the note does not have, nor turn an
+    // addition-only hunk into one that needs context.
+    let mut pending_blank_lines = 0;
     for line in body.iter().skip(1) {
-        if *line == "@@" || line.starts_with("@@ ") {
-            if let Some(lines) = current.take() {
-                push_hunk(&mut hunks, lines)?;
+        if let Some(anchor) = line
+            .strip_prefix("@@")
+            .filter(|rest| rest.is_empty() || rest.starts_with(' '))
+        {
+            if let Some(hunk) = current.take() {
+                push_hunk(&mut hunks, hunk)?;
             }
-            current = Some(Vec::new());
+            let anchor = anchor.trim();
+            current = Some(Hunk {
+                anchor: (!anchor.is_empty() && !is_line_range(anchor)).then(|| anchor.to_owned()),
+                lines: Vec::new(),
+            });
+            pending_blank_lines = 0;
             continue;
         }
-        let Some(hunk) = current.as_mut() else {
+        if line.is_empty() {
+            pending_blank_lines += 1;
+            continue;
+        }
+        let Some(Hunk { lines: hunk, .. }) = current.as_mut() else {
             return Err(PatchError::MissingHunk);
         };
+        let blank_lines = std::mem::take(&mut pending_blank_lines);
+        if !hunk.is_empty() {
+            hunk.extend((0..blank_lines).map(|_| HunkLine::Context(String::new())));
+        }
         if let Some(value) = line.strip_prefix(' ') {
             hunk.push(HunkLine::Context(value.to_owned()));
         } else if let Some(value) = line.strip_prefix('+') {
@@ -163,33 +195,82 @@ fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
             ));
         }
     }
-    let Some(lines) = current else {
+    let Some(hunk) = current else {
         return Err(PatchError::MissingHunk);
     };
-    push_hunk(&mut hunks, lines)?;
+    push_hunk(&mut hunks, hunk)?;
     Ok(FilePatch {
         target: target.to_owned(),
         hunks,
     })
 }
 
-fn push_hunk(hunks: &mut Vec<Hunk>, lines: Vec<HunkLine>) -> Result<(), PatchError> {
-    if lines.is_empty() {
+/// Whether the text after `@@` is a unified-diff line range such as
+/// `-3,4 +3,5 @@`. Models write these out of habit; they locate nothing here,
+/// so such a hunk is simply unanchored.
+fn is_line_range(text: &str) -> bool {
+    let range = |part: &str, sign: char| {
+        part.strip_prefix(sign).is_some_and(|numbers| {
+            !numbers.is_empty()
+                && numbers.split(',').all(|number| {
+                    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
+    };
+    let mut parts = text.split_whitespace();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(old), Some(new)) if range(old, '-') && range(new, '+')
+    ) && parts.next().is_none_or(|rest| rest.starts_with("@@"))
+}
+
+fn push_hunk(hunks: &mut Vec<Hunk>, hunk: Hunk) -> Result<(), PatchError> {
+    if hunk.lines.is_empty() {
         return Err(PatchError::MalformedHunk("hunk cannot be empty"));
     }
-    hunks.push(Hunk { lines });
+    hunks.push(hunk);
     Ok(())
 }
 
 fn apply_hunk(lines: &mut Vec<String>, hunk: Hunk) -> Result<(), PatchError> {
+    // Search only from the anchor line on, so context that also appears before
+    // the anchor no longer makes the hunk ambiguous.
+    let start = match hunk.anchor.as_deref() {
+        Some(anchor) => {
+            unique_index(lines.iter().map(|line| line.trim() == anchor)).map_err(|found| {
+                match found {
+                    Found::None => PatchError::AnchorNotFound(anchor.to_owned()),
+                    Found::Many => PatchError::AmbiguousAnchor(anchor.to_owned()),
+                }
+            })?
+        }
+        None => 0,
+    };
+
+    // Located before the replacement is built, so the old side is borrowed
+    // straight from the hunk rather than copied.
     let old = hunk
         .lines
         .iter()
         .filter_map(|line| match line {
-            HunkLine::Context(value) | HunkLine::Remove(value) => Some(value.clone()),
+            HunkLine::Context(value) | HunkLine::Remove(value) => Some(value.as_str()),
             HunkLine::Add(_) => None,
         })
         .collect::<Vec<_>>();
+    let replaced = if old.is_empty() {
+        None
+    } else {
+        let offset = unique_index(
+            lines[start..]
+                .windows(old.len())
+                .map(|window| window.iter().map(String::as_str).eq(old.iter().copied())),
+        )
+        .map_err(|found| match found {
+            Found::None => PatchError::ContextNotFound,
+            Found::Many => PatchError::AmbiguousContext,
+        })?;
+        Some((start + offset, old.len()))
+    };
     let new = hunk
         .lines
         .into_iter()
@@ -198,33 +279,44 @@ fn apply_hunk(lines: &mut Vec<String>, hunk: Hunk) -> Result<(), PatchError> {
             HunkLine::Remove(_) => None,
         })
         .collect::<Vec<_>>();
-    if old.is_empty() {
-        // Nothing to anchor to: an addition-only hunk is unambiguous only when
-        // it is filling an empty note, which is the one body no context can
-        // describe.
-        if !lines.is_empty() {
+
+    match replaced {
+        Some((position, len)) => {
+            lines.splice(position..position + len, new);
+        }
+        // An anchored addition goes directly below its anchor line.
+        None if hunk.anchor.is_some() => {
+            let below = start + 1;
+            lines.splice(below..below, new);
+        }
+
+        // Nothing to place it by: an unanchored addition-only hunk is
+        // unambiguous only when it fills an empty note, which is the one body
+        // no context can describe.
+        None if lines.is_empty() => *lines = new,
+        None => {
             return Err(PatchError::MalformedHunk(
-                "an addition-only hunk applies only to an empty note; anchor it with context or removed lines",
+                "an addition-only hunk applies only to an empty note; add an @@ anchor, context, or removed lines",
             ));
         }
-        *lines = new;
-        return Ok(());
     }
-    let position = find_unique_match(lines, &old)?;
-    lines.splice(position..position + old.len(), new);
     Ok(())
 }
 
-fn find_unique_match(lines: &[String], needle: &[String]) -> Result<usize, PatchError> {
-    let mut matches = lines
-        .windows(needle.len())
+enum Found {
+    None,
+    Many,
+}
+
+/// The index of the one `true` in `matches`: a patch never guesses between
+/// candidates, for anchors and context alike.
+fn unique_index(matches: impl Iterator<Item = bool>) -> Result<usize, Found> {
+    let mut hits = matches
         .enumerate()
-        .filter_map(|(index, window)| (window == needle).then_some(index));
-    let Some(first) = matches.next() else {
-        return Err(PatchError::ContextNotFound);
-    };
-    if matches.next().is_some() {
-        return Err(PatchError::AmbiguousContext);
+        .filter_map(|(index, hit)| hit.then_some(index));
+    let first = hits.next().ok_or(Found::None)?;
+    if hits.next().is_some() {
+        return Err(Found::Many);
     }
     Ok(first)
 }
@@ -249,6 +341,76 @@ mod tests {
         assert_eq!(
             apply_note_patch("one\ntwo\nthree", &patch, TARGET),
             Ok("1\ntwo\n3".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_bare_empty_line_inside_a_hunk_is_empty_context() {
+        let patch = envelope("@@\n one\n\n-three\n+3\n");
+        assert_eq!(
+            apply_note_patch("one\n\nthree\n", &patch, TARGET),
+            Ok("one\n\n3\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_anchor_disambiguates_context_repeated_above_it() {
+        let body = "## A\n- item\n## B\n- item\n";
+        assert_eq!(
+            apply_note_patch(body, &envelope("@@\n-- item\n+- changed"), TARGET),
+            Err(PatchError::AmbiguousContext)
+        );
+        assert_eq!(
+            apply_note_patch(body, &envelope("@@ ## B\n-- item\n+- changed"), TARGET),
+            Ok("## A\n- item\n## B\n- changed\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_unified_diff_line_range_is_not_an_anchor() {
+        for header in [
+            "@@ -1,2 +1,2 @@",
+            "@@ -1 +1 @@",
+            "@@ -1,2 +1,2 @@ ## Heading",
+        ] {
+            assert_eq!(
+                apply_note_patch("a\nb\n", &envelope(&format!("{header}\n-a\n+x")), TARGET),
+                Ok("x\nb\n".to_owned()),
+                "{header}"
+            );
+        }
+        assert!(!super::is_line_range("-1,2 +1,2 extra"));
+        assert!(!super::is_line_range("## Heading"));
+    }
+
+    #[test]
+    fn blank_padding_around_hunks_is_not_context() {
+        // Before the first @@, and between an anchor and an addition.
+        let patch =
+            "*** Begin Patch\n*** Update File: notes/a.md\n\n@@ ## B\n\n+new\n*** End Patch";
+        assert_eq!(
+            apply_note_patch("## B\nold\n", patch, TARGET),
+            Ok("## B\nnew\nold\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_anchored_addition_goes_directly_below_the_anchor() {
+        assert_eq!(
+            apply_note_patch("# T\n## B\nold\n", &envelope("@@ ## B\n+new"), TARGET),
+            Ok("# T\n## B\nnew\nold\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_missing_or_repeated_anchor_is_an_error() {
+        assert_eq!(
+            apply_note_patch("a\nb\n", &envelope("@@ c\n-a\n+x"), TARGET),
+            Err(PatchError::AnchorNotFound("c".to_owned()))
+        );
+        assert_eq!(
+            apply_note_patch("a\na\nb\n", &envelope("@@ a\n-b\n+x"), TARGET),
+            Err(PatchError::AmbiguousAnchor("a".to_owned()))
         );
     }
 
@@ -354,7 +516,7 @@ mod tests {
             (
                 "*** Begin Patch\n*** Update File: notes/a.md\n@@\n+only-add\n*** End Patch",
                 PatchError::MalformedHunk(
-                    "an addition-only hunk applies only to an empty note; anchor it with context or removed lines",
+                    "an addition-only hunk applies only to an empty note; add an @@ anchor, context, or removed lines",
                 ),
             ),
         ];

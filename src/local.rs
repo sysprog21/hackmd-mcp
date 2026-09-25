@@ -19,22 +19,81 @@ use crate::sync::state::StateStore;
 #[derive(Debug)]
 pub(crate) struct LocalFiles {
     state: StateStore,
-    root: Option<PathBuf>,
+    root: Option<WorkspaceRoot>,
 }
 
-pub(crate) struct LocalMetadata {
-    is_file: bool,
-    is_dir: bool,
+/// `HACKMD_MCP_WORKSPACE_ROOT`, resolved and opened once. Both the policy check
+/// and every later operation go through this one directory, so replacing the
+/// root (or a symlink on the way to it) after startup changes neither.
+#[derive(Debug)]
+struct WorkspaceRoot {
+    /// As configured, which is how callers usually spell their paths.
+    configured: PathBuf,
+    /// The canonical path and an open handle, or `None` when the root did not
+    /// exist at startup.
+    pinned: Option<PinnedRoot>,
 }
 
-impl LocalMetadata {
-    pub(crate) const fn is_file(&self) -> bool {
-        self.is_file
+#[derive(Debug)]
+struct PinnedRoot {
+    canonical: PathBuf,
+    dir: Dir,
+    /// Device and inode of `canonical` when it was opened, where the platform
+    /// has them.
+    identity: Option<(u64, u64)>,
+}
+
+impl WorkspaceRoot {
+    fn open(configured: PathBuf) -> Self {
+        let pinned = fs::canonicalize(&configured).ok().and_then(|canonical| {
+            let dir = Dir::open_ambient_dir(&canonical, ambient_authority()).ok()?;
+            let identity = directory_identity(&canonical);
+            Some(PinnedRoot {
+                canonical,
+                dir,
+                identity,
+            })
+        });
+        Self { configured, pinned }
     }
 
-    pub(crate) const fn is_dir(&self) -> bool {
-        self.is_dir
+    /// The pinned root, provided the directory at its canonical path is still
+    /// the one that was opened. Path checks run against the live tree while
+    /// operations run through the handle, so a root moved or replaced after
+    /// startup would otherwise have them disagree about which file is meant.
+    fn pinned(&self) -> Result<(&Path, &Dir), LocalAccessError> {
+        let Some(root) = self.pinned.as_ref() else {
+            return Err(LocalAccessError::MissingRoot {
+                root: self.configured.clone(),
+            });
+        };
+        if directory_identity(&root.canonical) != root.identity {
+            return Err(LocalAccessError::ReplacedRoot {
+                root: root.canonical.clone(),
+            });
+        }
+        Ok((root.canonical.as_path(), &root.dir))
     }
+}
+
+#[cfg(unix)]
+fn directory_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn directory_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// What a caller-supplied path currently names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Entry {
+    Directory,
+    Other,
 }
 
 #[derive(Debug, Error)]
@@ -47,9 +106,17 @@ pub(crate) enum LocalAccessError {
         root.display()
     )]
     OutsideRoot { path: PathBuf, root: PathBuf },
-    #[error("HACKMD_MCP_WORKSPACE_ROOT ({}) does not exist", root.display())]
+    #[error(
+        "HACKMD_MCP_WORKSPACE_ROOT ({}) did not exist when the server started",
+        root.display()
+    )]
     MissingRoot { root: PathBuf },
-    #[error("local file operation failed")]
+    #[error(
+        "HACKMD_MCP_WORKSPACE_ROOT ({}) was moved or replaced after the server started; restart it",
+        root.display()
+    )]
+    ReplacedRoot { root: PathBuf },
+    #[error("local file operation failed: {0}")]
     Io(#[from] io::Error),
 }
 
@@ -57,7 +124,7 @@ impl LocalFiles {
     pub(crate) fn new(state_dir: PathBuf, root: Option<PathBuf>) -> Self {
         Self {
             state: StateStore::new(state_dir),
-            root,
+            root: root.map(WorkspaceRoot::open),
         }
     }
 
@@ -69,13 +136,9 @@ impl LocalFiles {
         let Some(root) = self.root.as_ref() else {
             return Ok(());
         };
-        let dir = Dir::open_ambient_dir(root, ambient_authority())
-            .map_err(|_| LocalAccessError::MissingRoot { root: root.clone() })?;
-        if dir.metadata(".")?.is_dir() {
-            Ok(())
-        } else {
-            Err(LocalAccessError::MissingRoot { root: root.clone() })
-        }
+        let (_, dir) = root.pinned()?;
+        dir.metadata(".")?;
+        Ok(())
     }
 
     /// Decides whether a caller-supplied path may be read or written.
@@ -85,12 +148,27 @@ impl LocalFiles {
     /// inside that tree: an agent acting on a note that tells it to write
     /// `~/.zshrc` gets an error instead of a shell profile.
     pub(crate) fn allow(&self, path: &Path) -> Result<(), LocalAccessError> {
-        let Some(root) = self.root.as_ref() else {
+        let Some((canonical, _)) = self.root_for(path)? else {
             return Ok(());
         };
+        if resolve_existing_prefix(path).starts_with(canonical) {
+            Ok(())
+        } else {
+            Err(LocalAccessError::OutsideRoot {
+                path: path.to_path_buf(),
+                root: canonical.to_path_buf(),
+            })
+        }
+    }
 
-        // `..` is rejected outright rather than resolved, because the prefix
-        // check below only holds for a path that cannot climb back out.
+    /// The pinned root a caller-supplied path is judged against, or `None`
+    /// when no root is configured. `..` is rejected outright rather than
+    /// resolved, because the prefix checks only hold for a path that cannot
+    /// climb back out.
+    fn root_for(&self, path: &Path) -> Result<Option<(&Path, &Dir)>, LocalAccessError> {
+        let Some(root) = self.root.as_ref() else {
+            return Ok(None);
+        };
         if path
             .components()
             .any(|component| matches!(component, Component::ParentDir))
@@ -99,39 +177,36 @@ impl LocalFiles {
                 path: path.to_path_buf(),
             });
         }
-        let root = std::fs::canonicalize(root)
-            .map_err(|_| LocalAccessError::MissingRoot { root: root.clone() })?;
-        if resolve_existing_prefix(path).starts_with(&root) {
-            Ok(())
-        } else {
-            Err(LocalAccessError::OutsideRoot {
-                path: path.to_path_buf(),
-                root,
-            })
+        root.pinned().map(Some)
+    }
+
+    /// What `path` names, or `None` when nothing is there: one lookup where
+    /// callers would otherwise ask "does it exist" and then "what is it".
+    pub(crate) fn entry(&self, path: &Path) -> Result<Option<Entry>, LocalAccessError> {
+        let is_dir = match self.confined(path)? {
+            Some((dir, relative)) => dir.metadata(relative).map(|metadata| metadata.is_dir()),
+            None => fs::metadata(path).map(|metadata| metadata.is_dir()),
+        };
+        match is_dir {
+            Ok(true) => Ok(Some(Entry::Directory)),
+            Ok(false) => Ok(Some(Entry::Other)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
         }
     }
 
-    pub(crate) fn metadata(&self, path: &Path) -> Result<LocalMetadata, LocalAccessError> {
-        let Some((dir, relative)) = self.confined(path)? else {
-            let metadata = fs::metadata(path)?;
-            return Ok(LocalMetadata {
-                is_file: metadata.is_file(),
-                is_dir: metadata.is_dir(),
-            });
-        };
-        let metadata = dir.metadata(relative)?;
-        Ok(LocalMetadata {
-            is_file: metadata.is_file(),
-            is_dir: metadata.is_dir(),
-        })
-    }
-
-    pub(crate) fn read(&self, path: &Path) -> Result<Vec<u8>, LocalAccessError> {
-        let Some((dir, relative)) = self.confined(path)? else {
-            return Ok(fs::read(path)?);
-        };
+    /// Reads at most `limit` bytes, so a caller that only compares or bounds a
+    /// file never loads more of it than it can use. A result exactly `limit`
+    /// long may be the start of a larger file.
+    pub(crate) fn read_capped(
+        &self,
+        path: &Path,
+        limit: usize,
+    ) -> Result<Vec<u8>, LocalAccessError> {
         let mut bytes = Vec::new();
-        dir.open(relative)?.read_to_end(&mut bytes)?;
+        self.open_read(path)?
+            .take(u64::try_from(limit).unwrap_or(u64::MAX))
+            .read_to_end(&mut bytes)?;
         Ok(bytes)
     }
 
@@ -142,20 +217,13 @@ impl LocalFiles {
         Ok(dir.open(relative)?.into_std())
     }
 
-    pub(crate) fn read_to_string(&self, path: &Path) -> Result<String, LocalAccessError> {
-        String::from_utf8(self.read(path)?).map_err(|error| {
-            LocalAccessError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
-        })
-    }
-
-    pub(crate) fn exists(&self, path: &Path) -> Result<bool, LocalAccessError> {
-        match self.metadata(path) {
-            Ok(_) => Ok(true),
-            Err(LocalAccessError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                Ok(false)
-            }
-            Err(error) => Err(error),
+    /// Removes a file, through the root's capability when one is configured.
+    pub(crate) fn remove_file(&self, path: &Path) -> Result<(), LocalAccessError> {
+        match self.confined(path)? {
+            Some((dir, relative)) => dir.remove_file(relative)?,
+            None => fs::remove_file(path)?,
         }
+        Ok(())
     }
 
     /// Atomically replaces a confined file through a directory capability.
@@ -193,58 +261,65 @@ impl LocalFiles {
             .metadata(&relative)
             .ok()
             .map(|metadata| metadata.permissions());
-        for _ in 0..16 {
-            let temporary = parent.join(format!(
-                ".{}.hackmd-mcp-{:016x}.tmp",
-                file_name.to_string_lossy(),
-                fastrand::u64(..)
-            ));
-            let mut options = cap_std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            let Ok(mut file) = dir.open_with(&temporary, &options) else {
-                continue;
-            };
-            let result = (|| {
-                if let Some(permissions) = existing_permissions.clone() {
-                    file.set_permissions(permissions)?;
-                }
-                file.write_all(contents)?;
-                file.sync_all()?;
-                dir.rename(&temporary, &dir, &relative)
-            })();
-            if let Err(error) = result {
-                let _ = dir.remove_file(&temporary);
-                return Err(LocalAccessError::Io(error));
+
+        // A random 64-bit name, opened create-new: a collision is not a case
+        // worth retrying for, so any failure is reported as itself.
+        let temporary = parent.join(format!(
+            ".{}.hackmd-mcp-{:016x}.tmp",
+            file_name.to_string_lossy(),
+            fastrand::u64(..)
+        ));
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = dir.open_with(&temporary, &options)?;
+        let result = (|| {
+            if let Some(permissions) = existing_permissions {
+                file.set_permissions(permissions)?;
             }
-            return Ok(());
+            file.write_all(contents)?;
+            file.sync_all()?;
+            dir.rename(&temporary, dir, &relative)
+        })();
+        if let Err(error) = result {
+            let _ = dir.remove_file(&temporary);
+            return Err(LocalAccessError::Io(error));
         }
-        Err(LocalAccessError::Io(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate an atomic temporary file",
-        )))
+        Ok(())
     }
 
-    fn confined(&self, path: &Path) -> Result<Option<(Dir, PathBuf)>, LocalAccessError> {
-        let Some(root) = self.root.as_ref() else {
+    /// The pinned root and `path` relative to it.
+    fn confined(&self, path: &Path) -> Result<Option<(&Dir, PathBuf)>, LocalAccessError> {
+        let Some((canonical, dir)) = self.root_for(path)? else {
             return Ok(None);
         };
-        if path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
+
+        // Judged by where the parent really is, the same way `allow` judges it,
+        // so every spelling `allow` accepts works here too. The final component
+        // stays unresolved: a symlink there is the capability's to follow or
+        // replace, not ours.
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+            && let Ok(relative) = resolve_existing_prefix(parent)
+                .join(name)
+                .strip_prefix(canonical)
         {
-            return Err(LocalAccessError::Traversal {
-                path: path.to_path_buf(),
-            });
+            let relative = if relative.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                relative.to_path_buf()
+            };
+            return Ok(Some((dir, relative)));
         }
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| LocalAccessError::OutsideRoot {
-                path: path.to_path_buf(),
-                root: root.clone(),
-            })?;
-        let dir = Dir::open_ambient_dir(root, ambient_authority())
-            .map_err(|_| LocalAccessError::MissingRoot { root: root.clone() })?;
-        Ok(Some((dir, relative.to_path_buf())))
+
+        // The root itself is a valid target too, for instance as a parent
+        // checked before a note is written into it. Spelled through a symlink,
+        // only resolving the whole path recognizes it.
+        if resolve_existing_prefix(path) == canonical {
+            return Ok(Some((dir, PathBuf::from("."))));
+        }
+        Err(LocalAccessError::OutsideRoot {
+            path: path.to_path_buf(),
+            root: canonical.to_path_buf(),
+        })
     }
 }
 
@@ -358,8 +433,8 @@ mod tests {
 
         let files = LocalFiles::new(directory.path().join("state"), Some(root));
         for _ in 0..500 {
-            if let Ok(contents) = files.read_to_string(&link.join("note.md")) {
-                assert_eq!(contents, "inside");
+            if let Ok(contents) = files.read_capped(&link.join("note.md"), 64) {
+                assert_eq!(contents, b"inside");
             }
             let _ = files.write_atomic(&link.join("written.md"), b"confined", false);
         }
@@ -371,6 +446,59 @@ mod tests {
             "outside-secret"
         );
         assert!(!outside.join("written.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_accepts_both_spellings_of_a_path() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let real = directory.path().join("real");
+        fs::create_dir(&real).expect("real root should create");
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("root symlink should create");
+        let files = LocalFiles::new(directory.path().join("state"), Some(link.clone()));
+
+        for root in [&link, &real] {
+            assert_eq!(
+                files
+                    .entry(root)
+                    .expect("either spelling of the root itself resolves"),
+                Some(super::Entry::Directory)
+            );
+        }
+        for path in [link.join("a.md"), real.join("b.md")] {
+            files
+                .allow(&path)
+                .expect("either spelling is inside the root");
+            files
+                .write_atomic(&path, b"body", false)
+                .expect("either spelling writes through the pinned root");
+        }
+        assert_eq!(
+            fs::read_to_string(real.join("a.md")).expect("write should land"),
+            "body"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_replaced_after_startup_is_refused() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let root = directory.path().join("notes");
+        fs::create_dir(&root).expect("root should create");
+        let files = LocalFiles::new(directory.path().join("state"), Some(root.clone()));
+        assert!(files.allow(&root.join("note.md")).is_ok());
+
+        fs::rename(&root, directory.path().join("moved")).expect("root should move");
+        fs::create_dir(&root).expect("replacement root should create");
+        assert!(matches!(
+            files.allow(&root.join("note.md")),
+            Err(LocalAccessError::ReplacedRoot { .. })
+        ));
+        assert!(matches!(
+            files.write_atomic(&root.join("note.md"), b"body", false),
+            Err(LocalAccessError::ReplacedRoot { .. })
+        ));
     }
 
     #[test]

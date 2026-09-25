@@ -113,7 +113,7 @@ fn self_check_prints_json_and_exits_before_transport_startup() {
     assert_eq!(report["api_origin"], "https://api.hackmd.io");
     assert_eq!(report["state_directory"]["writable"], true);
     assert_eq!(report["workspace_root"]["configured"], false);
-    assert_eq!(report["workspace_root"]["confined"], false);
+    assert!(report["workspace_root"].get("confined").is_none());
     assert!(report.get("api_probe").is_none());
 }
 

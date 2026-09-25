@@ -1,21 +1,18 @@
-//! Account and workspace discovery tools.
+//! Account and workspace discovery.
 
 use rmcp::{handler::server::wrapper::Parameters, schemars, tool, tool_router};
 use serde::Deserialize;
 
 use super::HackmdServer;
-use crate::{
-    dto::{ProfileResponse, TeamResponse},
-    reply,
-};
+use crate::{client::HackmdError, dto::ProfileResponse, reply};
 
 #[tool_router(router = account_router, vis = "pub(crate)")]
 impl HackmdServer {
     #[tool(
         name = "hackmd_get_me",
-        description = "Get the authenticated HackMD profile, including userPath for resolving personal note URLs.",
+        description = "Get the authenticated HackMD profile and its teams. Use user_path to recognize personal @owner/slug URLs, and pass a team's path as team_path to work in that team.",
         annotations(
-            title = "Get HackMD Profile",
+            title = "Get HackMD Profile and Teams",
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -26,45 +23,34 @@ impl HackmdServer {
         &self,
         Parameters(EmptyInput {}): Parameters<EmptyInput>,
     ) -> rmcp::model::CallToolResult {
-        match self.client.get_me().await {
+        match self.account().await {
             Ok(profile) => profile_result(&profile),
-            Err(error) => error.into(),
+            Err(error) => reply::error(error.to_string()),
         }
     }
+}
 
-    #[tool(
-        name = "hackmd_list_teams",
-        description = "List teams available to the authenticated HackMD account. Use each returned path as workspace.team_path.",
-        annotations(
-            title = "List HackMD Teams",
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
-        )
-    )]
-    pub(crate) async fn list_teams(
-        &self,
-        Parameters(EmptyInput {}): Parameters<EmptyInput>,
-    ) -> rmcp::model::CallToolResult {
-        match self.client.list_teams().await {
-            Ok(teams) => teams_result(&teams),
-            Err(error) => error.into(),
+impl HackmdServer {
+    /// The profile with its teams filled in. `/me` may carry them already; when
+    /// it does not, one `/teams` request supplies them. Both are fetched fresh:
+    /// this is the call an agent makes to see the account as it is now.
+    async fn account(&self) -> Result<ProfileResponse, HackmdError> {
+        let mut profile = self.client.get_me().await?;
+        if profile.teams.is_empty() {
+            profile.teams = self.client.list_teams(true).await?.to_vec();
         }
+        Ok(profile)
     }
 }
 
 pub(crate) fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
     let summary = format!(
-        "Authenticated as {} (userPath: {})",
-        profile.name, profile.user_path
+        "Authenticated as {} (user_path: {}); {} team(s)",
+        profile.name,
+        profile.user_path,
+        profile.teams.len()
     );
-    reply::success(summary, serde_json::json!({"profile": profile}))
-}
-
-pub(crate) fn teams_result(teams: &[TeamResponse]) -> rmcp::model::CallToolResult {
-    let summary = format!("Found {} HackMD team(s)", teams.len());
-    reply::success(summary, serde_json::json!({"teams": teams}))
+    reply::structured(summary, profile)
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

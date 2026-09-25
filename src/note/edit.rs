@@ -12,27 +12,33 @@ use crate::{
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EditNoteInput {
-    /// Workspace used for a direct internal note ID; scoped URLs resolve their
-    /// own workspace.
-    #[serde(default)]
+    /// Team path (from `hackmd_get_me`) when a direct internal note ID belongs
+    /// to a team; omit for personal notes. `@owner/slug` URLs name their own
+    /// workspace.
+    #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
     /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
     pub(crate) note_ref: String,
-    /// Bypass cached note lists when resolving an `@owner/slug` URL.
+    /// Bypass the 60-second account and note-list caches when resolving an
+    /// `@owner/slug` URL.
     #[serde(default)]
     pub(crate) refresh: bool,
-    /// Codex patch envelope targeting the exact `patch_path` from
-    /// `hackmd_get_note`.
+    /// One patch envelope: `*** Begin Patch`, `*** Update File: <patch_path
+    /// from hackmd_get_note>`, then hunks each opened by `@@` whose lines start
+    /// with ` ` (context), `-` (remove), or `+` (add), then `*** End Patch`.
+    /// Context plus removed lines must match the current body exactly once.
     pub(crate) patch: String,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct EditNoteOutput {
+    #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
     pub(crate) note_id: String,
     pub(crate) patch_path: String,
     pub(crate) changed: bool,
-    pub(crate) content: String,
+    /// Size of the body now stored; `hackmd_get_note` returns the body itself.
+    pub(crate) bytes: usize,
 }
 
 #[derive(Debug, Error)]
@@ -92,7 +98,7 @@ pub(crate) async fn edit_note(
         note_id: note.note_id,
         patch_path,
         changed,
-        content: updated,
+        bytes: updated.len(),
     }))
 }
 
@@ -162,7 +168,7 @@ mod tests {
             .expect("edit should succeed")
             .expect("reference should resolve");
         assert!(output.changed);
-        assert_eq!(output.content, "new\n");
+        assert_eq!(output.bytes, "new\n".len());
         server.finish();
     }
 

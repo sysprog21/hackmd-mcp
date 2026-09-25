@@ -25,6 +25,7 @@ pub(crate) struct ListTrackedNotesInput {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct TrackedNoteSummary {
+    #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
     pub(crate) note_id: String,
     pub(crate) local_path: PathBuf,
@@ -42,7 +43,9 @@ pub(crate) struct ListTrackedNotesOutput {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct UntrackNoteInput {
-    #[serde(default)]
+    /// Team path (from `hackmd_get_me`) of a team workspace; omit for the
+    /// personal workspace.
+    #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
     /// Internal `HackMD` note ID shown by `hackmd_list_tracked_notes`.
     pub(crate) note_id: String,
@@ -53,11 +56,11 @@ pub(crate) struct UntrackNoteInput {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct UntrackNoteOutput {
+    #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
     pub(crate) note_id: String,
+    /// The Markdown file the record pointed at, left exactly as it was.
     pub(crate) local_path: PathBuf,
-    pub(crate) untracked: bool,
-    pub(crate) local_file_changed: bool,
 }
 
 #[derive(Debug, Error)]
@@ -90,10 +93,7 @@ pub(crate) fn list_tracked_notes(
         })
         .collect::<Vec<_>>();
     notes.sort_by(|left, right| {
-        left.workspace
-            .to_string()
-            .cmp(&right.workspace.to_string())
-            .then_with(|| left.note_id.cmp(&right.note_id))
+        (&left.workspace, &left.note_id).cmp(&(&right.workspace, &right.note_id))
     });
     let (notes, meta) = paginate(notes, input.offset, input.limit);
     Ok(ListTrackedNotesOutput { meta, notes })
@@ -114,8 +114,6 @@ pub(crate) fn untrack_note(
         workspace: state.workspace,
         note_id: state.internal_id,
         local_path: state.local_path,
-        untracked: true,
-        local_file_changed: false,
     })
 }
 
@@ -195,8 +193,7 @@ mod tests {
             },
         )
         .expect("confirmed untrack should succeed");
-        assert!(output.untracked);
-        assert!(!output.local_file_changed);
+        assert_eq!(output.local_path, local_path);
         assert_eq!(
             fs::read_to_string(&local_path).expect("Markdown should remain"),
             "baseline"
@@ -233,8 +230,7 @@ mod tests {
             },
         )
         .expect("stale state should remain removable");
-        assert!(output.untracked);
-        assert!(!output.local_file_changed);
+        assert_eq!(output.note_id, "note-id");
     }
 
     #[test]

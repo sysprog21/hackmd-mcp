@@ -3,7 +3,6 @@
 pub(crate) mod crud;
 pub(crate) mod edit;
 pub(crate) mod get;
-pub(crate) mod history;
 pub(crate) mod image;
 pub(crate) mod list;
 pub(crate) mod patch;

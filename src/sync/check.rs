@@ -8,12 +8,13 @@ use crate::{
     client::{HackmdClient, HackmdError},
     local::{LocalAccessError, LocalFiles},
     sync::state::{StateError, body_digest, body_hash_from_digest, timestamp_text},
-    sync::{ChangeState, classify_changes},
+    sync::{ChangeState, LocalBodyError, classify_changes, read_local_body},
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CheckNoteSyncInput {
+    /// Absolute path of a Markdown file tracked by `hackmd_pull_note`.
     pub(crate) local_path: PathBuf,
 }
 
@@ -44,8 +45,8 @@ pub(crate) enum CheckNoteSyncError {
     Access(#[from] LocalAccessError),
     #[error("local_path must be absolute")]
     RelativePath,
-    #[error("local Markdown file could not be read")]
-    LocalRead,
+    #[error(transparent)]
+    LocalBody(#[from] LocalBodyError),
     #[error("remote note {note_id} has no Markdown content")]
     MissingRemoteContent { note_id: String },
     #[error(transparent)]
@@ -63,10 +64,10 @@ pub(crate) async fn check_note_sync(
         return Err(CheckNoteSyncError::RelativePath);
     }
     files.allow(&input.local_path)?;
-    let local = files
-        .read_to_string(&input.local_path)
-        .map_err(|_| CheckNoteSyncError::LocalRead)?;
+    // The record first: an untracked path fails before its file is read.
     let tracked = files.state().load_for_local_path(&input.local_path)?;
+    // Only looking needs no large-file confirmation, but the maximum holds.
+    let local = read_local_body(files, &input.local_path, true)?;
     let remote_note = client
         .get_note(&tracked.state.workspace, &tracked.state.internal_id)
         .await?;

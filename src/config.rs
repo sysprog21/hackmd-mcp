@@ -28,6 +28,11 @@ const SUPPORTED_ENV_KEYS: [&str; 4] = [
     "HACKMD_MCP_WORKSPACE_ROOT",
 ];
 
+/// Parsed from a working-directory `.env` but never honored there. The state
+/// directory holds full private note bodies, and a `.env` shipped in someone
+/// else's repository could otherwise have them written into its own tree.
+const ENVIRONMENT_ONLY_KEY: &str = "HACKMD_MCP_STATE_DIR";
+
 /// Application configuration loaded from the local process environment.
 #[derive(Debug)]
 pub(crate) struct Config {
@@ -43,10 +48,15 @@ pub(crate) struct Config {
 
 impl Config {
     pub(crate) fn from_env() -> Result<Self, ConfigError> {
-        let dotenv = std::env::current_dir()
+        let mut dotenv = std::env::current_dir()
             .ok()
             .map(|directory| load_dotenv(&directory.join(".env")))
             .unwrap_or_default();
+        if dotenv.remove(ENVIRONMENT_ONLY_KEY).is_some() {
+            tracing::warn!(
+                "the working-directory .env sets {ENVIRONMENT_ONLY_KEY}, which is honored only from the environment; tracked notes elsewhere will look untracked"
+            );
+        }
         let inherited = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
 
         // The working directory is often someone else's repository. A `.env`
@@ -320,11 +330,14 @@ fn parse_dotenv_line(line: &str) -> Option<(String, String)> {
 
 fn parse_dotenv_value(raw: &str) -> Option<String> {
     let value = raw.trim();
-    if let Some(quoted) = value.strip_prefix('"') {
-        return quoted.strip_suffix('"').map(str::to_owned);
-    }
-    if let Some(quoted) = value.strip_prefix('\'') {
-        return quoted.strip_suffix('\'').map(str::to_owned);
+    for quote in ['"', '\''] {
+        if let Some(quoted) = value.strip_prefix(quote) {
+            // A quoted value may still carry a trailing comment after the
+            // closing quote; anything else after it makes the line malformed.
+            let (inner, rest) = quoted.split_once(quote)?;
+            let rest = rest.trim_start();
+            return (rest.is_empty() || rest.starts_with('#')).then(|| inner.to_owned());
+        }
     }
 
     let value = value
@@ -518,6 +531,12 @@ mod tests {
             parse_dotenv_line("export HACKMD_API_TOKEN='quoted token'"),
             Some(("HACKMD_API_TOKEN".to_owned(), "quoted token".to_owned()))
         );
+        assert_eq!(
+            parse_dotenv_line(r#"HACKMD_API_TOKEN="quoted token" # personal"#),
+            Some(("HACKMD_API_TOKEN".to_owned(), "quoted token".to_owned()))
+        );
+        assert_eq!(parse_dotenv_line(r#"HACKMD_API_TOKEN="open"#), None);
+        assert_eq!(parse_dotenv_line(r#"HACKMD_API_TOKEN="a" b"#), None);
         assert_eq!(parse_dotenv_line("UNRELATED_SECRET=ignore-me"), None);
         assert_eq!(parse_dotenv_line("# HACKMD_API_TOKEN=commented"), None);
         assert_eq!(parse_dotenv_line("malformed"), None);

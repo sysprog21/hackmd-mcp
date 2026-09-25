@@ -13,8 +13,8 @@ use crate::{
     local::{LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
-    sync::state::{StateError, TrackedNoteState, body_digest},
-    sync::{BODY_MAX_BYTES, BODY_WARNING_BYTES, ChangeState, classify_changes},
+    sync::state::{StateError, TrackedNoteState, body_digest, body_hash, body_hash_from_digest},
+    sync::{BODY_MAX_BYTES, ChangeState, LocalBodyError, classify_changes, read_local_body},
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
@@ -27,18 +27,36 @@ pub(crate) enum PushStrategy {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PushNoteInput {
-    #[serde(default)]
+    /// Absolute path of a Markdown file tracked by an earlier
+    /// `hackmd_pull_note`. Its sync record names the note to push to.
+    pub(crate) local_path: PathBuf,
+    /// Optional cross-check: when given, the push is refused unless this
+    /// reference resolves to the note the sync record names. Omit it to save
+    /// the lookup.
+    pub(crate) note_ref: Option<String>,
+    /// Team path (from `hackmd_get_me`) for a direct internal `note_ref`.
+    /// Omitted, the tracked note's own workspace is assumed; `@owner/slug`
+    /// URLs name their own.
+    #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
-    pub(crate) note_ref: String,
-    /// Bypass cached note lists when resolving an `@owner/slug` URL.
+    /// Bypass the 60-second account and note-list caches when resolving an
+    /// `@owner/slug` `note_ref`.
     #[serde(default)]
     pub(crate) refresh: bool,
-    pub(crate) local_path: PathBuf,
+    /// `safe` (default) writes only when the remote still matches the
+    /// baseline; `overwrite` replaces the remote body unconditionally.
     #[serde(default = "default_strategy")]
     #[schemars(default = "default_strategy")]
     pub(crate) strategy: PushStrategy,
+    /// Required with `strategy: overwrite`.
     #[serde(default)]
     pub(crate) confirm: bool,
+    /// After merging a conflict: the `remote_body_hash` that conflict
+    /// reported. The safe push then writes the merged file only if the remote
+    /// is still exactly the body that was merged, and conflicts again if it
+    /// changed since.
+    pub(crate) expected_remote_hash: Option<String>,
+    /// Required to push a file above 5 MiB.
     #[serde(default)]
     pub(crate) confirm_large_file: bool,
 }
@@ -59,16 +77,24 @@ pub(crate) enum PushStatus {
 #[derive(Debug, Serialize)]
 pub(crate) struct PushNoteOutput {
     pub(crate) status: PushStatus,
+    #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
     pub(crate) note_id: String,
     pub(crate) local_path: PathBuf,
     pub(crate) baseline_path: PathBuf,
-    pub(crate) pushed: bool,
-    pub(crate) merge_required: bool,
+    /// On a conflict, the hash to pass back as `expected_remote_hash` once
+    /// the snapshot has been merged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_body_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) diff_summary: Option<String>,
+    /// On a conflict, the sibling `*.remote.md` just written with the current
+    /// remote body, so both sides can be merged without another request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) snapshot_path: Option<PathBuf>,
+    /// Why no snapshot was written on a conflict, when one could not be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) snapshot_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) instructions: Option<String>,
 }
@@ -79,18 +105,11 @@ pub(crate) enum PushNoteError {
     Access(#[from] LocalAccessError),
     #[error("local_path must be absolute")]
     RelativePath,
-    #[error("local_path must be a readable regular file")]
-    InvalidLocalFile,
+    #[error(transparent)]
+    LocalBody(#[from] LocalBodyError),
     #[error("overwrite strategy requires confirm: true")]
     OverwriteConfirmationRequired,
-    #[error("local file is {size_bytes} bytes; retry with confirm_large_file: true")]
-    LargeFileConfirmationRequired { size_bytes: usize },
-    #[error(
-        "local file is {size_bytes} bytes; files above {} MiB are refused",
-        BODY_MAX_BYTES / 1024 / 1024
-    )]
-    TooLarge { size_bytes: usize },
-    #[error("note_ref/workspace resolves to a different note than the local sync sidecar")]
+    #[error("note_ref resolves to a different note than the one local_path was pulled from")]
     TrackingMismatch,
     #[error("remote note {note_id} has no Markdown content")]
     MissingRemoteContent { note_id: String },
@@ -104,8 +123,11 @@ pub(crate) enum PushNoteError {
         #[source]
         source: Box<StateError>,
     },
-    #[error("local file I/O failed")]
-    LocalIo(#[source] std::io::Error),
+    #[error(
+        "{} exists and is not the snapshot this tool last wrote, so it was left alone; move it to get a fresh snapshot",
+        path.display()
+    )]
+    SnapshotNotOurs { path: PathBuf },
     #[error(transparent)]
     Reference(#[from] NoteRefError),
     #[error(transparent)]
@@ -125,24 +147,36 @@ pub(crate) async fn push_note(
     files.allow(&input.local_path)?;
     let local = validate_and_read_local(files, &input)?;
     let tracked = files.state().load_for_local_path(&input.local_path)?;
-    let resolution = crate::note::reference::resolve_note_ref(
-        client,
-        input.workspace.clone(),
-        &input.note_ref,
-        input.refresh,
-    )
-    .await?;
-    let NoteResolution::Resolved { note } = resolution else {
-        return Ok(Err(resolution));
+    let note = crate::note::reference::ResolvedNoteRef {
+        workspace: tracked.state.workspace.clone(),
+        note_id: tracked.state.internal_id.clone(),
     };
-    if note.note_id != tracked.state.internal_id || note.workspace != tracked.state.workspace {
-        return Err(PushNoteError::TrackingMismatch);
+    if let Some(note_ref) = input.note_ref.as_deref() {
+        // A bare note ID without team_path is read in the tracked note's own
+        // workspace: the cross-check is about which note, and omitting
+        // team_path should not make a team note look like a different one.
+        let workspace = match input.workspace {
+            Workspace::Personal => note.workspace.clone(),
+            team @ Workspace::Team { .. } => team,
+        };
+        let resolution =
+            crate::note::reference::resolve_note_ref(client, workspace, note_ref, input.refresh)
+                .await?;
+        let NoteResolution::Resolved { note: named } = resolution else {
+            return Ok(Err(resolution));
+        };
+        if named != note {
+            return Err(PushNoteError::TrackingMismatch);
+        }
     }
     let remote_note = client.get_note(&note.workspace, &note.note_id).await?;
     push_resolved(
         client,
         files,
-        input.strategy,
+        Guard {
+            strategy: input.strategy,
+            expected_remote_hash: input.expected_remote_hash.as_deref(),
+        },
         tracked,
         note,
         remote_note,
@@ -158,33 +192,17 @@ fn validate_and_read_local(
     if matches!(input.strategy, PushStrategy::Overwrite) && !input.confirm {
         return Err(PushNoteError::OverwriteConfirmationRequired);
     }
-    let metadata = files
-        .metadata(&input.local_path)
-        .map_err(|_| PushNoteError::InvalidLocalFile)?;
-    if !metadata.is_file() {
-        return Err(PushNoteError::InvalidLocalFile);
-    }
-    let local = files
-        .read_to_string(&input.local_path)
-        .map_err(|error| PushNoteError::LocalIo(std::io::Error::other(error)))?;
-    validate_body_size(local.len(), input.confirm_large_file)?;
-    Ok(local)
-}
-
-fn validate_body_size(size_bytes: usize, confirmed: bool) -> Result<(), PushNoteError> {
-    if size_bytes > BODY_MAX_BYTES {
-        return Err(PushNoteError::TooLarge { size_bytes });
-    }
-    if size_bytes > BODY_WARNING_BYTES && !confirmed {
-        return Err(PushNoteError::LargeFileConfirmationRequired { size_bytes });
-    }
-    Ok(())
+    Ok(read_local_body(
+        files,
+        &input.local_path,
+        input.confirm_large_file,
+    )?)
 }
 
 async fn push_resolved(
     client: &HackmdClient,
     files: &LocalFiles,
-    strategy: PushStrategy,
+    guard: Guard<'_>,
     tracked: crate::sync::state::LoadedTrackedState,
     note: crate::note::reference::ResolvedNoteRef,
     remote_note: crate::dto::NoteResponse,
@@ -198,39 +216,64 @@ async fn push_resolved(
         })?;
 
     // Every result reports the tracked canonical path, not the caller's
-    // spelling of it, so the snapshot path here is the one
-    // hackmd_save_remote_snapshot would write.
+    // spelling of it, and the conflict snapshot is written beside that path.
     let target = Target {
         workspace: &note.workspace,
         note_id: &note.note_id,
         local_path: &tracked.state.local_path,
         baseline_path: &tracked.baseline_path,
     };
-    if matches!(strategy, PushStrategy::Safe) {
-        let change = classify_changes(
-            &tracked.baseline_digest,
-            &body_digest(&local),
-            &body_digest(&remote),
-        );
-        match change {
+    if matches!(guard.strategy, PushStrategy::Safe) {
+        let local_digest = body_digest(&local);
+        let remote_digest = body_digest(&remote);
+        let remote_hash = body_hash_from_digest(&remote_digest);
+
+        // Always judged against the recorded baseline first, so a remote-only
+        // change is never mistaken for a local one, whatever hash is supplied.
+        match classify_changes(&tracked.baseline_digest, &local_digest, &remote_digest) {
             ChangeState::InSync => {
-                return Ok(Ok(output(&target, PushStatus::NothingToPush, false)));
+                return Ok(Ok(output(&target, PushStatus::NothingToPush)));
             }
+
+            // Both sides changed to the same body, as after identical edits or
+            // a merge that settled on the remote: nothing to write, but the
+            // baseline moves there, or the next check reports a conflict.
+            ChangeState::Conflict if local_digest == remote_digest => {
+                let result = output(&target, PushStatus::NothingToPush);
+                advance_state(files, tracked.state, &local, remote_timestamp)?;
+                return Ok(Ok(result));
+            }
+
+            // A merge built against exactly this remote body may replace it.
+            // Anything newer on the remote is still a conflict below.
+            ChangeState::Conflict if guard.expected_remote_hash == Some(remote_hash.as_str()) => {}
             ChangeState::RemoteOnly => {
-                return Ok(Ok(output(&target, PushStatus::RemoteChanged, false)));
+                return Ok(Ok(PushNoteOutput {
+                    instructions: Some(REMOTE_CHANGED_INSTRUCTIONS.to_owned()),
+                    ..output(&target, PushStatus::RemoteChanged)
+                }));
             }
             ChangeState::Conflict => {
-                return Ok(Ok(conflict_output(
-                    &target,
-                    &tracked.baseline_body,
-                    &local,
-                    &remote,
-                )));
+                // The conflict is the result; a snapshot that cannot be saved
+                // is reported beside it rather than replacing it with an error.
+                let (snapshot_path, snapshot_error) =
+                    match write_snapshot(files, tracked.state.clone(), &remote, &remote_hash) {
+                        Ok(path) => (Some(path), None),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
+                return Ok(Ok(PushNoteOutput {
+                    remote_body_hash: Some(remote_hash),
+                    diff_summary: Some(conflict_diff(&tracked.baseline_body, &local, &remote)),
+                    snapshot_path,
+                    snapshot_error,
+                    instructions: Some(CONFLICT_INSTRUCTIONS.to_owned()),
+                    ..output(&target, PushStatus::Conflict)
+                }));
             }
             ChangeState::LocalOnly => {}
         }
     } else if remote == local {
-        let result = output(&target, PushStatus::NothingToPush, false);
+        let result = output(&target, PushStatus::NothingToPush);
         advance_state(files, tracked.state, &local, remote_timestamp)?;
         return Ok(Ok(result));
     }
@@ -247,7 +290,7 @@ async fn push_resolved(
             note_id: note.note_id,
         });
     }
-    let result = output(&target, PushStatus::Pushed, true);
+    let result = output(&target, PushStatus::Pushed);
     advance_state(files, tracked.state, &local, readback.value.last_changed_at).map_err(
         |source| PushNoteError::StatePersistenceAfterWrite {
             note_id: note.note_id,
@@ -255,6 +298,14 @@ async fn push_resolved(
         },
     )?;
     Ok(Ok(result))
+}
+
+/// What a push may overwrite: the strategy, and for a safe push the remote
+/// body a merge was built from.
+#[derive(Clone, Copy)]
+struct Guard<'a> {
+    strategy: PushStrategy,
+    expected_remote_hash: Option<&'a str>,
 }
 
 /// The note and the two files every push result names, borrowed once so the
@@ -266,38 +317,56 @@ struct Target<'a> {
     baseline_path: &'a Path,
 }
 
-fn output(target: &Target<'_>, status: PushStatus, pushed: bool) -> PushNoteOutput {
+fn output(target: &Target<'_>, status: PushStatus) -> PushNoteOutput {
     PushNoteOutput {
         status,
         workspace: target.workspace.clone(),
         note_id: target.note_id.to_owned(),
         local_path: target.local_path.to_path_buf(),
         baseline_path: target.baseline_path.to_path_buf(),
-        pushed,
-        merge_required: false,
+        remote_body_hash: None,
         diff_summary: None,
         snapshot_path: None,
+        snapshot_error: None,
         instructions: None,
     }
 }
 
-fn conflict_output(
-    target: &Target<'_>,
-    baseline: &str,
-    local: &str,
+const REMOTE_CHANGED_INSTRUCTIONS: &str = "Only the remote changed since the last sync; hackmd_pull_note with overwrite_local: true brings the local file up to date.";
+
+const CONFLICT_INSTRUCTIONS: &str = "Both sides changed since the last sync. Merge snapshot_path (the current remote body) into local_path, then push again with expected_remote_hash set to remote_body_hash; that push writes only if the remote has not changed again. Do not use strategy: overwrite until the merge is reviewed.";
+
+/// Saves the remote body as `<name>.remote.md` beside the working file, and
+/// records its hash so the next conflict knows the file is its own. An
+/// existing file is replaced only while it still has the recorded content: a
+/// file the user wrote, or edited while merging, is never overwritten.
+fn write_snapshot(
+    files: &LocalFiles,
+    mut state: TrackedNoteState,
     remote: &str,
-) -> PushNoteOutput {
-    let candidate_snapshot = target.local_path.with_extension("remote.md");
-    PushNoteOutput {
-        merge_required: true,
-        diff_summary: Some(conflict_diff(baseline, local, remote)),
-        snapshot_path: candidate_snapshot.exists().then_some(candidate_snapshot),
-        instructions: Some(
-            "Merge the local and remote changes; call hackmd_save_remote_snapshot with local_path to save the current remote body. Do not overwrite until the merge is reviewed."
-                .to_owned(),
-        ),
-        ..output(target, PushStatus::Conflict, false)
+    remote_hash: &str,
+) -> Result<PathBuf, PushNoteError> {
+    let snapshot_path = state.local_path.with_extension("remote.md");
+    files.allow(&snapshot_path)?;
+    if files.entry(&snapshot_path)?.is_some() {
+        let existing = files.read_capped(&snapshot_path, BODY_MAX_BYTES + 1)?;
+        let ours = std::str::from_utf8(&existing).ok().map(body_hash);
+        if ours.is_none() || ours != state.remote_snapshot_hash {
+            return Err(PushNoteError::SnapshotNotOurs {
+                path: snapshot_path,
+            });
+        }
     }
+    files.write_atomic(&snapshot_path, remote.as_bytes(), false)?;
+    state.remote_snapshot_hash = Some(remote_hash.to_owned());
+
+    // A snapshot whose hash never reached the record would read as someone
+    // else's file from the next conflict on, so it does not stay behind.
+    if let Err(error) = files.state().update_sidecar(&state) {
+        let _ = files.remove_file(&snapshot_path);
+        return Err(error.into());
+    }
+    Ok(snapshot_path)
 }
 
 fn conflict_diff(baseline: &str, local: &str, remote: &str) -> String {
@@ -409,24 +478,25 @@ mod tests {
 
     use super::{
         PushNoteError, PushNoteInput, PushStatus, PushStrategy, conflict_diff, push_note,
-        push_resolved, validate_body_size,
+        push_resolved,
     };
     use crate::{
         client::HackmdClient,
         config::Config,
         fixture::{Scenario, SequenceServer},
         models::Workspace,
-        sync::{BODY_MAX_BYTES, BODY_WARNING_BYTES},
+        sync::BODY_MAX_BYTES,
     };
 
     fn input(path: &Path, strategy: PushStrategy, confirm: bool) -> PushNoteInput {
         PushNoteInput {
-            workspace: Workspace::Personal,
-            note_ref: "note-id".to_owned(),
-            refresh: false,
             local_path: path.to_path_buf(),
+            note_ref: None,
+            workspace: Workspace::Personal,
+            refresh: false,
             strategy,
             confirm,
+            expected_remote_hash: None,
             confirm_large_file: false,
         }
     }
@@ -493,7 +563,10 @@ mod tests {
         let result = push_resolved(
             &fixture.client(),
             &files,
-            PushStrategy::Safe,
+            super::Guard {
+                strategy: PushStrategy::Safe,
+                expected_remote_hash: None,
+            },
             tracked,
             crate::note::reference::ResolvedNoteRef {
                 workspace: Workspace::Personal,
@@ -534,7 +607,10 @@ mod tests {
         let result = push_resolved(
             &fixture.client_without_retry("fixture-token"),
             &files,
-            PushStrategy::Safe,
+            super::Guard {
+                strategy: PushStrategy::Safe,
+                expected_remote_hash: None,
+            },
             tracked,
             crate::note::reference::ResolvedNoteRef {
                 workspace: Workspace::Personal,
@@ -596,7 +672,6 @@ mod tests {
         .expect("safe push should succeed")
         .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::Pushed);
-        assert!(output.pushed);
         fixture.finish();
         let loaded = files
             .state()
@@ -608,48 +683,196 @@ mod tests {
 
     #[tokio::test]
     async fn safe_push_reports_conflict_without_patch() {
+        const REMOTE: &str = r#"{"id":"note-id","title":"Note","content":"remote edit"}"#;
+        const NEWER: &str = r#"{"id":"note-id","title":"Note","content":"newer remote"}"#;
         let directory = tempfile::tempdir().expect("temp directory should create");
         let local_path = directory.path().join("note.md");
+        let snapshot = local_path.with_extension("remote.md");
         fs::write(&local_path, "local edit").expect("local fixture should write");
-        fs::write(local_path.with_extension("remote.md"), "prior snapshot")
-            .expect("snapshot fixture should write");
-        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
-            "GET",
-            "/v1/notes/note-id",
-            200,
-            r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
-        )]);
+        fs::write(&snapshot, "user notes").expect("unrelated file should write");
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/notes/note-id", 200, REMOTE),
+            Scenario::new("GET", "/v1/notes/note-id", 200, REMOTE),
+            Scenario::new("GET", "/v1/notes/note-id", 200, NEWER),
+        ]);
         let client = fixture.client();
         let files =
             crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
-        let output = push_note(
-            &client,
-            &files,
-            input(&local_path, PushStrategy::Safe, false),
-        )
-        .await
-        .expect("comparison should succeed")
-        .expect("direct note should resolve");
+        let push = || {
+            push_note(
+                &client,
+                &files,
+                input(&local_path, PushStrategy::Safe, false),
+            )
+        };
+
+        // A file this tool did not write is left alone, and the conflict is
+        // still reported in full.
+        let output = push()
+            .await
+            .expect("comparison should succeed")
+            .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::Conflict);
-        assert!(!output.pushed);
         assert!(
             output
                 .baseline_path
                 .ends_with("personal--note-id.baseline.md")
         );
         assert_eq!(output.local_path, local_path);
-        assert!(output.merge_required);
-        assert!(output.snapshot_path.is_some());
-        assert!(
-            output
-                .instructions
-                .as_deref()
-                .expect("instructions should exist")
-                .contains("hackmd_save_remote_snapshot")
+        assert!(output.snapshot_path.is_none());
+        assert!(output.snapshot_error.is_some());
+        assert_eq!(
+            fs::read_to_string(&snapshot).expect("user file should read"),
+            "user notes"
         );
         let diff = output.diff_summary.expect("diff summary should exist");
         assert!(diff.contains("LOCAL CHANGES"));
         assert!(diff.contains("REMOTE CHANGES"));
+
+        // Once it is gone, the conflict writes its own snapshot, and a later
+        // conflict may replace that one.
+        fs::remove_file(&snapshot).expect("user file should remove");
+        for expected in ["remote edit", "newer remote"] {
+            let output = push()
+                .await
+                .expect("comparison should succeed")
+                .expect("direct note should resolve");
+            assert_eq!(
+                output.snapshot_path.as_deref(),
+                Some(snapshot.as_path()),
+                "{:?}",
+                output.snapshot_error
+            );
+            assert_eq!(
+                fs::read_to_string(&snapshot).expect("snapshot should read"),
+                expected
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&local_path).expect("local should read"),
+            "local edit"
+        );
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn a_merged_push_writes_only_against_the_remote_it_merged() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "local edit").expect("local fixture should write");
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, "")
+                .expect_body("the merged body", |body| body == r#"{"content":"merged"}"#),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"merged","lastChangedAt":4}"#,
+            ),
+        ]);
+        let client = fixture.client();
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+
+        let conflict = push_note(
+            &client,
+            &files,
+            input(&local_path, PushStrategy::Safe, false),
+        )
+        .await
+        .expect("comparison should succeed")
+        .expect("tracked note should resolve");
+        assert_eq!(conflict.status, PushStatus::Conflict);
+        let remote_hash = conflict.remote_body_hash.expect("conflict reports a hash");
+
+        fs::write(&local_path, "merged").expect("merge should write");
+        let mut merged = input(&local_path, PushStrategy::Safe, false);
+        merged.expected_remote_hash = Some(remote_hash);
+        let pushed = push_note(&client, &files, merged)
+            .await
+            .expect("merged push should succeed")
+            .expect("tracked note should resolve");
+        assert_eq!(pushed.status, PushStatus::Pushed);
+        assert_eq!(
+            files
+                .state()
+                .load_for_local_path(&local_path)
+                .expect("advanced state should load")
+                .baseline_body,
+            "merged"
+        );
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn a_supplied_hash_never_turns_a_remote_change_into_a_push() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").expect("local fixture should write");
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/note-id",
+            200,
+            r#"{"id":"note-id","title":"Note","content":"remote edit"}"#,
+        )]);
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        let mut stale = input(&local_path, PushStrategy::Safe, false);
+        stale.expected_remote_hash = Some(crate::sync::state::body_hash("remote edit"));
+
+        let output = push_note(&fixture.client(), &files, stale)
+            .await
+            .expect("comparison should succeed")
+            .expect("tracked note should resolve");
+
+        // Only the one GET: the unchanged local file must never be written over
+        // someone else's remote edit.
+        assert_eq!(output.status, PushStatus::RemoteChanged);
+        assert_eq!(fixture.finish().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn identical_edits_on_both_sides_advance_the_baseline() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "same edit").expect("local fixture should write");
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/note-id",
+            200,
+            r#"{"id":"note-id","title":"Note","content":"same edit","lastChangedAt":5}"#,
+        )]);
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        let output = push_note(
+            &fixture.client(),
+            &files,
+            input(&local_path, PushStrategy::Safe, false),
+        )
+        .await
+        .expect("comparison should succeed")
+        .expect("tracked note should resolve");
+        assert_eq!(output.status, PushStatus::NothingToPush);
+        assert_eq!(
+            files
+                .state()
+                .load_for_local_path(&local_path)
+                .expect("advanced state should load")
+                .baseline_body,
+            "same edit"
+        );
         fixture.finish();
     }
 
@@ -727,7 +950,6 @@ mod tests {
         .expect("comparison should succeed")
         .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::NothingToPush);
-        assert!(!output.pushed);
         fixture.finish();
     }
 
@@ -784,18 +1006,50 @@ mod tests {
         fixture.finish();
     }
 
-    #[test]
-    fn push_body_limits_have_exact_boundaries() {
-        assert!(validate_body_size(BODY_WARNING_BYTES, false).is_ok());
+    #[tokio::test]
+    async fn a_bare_note_id_is_checked_in_the_tracked_workspace() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").expect("local fixture should write");
+        let files = crate::fixture::tracked_files_in(
+            Workspace::Team {
+                team_path: "core".to_owned(),
+            },
+            directory.path(),
+            "note-id",
+            &local_path,
+            "baseline",
+        );
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/teams/core/notes/note-id",
+            200,
+            r#"{"id":"note-id","title":"Note","content":"baseline"}"#,
+        )]);
+        let mut named = input(&local_path, PushStrategy::Safe, false);
+        named.note_ref = Some("note-id".to_owned());
+
+        let output = push_note(&fixture.client(), &files, named)
+            .await
+            .expect("a matching bare ID should pass the cross-check")
+            .expect("tracked note should resolve");
+        assert_eq!(output.status, PushStatus::NothingToPush);
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn a_note_ref_naming_another_note_is_refused() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "local edit").expect("local fixture should write");
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        let mut other = input(&local_path, PushStrategy::Safe, false);
+        other.note_ref = Some("other-id".to_owned());
         assert!(matches!(
-            validate_body_size(BODY_WARNING_BYTES + 1, false),
-            Err(PushNoteError::LargeFileConfirmationRequired { .. })
-        ));
-        assert!(validate_body_size(BODY_WARNING_BYTES + 1, true).is_ok());
-        assert!(validate_body_size(BODY_MAX_BYTES, true).is_ok());
-        assert!(matches!(
-            validate_body_size(BODY_MAX_BYTES + 1, true),
-            Err(PushNoteError::TooLarge { .. })
+            push_note(&client, &files, other).await,
+            Err(PushNoteError::TrackingMismatch)
         ));
     }
 }

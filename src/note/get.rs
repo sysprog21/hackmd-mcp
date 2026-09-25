@@ -14,26 +14,31 @@ use crate::{
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GetNoteInput {
-    /// Workspace used for a direct internal note ID; scoped URLs resolve their
-    /// own workspace.
-    #[serde(default)]
+    /// Team path (from `hackmd_get_me`) when a direct internal note ID belongs
+    /// to a team; omit for personal notes. `@owner/slug` URLs name their own
+    /// workspace.
+    #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
     /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
     pub(crate) note_ref: String,
-    /// Bypass cached note lists when resolving an `@owner/slug` URL.
+    /// Bypass the 60-second account and note-list caches when resolving an
+    /// `@owner/slug` URL.
     #[serde(default)]
     pub(crate) refresh: bool,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct NoteDetail {
     pub(crate) id: String,
     pub(crate) short_id: Option<String>,
     pub(crate) title: String,
+    /// The Markdown body. Write tools leave it out: the caller just sent it,
+    /// and echoing a large note back only spends context.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) content: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) tags: Vec<String>,
+    #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
     pub(crate) patch_path: String,
     pub(crate) folder_ids: Vec<String>,
@@ -52,7 +57,6 @@ pub(crate) struct NoteDetail {
     pub(crate) publish_link: Option<String>,
     pub(crate) permalink: Option<String>,
     pub(crate) user_path: Option<String>,
-    pub(crate) team_path: Option<String>,
     pub(crate) read_permission: Option<NotePermission>,
     pub(crate) write_permission: Option<NotePermission>,
     pub(crate) comment_permission: Option<CommentPermission>,
@@ -84,7 +88,7 @@ pub(crate) async fn get_note(
     Ok(Ok(normalize_note(note, response)))
 }
 
-fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> NoteDetail {
+pub(crate) fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> NoteDetail {
     let patch_path = crate::note::patch::patch_path(&reference.workspace, &reference.note_id);
     NoteDetail {
         id: note.id,
@@ -110,7 +114,6 @@ fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> NoteDetail 
         publish_link: note.publish_link,
         permalink: note.permalink,
         user_path: note.user_path,
-        team_path: note.team_path,
         read_permission: note.read_permission,
         write_permission: note.write_permission,
         comment_permission: note.comment_permission,
@@ -160,11 +163,13 @@ mod tests {
         assert_eq!(detail.folder_ids, ["parent", "child"]);
         let value = serde_json::to_value(detail).expect("detail should serialize");
         assert_eq!(value["content"], "# Body");
-        assert_eq!(value["titleUpdatedAt"], 10);
-        assert_eq!(value["tagsUpdatedAt"], 11);
-        assert_eq!(value["publishType"], "view");
-        assert_eq!(value["publishedAt"], 13);
-        assert!(value.get("folderPaths").is_none());
+        assert_eq!(value["title_updated_at"], 10);
+        assert_eq!(value["tags_updated_at"], 11);
+        assert_eq!(value["publish_type"], "view");
+        assert_eq!(value["published_at"], 13);
+        assert_eq!(value["patch_path"], "notes/internal-id.md");
+        assert!(value.get("folder_paths").is_none());
+        assert!(value.get("titleUpdatedAt").is_none());
     }
 
     #[test]

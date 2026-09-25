@@ -33,8 +33,8 @@ struct StateDirectoryCheck {
 
 #[derive(Debug, Serialize)]
 struct WorkspaceRootCheck {
+    /// Whether local file tools are confined to a root at all.
     configured: bool,
-    confined: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<PathBuf>,
     accessible: Option<bool>,
@@ -108,7 +108,6 @@ async fn self_check(
         },
         workspace_root: WorkspaceRootCheck {
             configured: root_path.is_some(),
-            confined: root_path.is_some(),
             accessible: root_path.as_ref().map(|_| root_error.is_none()),
             path: root_path,
             error: root_error,
