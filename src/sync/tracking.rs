@@ -75,6 +75,18 @@ pub(crate) enum TrackingError {
     State(#[from] StateError),
 }
 
+impl crate::reply::ToolError for TrackingError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        use crate::reply::ErrorKind;
+
+        match self {
+            Self::Limit(..) | Self::EmptyNoteId => ErrorKind::InvalidInput,
+            Self::ConfirmationRequired => ErrorKind::ConfirmationRequired,
+            Self::State(error) => error.kind(),
+        }
+    }
+}
+
 pub(crate) fn list_tracked_notes(
     files: &LocalFiles,
     input: &ListTrackedNotesInput,

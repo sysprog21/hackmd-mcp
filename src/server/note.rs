@@ -41,7 +41,7 @@ impl HackmdServer {
                 ),
                 &output,
             ),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -63,7 +63,7 @@ impl HackmdServer {
         match crate::note::get::get_note(&self.client, input).await {
             Ok(Ok(note)) => reply::structured(format!("Fetched HackMD note {}", note.id), &note),
             Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -86,7 +86,7 @@ impl HackmdServer {
             Ok(output) => {
                 reply::structured(format!("Created HackMD note {}", output.note.id), &output)
             }
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -110,7 +110,7 @@ impl HackmdServer {
                 reply::structured(format!("Updated HackMD note {}", output.note.id), &output)
             }
             Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -134,7 +134,7 @@ impl HackmdServer {
                 reply::structured(format!("Deleted HackMD note {}", output.note_id), &output)
             }
             Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -157,7 +157,7 @@ impl HackmdServer {
             Ok(output) => {
                 reply::structured(format!("Restored HackMD note {}", output.note_id), &output)
             }
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -186,7 +186,7 @@ impl HackmdServer {
                 reply::structured(summary, &output)
             }
             Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -208,7 +208,7 @@ impl HackmdServer {
         match crate::note::image::upload_note_image(&self.client, &self.files, input).await {
             Ok(Ok(output)) => reply::structured("Uploaded HackMD note image", &output),
             Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 }

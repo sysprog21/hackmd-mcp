@@ -73,6 +73,24 @@ pub(crate) enum UploadNoteImageError {
     Api(#[from] HackmdError),
 }
 
+impl crate::reply::ToolError for UploadNoteImageError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        use crate::reply::ErrorKind;
+
+        match self {
+            Self::Access(error) => error.kind(),
+            Self::RelativePath
+            | Self::InvalidFile
+            | Self::UnsupportedFormat
+            | Self::TeamUnsupported => ErrorKind::InvalidInput,
+            Self::TooLarge { .. } => ErrorKind::TooLarge,
+            Self::ConfirmationRequired { .. } => ErrorKind::ConfirmationRequired,
+            Self::Reference(error) => error.kind(),
+            Self::Api(error) => error.kind(),
+        }
+    }
+}
+
 /// Checks the file's magic bytes.
 ///
 /// The tool hands a local file to a remote CDN that answers with a public link,

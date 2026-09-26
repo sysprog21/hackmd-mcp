@@ -125,6 +125,17 @@ pub(crate) enum ListNotesError {
     Api(#[from] crate::client::HackmdError),
 }
 
+impl crate::reply::ToolError for ListNotesError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        use crate::reply::ErrorKind;
+
+        match self {
+            Self::Limit(..) | Self::AccountWideSource(..) => ErrorKind::InvalidInput,
+            Self::Api(error) => error.kind(),
+        }
+    }
+}
+
 pub(crate) async fn list_notes(
     client: &HackmdClient,
     input: ListNotesInput,

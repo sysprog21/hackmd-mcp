@@ -82,8 +82,12 @@ impl Config {
         mut get: impl FnMut(&str) -> Option<String>,
         policy: ApiUrlPolicy,
     ) -> Result<Self, ConfigError> {
+        // Trimmed, so the token redacted from upstream error bodies is exactly
+        // the one sent, not one with the stray whitespace a JSON client config
+        // can carry.
         let api_token = get("HACKMD_API_TOKEN")
-            .filter(|token| !token.trim().is_empty())
+            .map(|token| token.trim().to_owned())
+            .filter(|token| !token.is_empty())
             .map(SecretToken);
         let api_url = get("HACKMD_API_URL").unwrap_or_else(|| DEFAULT_API_URL.to_owned());
         let state_dir = get("HACKMD_MCP_STATE_DIR")
@@ -243,6 +247,16 @@ enum ApiUrlPolicy {
 }
 
 fn validate_api_url(url: &Url, policy: ApiUrlPolicy) -> Result<(), ConfigError> {
+    // This is a base URL, not a complete request URL. Reject URL components
+    // that could silently change every request or attach credentials outside
+    // the dedicated bearer-token setting.
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidApiUrlComponents);
+    }
     if url.scheme() == "https" {
         return Ok(());
     }
@@ -314,7 +328,8 @@ fn warn_if_readable_by_others(path: &Path) {
 }
 
 fn parse_dotenv_line(line: &str) -> Option<(String, String)> {
-    let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
+    let line = line.trim();
+    let line = line.strip_prefix("export ").unwrap_or(line);
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
@@ -382,6 +397,8 @@ impl fmt::Debug for SecretToken {
 pub(crate) enum ConfigError {
     #[error("HACKMD_API_URL must be a valid URL")]
     InvalidApiUrl(#[source] url::ParseError),
+    #[error("HACKMD_API_URL must not contain credentials, a query, or a fragment")]
+    InvalidApiUrlComponents,
     #[error("HACKMD_API_URL must use HTTPS")]
     InsecureApiUrl,
     #[error("platform state directory is unavailable; set HACKMD_MCP_STATE_DIR")]
@@ -417,6 +434,19 @@ mod tests {
         assert_eq!(config.retry.initial_backoff, Duration::from_millis(500));
         assert_eq!(config.retry.max_backoff, Duration::from_secs(5));
         assert!(config.state_dir.ends_with("hackmd-mcp"));
+    }
+
+    #[test]
+    fn the_token_is_stored_trimmed() {
+        let config = config_from(&[("HACKMD_API_TOKEN", "  test-secret\n")])
+            .expect("a padded token should be accepted");
+        assert_eq!(
+            config.api_token().expect("token should be present"),
+            "test-secret"
+        );
+        let config =
+            config_from(&[("HACKMD_API_TOKEN", "  \t")]).expect("a blank token is no token");
+        assert!(!config.has_api_token());
     }
 
     #[test]
@@ -493,6 +523,25 @@ mod tests {
                 .expect_err("normal configuration must require HTTPS");
             assert_eq!(error.to_string(), "HACKMD_API_URL must use HTTPS");
             assert!(!error.to_string().contains(insecure));
+        }
+    }
+
+    #[test]
+    fn api_url_rejects_credentials_query_and_fragment() {
+        for url in [
+            "https://user:secret@api.hackmd.io/v1",
+            "https://user@api.hackmd.io/v1",
+            "https://api.hackmd.io/v1?x=1",
+            "https://api.hackmd.io/v1?",
+            "https://api.hackmd.io/v1#f",
+        ] {
+            let error = config_from(&[("HACKMD_API_URL", url)])
+                .expect_err("base URL components must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "HACKMD_API_URL must not contain credentials, a query, or a fragment"
+            );
+            assert!(!error.to_string().contains("secret"));
         }
     }
 

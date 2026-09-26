@@ -155,6 +155,21 @@ pub(crate) enum CrudError {
     },
 }
 
+impl crate::reply::ToolError for CrudError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        use crate::reply::ErrorKind;
+
+        match self {
+            Self::UnsupportedPatchPermissions => ErrorKind::InvalidInput,
+            Self::Payload(error) => error.kind(),
+            Self::Reference(error) => error.kind(),
+            Self::Api(error) => error.kind(),
+            Self::ReadbackMismatch { .. } => ErrorKind::Readback,
+            Self::FolderPlacement { .. } => ErrorKind::PartialWrite,
+        }
+    }
+}
+
 fn placed_in(note: &NoteResponse, folder_id: &str) -> bool {
     note.folder_paths.iter().any(|path| path.id == folder_id)
 }
@@ -213,13 +228,15 @@ pub(crate) async fn create_note(
             // immediate read. Failing to confirm is reported as a flag, never
             // as an error: the note exists by now, and an agent that saw an
             // error would create a second one on retry.
-            note = crate::client::poll_readback(
-                || client.get_note(&input.workspace, &note_id),
-                |note| placed_in(note, folder_id),
-            )
-            .await
-            .map_err(placement_failed)?
-            .value;
+            note = client
+                .poll_readback(
+                    0,
+                    || client.get_note(&input.workspace, &note_id),
+                    |note| placed_in(note, folder_id),
+                )
+                .await
+                .map_err(placement_failed)?
+                .value;
         }
     }
 
@@ -275,16 +292,18 @@ pub(crate) async fn update_note(
     // Only a body replacement is compared. Metadata is not: `HackMD` derives a
     // title from the body's first heading, so a supplied title can legitimately
     // read back different, and waiting on it would only stall.
-    let readback = crate::client::poll_readback(
-        || client.get_note(&note.workspace, &note.note_id),
-        |readback| {
-            payload
-                .content
-                .as_deref()
-                .is_none_or(|content| readback.content.as_deref() == Some(content))
-        },
-    )
-    .await?;
+    let readback = client
+        .poll_readback(
+            payload.content.as_ref().map_or(0, String::len),
+            || client.get_note(&note.workspace, &note.note_id),
+            |readback| {
+                payload
+                    .content
+                    .as_deref()
+                    .is_none_or(|content| readback.content.as_deref() == Some(content))
+            },
+        )
+        .await?;
     if !readback.confirmed {
         return Err(CrudError::ReadbackMismatch {
             note_id: note.note_id,

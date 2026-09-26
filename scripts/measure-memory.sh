@@ -10,16 +10,17 @@ report=${1:-memory-baseline.tsv}
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
-printf 'features\tworkload\tpeak_rss_kib\telapsed_seconds\n' >"$report"
+printf 'features\tworkload\tpeak_rss_kib\telapsed_seconds\n' > "$report"
 
-measure() {
+measure()
+{
     feature_label=$1
     workload=$2
     shift 2
     timing="$work_dir/timing"
-    /usr/bin/time -o "$timing" -f '%M\t%e' "$@" >/dev/null
-    printf '%s\t%s\t' "$feature_label" "$workload" >>"$report"
-    cat "$timing" >>"$report"
+    /usr/bin/time -o "$timing" -f '%M\t%e' "$@" > /dev/null
+    printf '%s\t%s\t' "$feature_label" "$workload" >> "$report"
+    cat "$timing" >> "$report"
 }
 
 for feature_label in default otel; do
@@ -31,9 +32,9 @@ for feature_label in default otel; do
 
     # Build first so the measurements exclude compilation.
     # shellcheck disable=SC2086
-    cargo build --release --locked $feature_args >/dev/null
+    cargo build --release --locked $feature_args > /dev/null
     # shellcheck disable=SC2086
-    cargo test --release --locked $feature_args --no-run >/dev/null
+    cargo test --release --locked $feature_args --no-run > /dev/null
 
     state_dir="$work_dir/state-$feature_label"
     # shellcheck disable=SC2086

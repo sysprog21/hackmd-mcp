@@ -50,6 +50,17 @@ pub(crate) enum NoteRefError {
     Api(#[from] HackmdError),
 }
 
+impl crate::reply::ToolError for NoteRefError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        use crate::reply::ErrorKind;
+
+        match self {
+            Self::Empty | Self::InvalidUrl => ErrorKind::InvalidInput,
+            Self::Api(error) => error.kind(),
+        }
+    }
+}
+
 enum ParsedNoteRef {
     Direct(String),
     Scoped { owner: String, slug: String },
@@ -100,21 +111,48 @@ fn parse_note_ref(note_ref: &str) -> Result<ParsedNoteRef, NoteRefError> {
     if url.scheme() != "https" || url.host_str() != Some("hackmd.io") {
         return Err(NoteRefError::InvalidUrl);
     }
+
+    // The parser leaves segments percent-encoded, and encodes a pasted
+    // `hackmd.io/@team/中文` itself; `HackMD` reports permalinks decoded.
     let segments = url
         .path_segments()
         .ok_or(NoteRefError::InvalidUrl)?
         .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
+        .map(percent_decode)
+        .collect::<Result<Vec<_>, _>>()?;
     match segments.as_slice() {
-        [note_id] if !note_id.starts_with('@') => Ok(ParsedNoteRef::Direct((*note_id).to_owned())),
+        [note_id] if !note_id.starts_with('@') => Ok(ParsedNoteRef::Direct(note_id.clone())),
         [owner, slug] if owner.starts_with('@') && owner.len() > 1 && !slug.is_empty() => {
             Ok(ParsedNoteRef::Scoped {
                 owner: owner[1..].to_owned(),
-                slug: (*slug).to_owned(),
+                slug: slug.clone(),
             })
         }
         _ => Err(NoteRefError::InvalidUrl),
     }
+}
+
+/// Decodes `%XX` escapes in one URL path segment. A malformed escape or a
+/// result that is not UTF-8 is not a note reference.
+fn percent_decode(segment: &str) -> Result<String, NoteRefError> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = bytes
+                .get(index + 1..index + 3)
+                .and_then(|hex| std::str::from_utf8(hex).ok())
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                .ok_or(NoteRefError::InvalidUrl)?;
+            decoded.push(hex);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| NoteRefError::InvalidUrl)
 }
 
 fn unique_matches<F>(
@@ -191,6 +229,25 @@ mod tests {
         assert!(
             matches!(parse_note_ref("https://hackmd.io/@core/slug"), Ok(ParsedNoteRef::Scoped { owner, slug }) if owner == "core" && slug == "slug")
         );
+    }
+
+    #[test]
+    fn percent_encoded_and_non_ascii_slugs_are_decoded() {
+        for value in [
+            "https://hackmd.io/@core/%E4%B8%AD%E6%96%87",
+            "hackmd.io/@core/中文",
+        ] {
+            assert!(
+                matches!(parse_note_ref(value), Ok(ParsedNoteRef::Scoped { owner, slug }) if owner == "core" && slug == "中文"),
+                "{value:?}"
+            );
+        }
+        for value in [
+            "https://hackmd.io/@core/%E4%B8",
+            "https://hackmd.io/@core/%zz",
+        ] {
+            assert!(parse_note_ref(value).is_err(), "accepted {value:?}");
+        }
     }
 
     #[test]

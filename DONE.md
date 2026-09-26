@@ -2,6 +2,35 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Analyze, harden, and simplify after review by Codex, Antigravity, and
+  Claude (2026-09-26). A file has at most one sync record, so a pull over
+  another note's file can no longer send a later push to that note; state keys
+  escape `-`, with records under the older keys still found and moved. A merged
+  push conflicts again if the remote moved since the merge, and a pull repairs
+  state lost after a successful push. With no workspace root, a pull will not
+  write files agents load as instructions. The client caps response bodies,
+  rejects `.` and `..` segments, stops retrying past a long `Retry-After`, sizes
+  read-back windows by body, and clears the note-list cache on every exit.
+  Errors carry `_meta.error_kind`; folder order is read back after writing;
+  `client.rs` splits into `client/error.rs` and `client/readback.rs`; blocking
+  local work runs through `local::offload`; and the live suites share
+  `tests/support/liveapi.rs`.
+
+- [x] Review with Codex, Antigravity, and Claude, then refine (2026-09-25).
+  Fold 24 tools into 19: teams return with `hackmd_get_me`, history and trash
+  become `source` values of `hackmd_list_notes`, `hackmd_get_folder` goes, and a
+  conflicting push writes its own `*.remote.md`, replaced only while it still
+  matches the hash recorded in the sidecar. Replies carry a summary, JSON text,
+  and flat snake_case structured content; a workspace is a nullable
+  `team_path` on input and output, while sync state keeps the tagged form.
+  Safe push classifies against the baseline before honoring
+  `expected_remote_hash`; pull writes only `.md`, refuses unpushed edits unless
+  `discard_local_changes`, and rechecks its destination after fetching. The
+  workspace root is pinned at startup and a replaced root refused. Local reads
+  are bounded, patches accept `@@` anchors and line-range headers, account
+  lookups are cached, `.env` may no longer set `HACKMD_MCP_STATE_DIR`, and
+  `rustls` moves to 0.23.45 for RUSTSEC-2026-0285.
+
 - [x] Profile allocations for all five memory workloads with the locally
   available GNU libc `memusage` after Massif proved unusable. The 10,000-note
   cache retains 5,987,804 accounted bytes under its 8 MiB cap; startup, sync,

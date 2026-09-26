@@ -9,89 +9,23 @@
 //!     cargo test --test live-readonly -- --ignored --nocapture
 //! ```
 
-use reqwest::{StatusCode, Url, header::HeaderMap};
+use reqwest::{StatusCode, header::HeaderMap};
 use serde_json::Value;
 
-struct LiveReadOnlyApi {
-    http: reqwest::Client,
-    base: Url,
-    token: String,
-}
+#[path = "support/liveapi.rs"]
+#[allow(
+    dead_code,
+    reason = "shared by live-readonly and live-destructive; each uses a subset"
+)]
+mod liveapi;
 
-struct LiveResponse {
-    status: StatusCode,
-    headers: HeaderMap,
-    value: Option<Value>,
-}
-
-impl LiveReadOnlyApi {
-    fn from_env() -> Self {
-        assert_eq!(
-            std::env::var("HACKMD_RUN_LIVE_READONLY_TESTS").as_deref(),
-            Ok("1"),
-            "set HACKMD_RUN_LIVE_READONLY_TESTS=1 to run the read-only live probe"
-        );
-        let token = std::env::var("HACKMD_LIVE_TEST_TOKEN")
-            .expect("set a dedicated HACKMD_LIVE_TEST_TOKEN");
-        assert!(
-            !token.trim().is_empty(),
-            "live test token must not be empty"
-        );
-        let base = std::env::var("HACKMD_LIVE_TEST_API_URL")
-            .unwrap_or_else(|_| "https://api.hackmd.io/v1".to_owned());
-        let base = Url::parse(&base).expect("HACKMD_LIVE_TEST_API_URL must be a valid URL");
-        assert_eq!(base.scheme(), "https", "live API URL must use HTTPS");
-        Self {
-            http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("live HTTP client should build"),
-            base,
-            token,
-        }
-    }
-
-    fn url(&self, segments: &[&str]) -> Url {
-        let mut url = self.base.clone();
-        let mut path = url
-            .path_segments_mut()
-            .expect("HTTPS live API URL must support path segments");
-        path.pop_if_empty();
-        path.extend(segments);
-        drop(path);
-        url
-    }
-
-    async fn get(&self, segments: &[&str], conditional: Option<(&str, &str)>) -> LiveResponse {
-        let mut request = self.http.get(self.url(segments)).bearer_auth(&self.token);
-        if let Some((name, value)) = conditional {
-            request = request.header(name, value);
-        }
-        let response = request.send().await.expect("live GET should complete");
-        let status = response.status();
-        let headers = response.headers().clone();
-        let bytes = response
-            .bytes()
-            .await
-            .expect("live response body should read");
-        let value = (!bytes.is_empty()).then(|| {
-            serde_json::from_slice(&bytes)
-                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
-        });
-        LiveResponse {
-            status,
-            headers,
-            value,
-        }
-    }
-}
+use liveapi::{LiveApi, LiveResponse};
 
 fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
-async fn probe_endpoint(api: &LiveReadOnlyApi, label: &str, segments: &[&str]) -> LiveResponse {
+async fn probe_endpoint(api: &LiveApi, label: &str, segments: &[&str]) -> LiveResponse {
     let first = api.get(segments, None).await;
     assert!(
         first.status.is_success(),
@@ -128,7 +62,7 @@ async fn probe_endpoint(api: &LiveReadOnlyApi, label: &str, segments: &[&str]) -
 #[tokio::test]
 #[ignore = "requires explicit read-only HackMD live-test environment"]
 async fn personal_team_and_note_gets_report_validator_support() {
-    let api = LiveReadOnlyApi::from_env();
+    let api = LiveApi::readonly_from_env();
     let profile = probe_endpoint(&api, "personal profile", &["me"]).await;
     assert!(
         profile

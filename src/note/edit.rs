@@ -55,6 +55,20 @@ pub(crate) enum EditNoteError {
     ReadbackMismatch { note_id: String },
 }
 
+impl crate::reply::ToolError for EditNoteError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        use crate::reply::ErrorKind;
+
+        match self {
+            Self::Reference(error) => error.kind(),
+            Self::Api(error) => error.kind(),
+            Self::Patch(error) => error.kind(),
+            Self::MissingContent { .. } => ErrorKind::Upstream,
+            Self::ReadbackMismatch { .. } => ErrorKind::Readback,
+        }
+    }
+}
+
 pub(crate) async fn edit_note(
     client: &HackmdClient,
     input: EditNoteInput,
@@ -82,11 +96,13 @@ pub(crate) async fn edit_note(
         client
             .update_note_content(&note.workspace, &note.note_id, &updated)
             .await?;
-        let readback = crate::client::poll_readback(
-            || client.get_note(&note.workspace, &note.note_id),
-            |readback| readback.content.as_deref() == Some(updated.as_str()),
-        )
-        .await?;
+        let readback = client
+            .poll_readback(
+                updated.len(),
+                || client.get_note(&note.workspace, &note.note_id),
+                |readback| readback.content.as_deref() == Some(updated.as_str()),
+            )
+            .await?;
         if !readback.confirmed {
             return Err(EditNoteError::ReadbackMismatch {
                 note_id: note.note_id,

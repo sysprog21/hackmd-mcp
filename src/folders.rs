@@ -160,6 +160,10 @@ pub(crate) enum FolderError {
     Limit(#[from] InvalidLimit),
     #[error("HackMD accepted the folder update for {folder_id}, but read-back did not match")]
     ReadbackMismatch { folder_id: String },
+    #[error(
+        "HackMD accepted the order for {parent}, but it did not read back; another client may have written the folder order at the same time, so read it and set it again"
+    )]
+    OrderReadbackMismatch { parent: String },
     #[error("personal folder updates are unsupported: HackMD exposes PATCH only for team folders")]
     UnsupportedPersonalUpdate,
     #[error("folder moves are unsupported: HackMD accepts parent_folder_id but ignores it")]
@@ -168,6 +172,26 @@ pub(crate) enum FolderError {
     Payload(#[from] PayloadError),
     #[error(transparent)]
     Api(#[from] HackmdError),
+}
+
+impl crate::reply::ToolError for FolderError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        use crate::reply::ErrorKind;
+
+        match self {
+            Self::EmptyName
+            | Self::DuplicateOrderId { .. }
+            | Self::Limit(..)
+            | Self::UnsupportedPersonalUpdate
+            | Self::UnsupportedFolderMove => ErrorKind::InvalidInput,
+            Self::NotFound { .. } => ErrorKind::NotFound,
+            Self::ReadbackMismatch { .. } | Self::OrderReadbackMismatch { .. } => {
+                ErrorKind::Readback
+            }
+            Self::Payload(error) => error.kind(),
+            Self::Api(error) => error.kind(),
+        }
+    }
 }
 
 pub(crate) async fn set_folder_order(
@@ -183,10 +207,30 @@ pub(crate) async fn set_folder_order(
         }
     }
     let parent = input.parent_folder_id.unwrap_or_else(|| "root".to_owned());
+
+    // HackMD stores the order as one map and offers no conditional write, so
+    // this is read-modify-write. The window cannot be closed from here, but a
+    // write that was itself overwritten can be seen: the read-back must show
+    // this parent's entry as written, or the caller is told to try again.
     let mut order: BTreeMap<String, Vec<String>> =
         client.get_folder_order(&input.workspace).await?;
     order.insert(parent.clone(), input.folder_ids.clone());
     client.set_folder_order(&input.workspace, &order).await?;
+    let readback = client
+        .poll_readback(
+            0,
+            || client.get_folder_order(&input.workspace),
+            // An empty order may come back as no entry at all.
+            |current| {
+                current
+                    .get(&parent)
+                    .map_or(input.folder_ids.is_empty(), |ids| *ids == input.folder_ids)
+            },
+        )
+        .await?;
+    if !readback.confirmed {
+        return Err(FolderError::OrderReadbackMismatch { parent });
+    }
     Ok(FolderOrderOutput {
         workspace: input.workspace,
         parent,
@@ -273,11 +317,13 @@ pub(crate) async fn update_folder(
     client
         .update_folder(&input.workspace, &input.folder_id, &payload)
         .await?;
-    let folder = crate::client::poll_readback(
-        || client.get_folder(&input.workspace, &input.folder_id),
-        |folder| folder_matches_update(folder, &payload),
-    )
-    .await?;
+    let folder = client
+        .poll_readback(
+            0,
+            || client.get_folder(&input.workspace, &input.folder_id),
+            |folder| folder_matches_update(folder, &payload),
+        )
+        .await?;
     if !folder.confirmed {
         return Err(FolderError::ReadbackMismatch {
             folder_id: input.folder_id.clone(),
@@ -456,7 +502,7 @@ mod tests {
             ),
         ]);
         let input = serde_json::from_value(json!({
-            "workspace": {"kind": "team", "team_path": "team/path"},
+            "team_path": "team/path",
             "folder_id": "folder/id",
             "description": null
         }))
@@ -485,7 +531,7 @@ mod tests {
             ),
         ]);
         let input = serde_json::from_value(json!({
-            "workspace": {"kind": "team", "team_path": "team"},
+            "team_path": "team",
             "folder_id": "folder",
             "name": "New"
         }))
@@ -514,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn team_move_is_rejected_before_network_after_live_no_op() {
         let input = serde_json::from_value(json!({
-            "workspace": {"kind": "team", "team_path": "team"},
+            "team_path": "team",
             "folder_id": "folder",
             "parent_folder_id": "destination"
         }))
@@ -563,6 +609,12 @@ mod tests {
                 .expect_body("the merged folder order", |body| {
                     body == r#"{"order":{"other":["keep"],"root":["b","a"]}}"#
                 }),
+            Scenario::new(
+                "GET",
+                "/v1/folders/folder-order",
+                200,
+                r#"{"root":["b","a"],"other":["keep"]}"#,
+            ),
         ]);
         let output = set_folder_order(
             &fixture.client(),
@@ -575,6 +627,54 @@ mod tests {
         .await
         .expect("order should update");
         assert_eq!(output.parent, "root");
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn an_order_overwritten_by_another_client_is_reported() {
+        // Another client's full-map PUT lands just after this one and puts the
+        // old root order back.
+        let fixture = SequenceServer::spawn_repeating([
+            (200, r#"{"root":["old"]}"#),
+            (204, ""),
+            (200, r#"{"root":["old"],"other":["theirs"]}"#),
+        ]);
+        let error = set_folder_order(
+            &fixture.client(),
+            SetFolderOrderInput {
+                workspace: Workspace::Personal,
+                parent_folder_id: None,
+                folder_ids: vec!["b".to_owned(), "a".to_owned()],
+            },
+        )
+        .await
+        .expect_err("a lost order must not be reported as set");
+        assert!(
+            matches!(error, FolderError::OrderReadbackMismatch { ref parent } if parent == "root")
+        );
+        assert_eq!(
+            crate::reply::ToolError::kind(&error),
+            crate::reply::ErrorKind::Readback
+        );
+    }
+
+    #[tokio::test]
+    async fn an_emptied_order_that_reads_back_as_no_entry_is_confirmed() {
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/folders/folder-order", 200, r#"{"root":["a"]}"#),
+            Scenario::new("PUT", "/v1/folders/folder-order", 204, ""),
+            Scenario::new("GET", "/v1/folders/folder-order", 200, "{}"),
+        ]);
+        set_folder_order(
+            &fixture.client(),
+            SetFolderOrderInput {
+                workspace: Workspace::Personal,
+                parent_folder_id: None,
+                folder_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("an emptied order should confirm");
         fixture.finish();
     }
 

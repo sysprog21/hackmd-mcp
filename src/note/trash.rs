@@ -25,6 +25,17 @@ pub(crate) enum TrashError {
     Api(#[from] HackmdError),
 }
 
+impl crate::reply::ToolError for TrashError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        use crate::reply::ErrorKind;
+
+        match self {
+            Self::EmptyNoteId => ErrorKind::InvalidInput,
+            Self::Api(error) => error.kind(),
+        }
+    }
+}
+
 pub(crate) async fn restore_note(
     client: &HackmdClient,
     input: RestoreNoteInput,

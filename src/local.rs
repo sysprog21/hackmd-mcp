@@ -116,8 +116,77 @@ pub(crate) enum LocalAccessError {
         root.display()
     )]
     ReplacedRoot { root: PathBuf },
+    #[error(
+        "{} is a file coding agents load as instructions; set HACKMD_MCP_WORKSPACE_ROOT to a tree that may hold it",
+        path.display()
+    )]
+    AgentInstructions { path: PathBuf },
     #[error("local file operation failed: {0}")]
     Io(#[from] io::Error),
+}
+
+impl crate::reply::ToolError for LocalAccessError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        use crate::reply::ErrorKind;
+
+        match self {
+            Self::Traversal { .. }
+            | Self::OutsideRoot { .. }
+            | Self::MissingRoot { .. }
+            | Self::ReplacedRoot { .. }
+            | Self::AgentInstructions { .. } => ErrorKind::LocalAccess,
+            Self::Io(_) => ErrorKind::LocalIo,
+        }
+    }
+}
+
+/// Runs blocking filesystem or hashing work from an async tool handler. On
+/// the multi-threaded runtime the server runs on, the worker first hands its
+/// other tasks to the rest of the pool, so an fsync or a 50 MiB hash does not
+/// stall them. On a single-threaded runtime, as in tests, it simply runs.
+pub(crate) fn offload<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
+/// Files that coding agents read as standing instructions, by name.
+const AGENT_INSTRUCTION_FILES: &[&str] = &[
+    "agent.md",
+    "agents.md",
+    "claude.md",
+    "claude.local.md",
+    "gemini.md",
+    "skill.md",
+];
+
+/// Directories whose contents coding agents load as configuration, skills,
+/// or instructions.
+const AGENT_CONFIG_DIRS: &[&str] = &[
+    ".agents",
+    ".claude",
+    ".codex",
+    ".continue",
+    ".cursor",
+    ".gemini",
+    ".github",
+    ".windsurf",
+];
+
+/// Whether writing `path` could plant instructions an agent later follows.
+fn is_agent_instruction_path(path: &Path) -> bool {
+    let listed = |list: &[&str], name: &std::ffi::OsStr| {
+        name.to_str()
+            .is_some_and(|name| list.iter().any(|entry| name.eq_ignore_ascii_case(entry)))
+    };
+    path.file_name()
+        .is_some_and(|name| listed(AGENT_INSTRUCTION_FILES, name))
+        || path
+            .components()
+            .any(|component| listed(AGENT_CONFIG_DIRS, component.as_os_str()))
 }
 
 impl LocalFiles {
@@ -159,6 +228,26 @@ impl LocalFiles {
                 root: canonical.to_path_buf(),
             })
         }
+    }
+
+    /// `allow`, for a path about to be written. Without a root there is no
+    /// tree the user chose, so the files agents load as instructions are
+    /// refused too: a note must not be able to talk an agent into pulling
+    /// itself over `CLAUDE.md` or into a skills directory.
+    pub(crate) fn allow_write(&self, path: &Path) -> Result<(), LocalAccessError> {
+        self.allow(path)?;
+
+        // Judged on the path as spelled and as resolved, so a symlinked
+        // directory such as `/tmp/x -> /repo/.claude` cannot hide one.
+        if self.root.is_none()
+            && (is_agent_instruction_path(path)
+                || is_agent_instruction_path(&resolve_existing_prefix(path)))
+        {
+            return Err(LocalAccessError::AgentInstructions {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(())
     }
 
     /// The pinned root a caller-supplied path is judged against, or `None`
@@ -203,11 +292,13 @@ impl LocalFiles {
         path: &Path,
         limit: usize,
     ) -> Result<Vec<u8>, LocalAccessError> {
-        let mut bytes = Vec::new();
-        self.open_read(path)?
-            .take(u64::try_from(limit).unwrap_or(u64::MAX))
-            .read_to_end(&mut bytes)?;
-        Ok(bytes)
+        crate::local::offload(|| {
+            let mut bytes = Vec::new();
+            self.open_read(path)?
+                .take(u64::try_from(limit).unwrap_or(u64::MAX))
+                .read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })
     }
 
     pub(crate) fn open_read(&self, path: &Path) -> Result<fs::File, LocalAccessError> {
@@ -219,11 +310,13 @@ impl LocalFiles {
 
     /// Removes a file, through the root's capability when one is configured.
     pub(crate) fn remove_file(&self, path: &Path) -> Result<(), LocalAccessError> {
-        match self.confined(path)? {
-            Some((dir, relative)) => dir.remove_file(relative)?,
-            None => fs::remove_file(path)?,
-        }
-        Ok(())
+        offload(|| {
+            match self.confined(path)? {
+                Some((dir, relative)) => dir.remove_file(relative)?,
+                None => fs::remove_file(path)?,
+            }
+            Ok(())
+        })
     }
 
     /// Atomically replaces a confined file through a directory capability.
@@ -235,56 +328,61 @@ impl LocalFiles {
         contents: &[u8],
         create_parent_dirs: bool,
     ) -> Result<(), LocalAccessError> {
-        let Some((dir, relative)) = self.confined(path)? else {
-            if create_parent_dirs && let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
+        crate::local::offload(|| {
+            let Some((dir, relative)) = self.confined(path)? else {
+                // The same refusal `allow_write` gives up front, repeated where
+                // the unconfined write happens so no caller can skip it.
+                self.allow_write(path)?;
+                if create_parent_dirs && let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                return crate::sync::state::write_local_atomic(path, contents)
+                    .map_err(|error| LocalAccessError::Io(io::Error::other(error)));
+            };
+            let parent = relative.parent().ok_or_else(|| {
+                LocalAccessError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing parent",
+                ))
+            })?;
+            if create_parent_dirs {
+                dir.create_dir_all(parent)?;
             }
-            return crate::sync::state::write_local_atomic(path, contents)
-                .map_err(|error| LocalAccessError::Io(io::Error::other(error)));
-        };
-        let parent = relative.parent().ok_or_else(|| {
-            LocalAccessError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "missing parent",
-            ))
-        })?;
-        if create_parent_dirs {
-            dir.create_dir_all(parent)?;
-        }
-        let file_name = relative.file_name().ok_or_else(|| {
-            LocalAccessError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "missing filename",
-            ))
-        })?;
-        let existing_permissions = dir
-            .metadata(&relative)
-            .ok()
-            .map(|metadata| metadata.permissions());
+            let file_name = relative.file_name().ok_or_else(|| {
+                LocalAccessError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing filename",
+                ))
+            })?;
+            let existing_permissions = dir
+                .metadata(&relative)
+                .ok()
+                .map(|metadata| metadata.permissions());
 
-        // A random 64-bit name, opened create-new: a collision is not a case
-        // worth retrying for, so any failure is reported as itself.
-        let temporary = parent.join(format!(
-            ".{}.hackmd-mcp-{:016x}.tmp",
-            file_name.to_string_lossy(),
-            fastrand::u64(..)
-        ));
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        let mut file = dir.open_with(&temporary, &options)?;
-        let result = (|| {
-            if let Some(permissions) = existing_permissions {
-                file.set_permissions(permissions)?;
+            // A random 64-bit name, opened create-new: a collision is not a
+            // case worth retrying for, so any failure is reported as itself.
+            let temporary = parent.join(format!(
+                ".{}.hackmd-mcp-{:016x}.tmp",
+                file_name.to_string_lossy(),
+                fastrand::u64(..)
+            ));
+            let mut options = cap_std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut file = dir.open_with(&temporary, &options)?;
+            let result = (|| {
+                if let Some(permissions) = existing_permissions {
+                    file.set_permissions(permissions)?;
+                }
+                file.write_all(contents)?;
+                file.sync_all()?;
+                dir.rename(&temporary, dir, &relative)
+            })();
+            if let Err(error) = result {
+                let _ = dir.remove_file(&temporary);
+                return Err(LocalAccessError::Io(error));
             }
-            file.write_all(contents)?;
-            file.sync_all()?;
-            dir.rename(&temporary, dir, &relative)
-        })();
-        if let Err(error) = result {
-            let _ = dir.remove_file(&temporary);
-            return Err(LocalAccessError::Io(error));
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// The pinned root and `path` relative to it.
@@ -346,6 +444,79 @@ mod tests {
         let files = LocalFiles::new("/tmp/state".into(), None);
         assert!(files.allow("/etc/hosts".as_ref()).is_ok());
         assert!(files.allow("/tmp/../etc/hosts".as_ref()).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offload_runs_on_the_server_runtime_and_on_a_plain_thread() {
+        assert_eq!(super::offload(|| 1 + 1), 2);
+        assert_eq!(
+            tokio::spawn(async { super::offload(|| "worker") })
+                .await
+                .expect("task should finish"),
+            "worker"
+        );
+        assert_eq!(
+            tokio::spawn(async { super::offload(|| super::offload(|| "nested")) })
+                .await
+                .expect("nested offload should finish"),
+            "nested"
+        );
+        assert_eq!(super::offload(|| "no runtime needed"), "no runtime needed");
+    }
+
+    #[test]
+    fn without_a_root_agent_instruction_files_are_not_written() {
+        let files = LocalFiles::new("/tmp/state".into(), None);
+        for refused in [
+            "/repo/CLAUDE.md",
+            "/repo/agents.md",
+            "/home/u/.claude/skills/x/SKILL.md",
+            "/repo/.github/copilot-instructions.md",
+            "/repo/.cursor/rules/note.md",
+        ] {
+            let error = files
+                .allow_write(refused.as_ref())
+                .expect_err("agent instruction files must be refused");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "{refused} is a file coding agents load as instructions; set HACKMD_MCP_WORKSPACE_ROOT to a tree that may hold it"
+                )
+            );
+            // Reading one, say to check its sync state, is not the risk.
+            assert!(files.allow(refused.as_ref()).is_ok());
+        }
+        assert!(files.allow_write("/repo/docs/notes.md".as_ref()).is_ok());
+        assert!(files.allow_write("/repo/CLAUDE-notes.md".as_ref()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_cannot_hide_an_agent_config_dir() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let config = directory.path().join(".claude");
+        fs::create_dir(&config).expect("config directory should create");
+        let link = directory.path().join("innocent");
+        std::os::unix::fs::symlink(&config, &link).expect("symlink should create");
+        let files = LocalFiles::new(directory.path().join("state"), None);
+        assert!(matches!(
+            files.allow_write(&link.join("rules/note.md")),
+            Err(LocalAccessError::AgentInstructions { .. })
+        ));
+    }
+
+    #[test]
+    fn a_root_the_user_chose_may_hold_agent_instruction_files() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let files = LocalFiles::new(
+            directory.path().join("state"),
+            Some(directory.path().to_path_buf()),
+        );
+        assert!(
+            files
+                .allow_write(&directory.path().join("CLAUDE.md"))
+                .is_ok()
+        );
     }
 
     #[test]

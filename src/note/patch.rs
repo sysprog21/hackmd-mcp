@@ -28,6 +28,12 @@ pub(crate) enum PatchError {
     AmbiguousAnchor(String),
 }
 
+impl crate::reply::ToolError for PatchError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        crate::reply::ErrorKind::PatchRejected
+    }
+}
+
 #[derive(Debug)]
 struct FilePatch {
     target: String,

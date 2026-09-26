@@ -36,7 +36,7 @@ impl HackmdServer {
                 ),
                 &output,
             ),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -60,7 +60,7 @@ impl HackmdServer {
                 format!("Created HackMD folder {}", output.folder.id),
                 &output,
             ),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -84,7 +84,7 @@ impl HackmdServer {
                 format!("Updated HackMD folder {}", output.folder.id),
                 &output,
             ),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -115,7 +115,7 @@ impl HackmdServer {
                 };
                 reply::structured(summary, &output)
             }
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -139,7 +139,7 @@ impl HackmdServer {
                 format!("Set HackMD folder order for {}", output.parent),
                 &output,
             ),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 }

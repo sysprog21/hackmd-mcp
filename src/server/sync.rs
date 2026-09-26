@@ -38,7 +38,7 @@ impl HackmdServer {
                 ),
                 &output,
             ),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -62,7 +62,7 @@ impl HackmdServer {
                 format!("Stopped tracking HackMD note {}", output.note_id),
                 &output,
             ),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -86,7 +86,7 @@ impl HackmdServer {
                 reply::structured(format!("Pulled HackMD note {}", output.note_id), &output)
             }
             Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -115,7 +115,7 @@ impl HackmdServer {
                 &output,
             ),
             Ok(Err(resolution)) => reply::unresolved(&resolution),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 
@@ -143,7 +143,7 @@ impl HackmdServer {
                 ),
                 &output,
             ),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 }

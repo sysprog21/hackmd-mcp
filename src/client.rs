@@ -7,7 +7,6 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use thiserror::Error;
 use url::Url;
 
 use crate::{
@@ -21,8 +20,14 @@ use crate::{
 };
 
 mod cache;
+mod error;
+mod readback;
 
 use cache::{AccountCache, CacheFill, CacheLookup, NotesCache, fresh, store};
+pub(crate) use error::HackmdError;
+use error::{RateLimitHeaders, map_status_error, request_error};
+pub(crate) use readback::Readback;
+use readback::poll_readback_sized;
 
 /// HTTP client shared by all `HackMD` tool handlers.
 #[derive(Debug)]
@@ -324,6 +329,7 @@ impl HackmdClient {
             reqwest::multipart::Part::stream_with_length(image, size_bytes)
                 .file_name(file_name.to_owned()),
         );
+        tracing::debug!(method = "POST", path = %path, "HackMD request started");
         let response = self
             .http
             .post(url)
@@ -334,27 +340,30 @@ impl HackmdClient {
             .map_err(|error| request_error(&error, "POST".to_owned(), path.clone()))?;
         let status = response.status();
         let rate_limit = RateLimitHeaders::from_headers(response.headers());
-        let bytes = response
-            .bytes()
+        let bytes = read_body_capped(response, RESPONSE_MAX_BYTES)
             .await
-            .map_err(|error| request_error(&error, "POST".to_owned(), path.clone()))?;
+            .map_err(|error| error.into_hackmd("POST", &path))?;
+        tracing::debug!(
+            method = "POST",
+            path = %path,
+            status = status.as_u16(),
+            retries = 0,
+            "HackMD request completed"
+        );
         if status == StatusCode::PAYLOAD_TOO_LARGE {
             return Err(HackmdError::ImageTooLarge { path });
         }
-        if !status.is_success() {
-            return Err(map_status_error(
-                status,
-                "POST".to_owned(),
-                path,
-                &bytes,
-                token,
-                rate_limit,
-            ));
-        }
-        serde_json::from_slice(&bytes).map_err(|_| HackmdError::InvalidJson {
+        decode_response(
+            status,
+            "POST".to_owned(),
+            path.clone(),
+            &bytes,
+            token,
+            rate_limit,
+        )?
+        .ok_or(HackmdError::EmptyResponse {
             method: "POST".to_owned(),
             path,
-            status,
         })
     }
 
@@ -409,17 +418,38 @@ impl HackmdClient {
             .await
     }
 
-    /// Drops every cached note list once a request that is not a read has been
-    /// issued. Called before the request as well as after it: a write that
-    /// fails with a timeout may still have landed on `HackMD`, and the error
-    /// paths return without reaching the second call. The second call covers
-    /// the opposite order, where a concurrent list refilled the cache while the
+    /// Drops every cached note list around a request that is not a read:
+    /// once now and once more when the returned guard is dropped, which is
+    /// every way out of the request, error paths included. The first covers
+    /// a write that fails with a timeout yet still landed on `HackMD`; the
+    /// second covers a concurrent list that refilled the cache while the
     /// write was in flight. Both live here rather than at each write site,
     /// where the next endpoint added would be free to forget.
-    fn invalidate_list_cache_on_write(&self, method: &Method) {
-        if method != Method::GET {
+    fn invalidate_list_cache_on_write(&self, method: &Method) -> Option<InvalidateOnDrop<'_>> {
+        (method != Method::GET).then(|| {
+            self.notes.invalidate();
+            InvalidateOnDrop(&self.notes)
+        })
+    }
+
+    /// `poll_readback` for a write this client made, sized to the body that
+    /// was written. A confirmed read-back also drops cached note lists once
+    /// more: one fetched while the write was still settling may hold the old
+    /// title or permalink.
+    pub(crate) async fn poll_readback<T, Fut>(
+        &self,
+        written_bytes: usize,
+        fetch: impl FnMut() -> Fut,
+        accepted: impl Fn(&T) -> bool,
+    ) -> Result<Readback<T>, HackmdError>
+    where
+        Fut: std::future::Future<Output = Result<T, HackmdError>>,
+    {
+        let readback = poll_readback_sized(written_bytes, fetch, accepted).await?;
+        if readback.confirmed {
             self.notes.invalidate();
         }
+        Ok(readback)
     }
 
     async fn request_json_with_retry<T: DeserializeOwned>(
@@ -456,7 +486,7 @@ impl HackmdClient {
                 .body(body);
         }
 
-        self.invalidate_list_cache_on_write(&method);
+        let _invalidate = self.invalidate_list_cache_on_write(&method);
         tracing::debug!(method = %method_text, path = %path, "HackMD request started");
         let (status, bytes, rate_limit) = loop {
             let request = request.try_clone().ok_or(HackmdError::InvalidPayload)?;
@@ -474,19 +504,23 @@ impl HackmdClient {
             let status = response.status();
             let retry_after = retry_after(response.headers());
             let rate_limit = RateLimitHeaders::from_headers(response.headers());
-            let bytes = match response.bytes().await {
+            let bytes = match read_body_capped(response, RESPONSE_MAX_BYTES).await {
                 Ok(bytes) => bytes,
-                Err(_) if retryable && retries < retry.max_retries => {
+                Err(BodyError::Transport(_)) if retryable && retries < retry.max_retries => {
                     sleep_before_retry(retries, None, retry, false).await;
                     retries += 1;
                     continue;
                 }
-                Err(error) => {
-                    return Err(request_error(&error, method_text.clone(), path.clone()));
-                }
+                Err(error) => return Err(error.into_hackmd(&method_text, &path)),
             };
+
+            // A wait longer than the backoff cap is not waited out in capped
+            // slices, which would only spend every retry inside the same
+            // window: the rate-limit error goes back at once, naming the reset.
+            let wait_too_long = retry_after.is_some_and(|wait| wait > retry.max_backoff);
             if retryable
                 && retries < retry.max_retries
+                && !wait_too_long
                 && (status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
             {
                 sleep_before_retry(
@@ -510,29 +544,7 @@ impl HackmdClient {
             "HackMD request completed"
         );
 
-        self.invalidate_list_cache_on_write(&method);
-
-        if !status.is_success() {
-            return Err(map_status_error(
-                status,
-                method_text,
-                path,
-                &bytes,
-                token,
-                rate_limit,
-            ));
-        }
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-
-        serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|_| HackmdError::InvalidJson {
-                method: method_text,
-                path,
-                status,
-            })
+        decode_response(status, method_text, path, &bytes, token, rate_limit)
     }
 
     fn url_for_segments(&self, path_segments: &[&str]) -> Result<Url, HackmdError> {
@@ -541,6 +553,16 @@ impl HackmdClient {
             .any(|segment| segment.trim().is_empty())
         {
             return Err(HackmdError::EmptyPathSegment);
+        }
+
+        // The URL library drops these rather than encoding them, so a note ID
+        // of `..` would quietly turn `/teams/../notes/X` into another route on
+        // the same API.
+        if path_segments
+            .iter()
+            .any(|segment| matches!(*segment, "." | ".."))
+        {
+            return Err(HackmdError::DotPathSegment);
         }
         let mut url = self.config.api_url().clone();
         let mut segments = url
@@ -554,9 +576,9 @@ impl HackmdClient {
 }
 
 /// Reads how long the server asked us to wait, preferring the standard header
-/// and falling back to `HackMD`'s own rate-limit reset. Note that
-/// `sleep_before_retry` clamps the result: a reset further out than the maximum
-/// backoff is not waited for, it is retried and allowed to fail.
+/// and falling back to `HackMD`'s own rate-limit reset. A reset further out
+/// than the maximum backoff is not retried at all: the rate-limit error is
+/// returned straight away.
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     if let Some(value) = headers
         .get(reqwest::header::RETRY_AFTER)
@@ -597,88 +619,95 @@ async fn sleep_before_retry(
     tokio::time::sleep(delay).await;
 }
 
+/// The largest response body read into memory. Note bodies are capped at
+/// 50 MiB, and JSON escaping of a Markdown body rarely comes near doubling
+/// it; anything larger is refused before it is buffered, not after.
+const RESPONSE_MAX_BYTES: usize = 2 * crate::sync::BODY_MAX_BYTES + 1024 * 1024;
+
+/// Clears the note-list cache when dropped, on whichever path leaves the
+/// request.
+struct InvalidateOnDrop<'a>(&'a NotesCache);
+
+impl Drop for InvalidateOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.invalidate();
+    }
+}
+
+enum BodyError {
+    Transport(reqwest::Error),
+    TooLarge,
+}
+
+impl BodyError {
+    fn into_hackmd(self, method: &str, path: &str) -> HackmdError {
+        match self {
+            Self::Transport(error) => request_error(&error, method.to_owned(), path.to_owned()),
+            Self::TooLarge => HackmdError::ResponseTooLarge {
+                method: method.to_owned(),
+                path: path.to_owned(),
+                limit_mib: RESPONSE_MAX_BYTES / 1024 / 1024,
+            },
+        }
+    }
+}
+
+/// Reads a response body of at most `cap` bytes. A declared length over the
+/// cap is refused before anything is read, and a body without one is
+/// refused as soon as it passes the cap.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, BodyError> {
+    let declared = response
+        .content_length()
+        .map(|length| usize::try_from(length).unwrap_or(usize::MAX));
+    if declared.is_some_and(|length| length > cap) {
+        return Err(BodyError::TooLarge);
+    }
+    let mut body = Vec::with_capacity(declared.unwrap_or(0));
+    while let Some(chunk) = response.chunk().await.map_err(BodyError::Transport)? {
+        if body.len() + chunk.len() > cap {
+            return Err(BodyError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Turns a finished response into the caller's result: an error named by its
+/// status, `None` for `HackMD`'s empty success bodies, or the decoded JSON.
+fn decode_response<T: DeserializeOwned>(
+    status: StatusCode,
+    method: String,
+    path: String,
+    bytes: &[u8],
+    token: &str,
+    rate_limit: RateLimitHeaders,
+) -> Result<Option<T>, HackmdError> {
+    if !status.is_success() {
+        return Err(map_status_error(
+            status, method, path, bytes, token, rate_limit,
+        ));
+    }
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_slice(bytes)
+        .map(Some)
+        .map_err(|_| HackmdError::InvalidJson {
+            method,
+            path,
+            status,
+        })
+}
+
 /// Names the absent body at the many call sites that have none: `None` alone
 /// cannot infer the payload type once the parameter is generic.
 const NO_BODY: Option<&Value> = None;
 
 fn includes_team(teams: &[TeamResponse], team_path: &str) -> bool {
     teams.iter().any(|team| team.path == team_path)
-}
-
-/// How long a write is given to become visible, and the first pause between
-/// reads. The pause doubles so the window is covered in a handful of requests
-/// rather than ten: `HackMD` allows 100 requests per five minutes, and a
-/// foldered note creation spends several of them before ever polling.
-const READBACK_WINDOW: Duration = Duration::from_secs(2);
-const READBACK_FIRST_DELAY: Duration = Duration::from_millis(100);
-
-/// What a read-back saw, and whether it satisfied the caller.
-pub(crate) struct Readback<T> {
-    pub(crate) value: T,
-    pub(crate) confirmed: bool,
-}
-
-/// Re-reads a just-written resource until `accepted` holds.
-///
-/// `HackMD` applies some writes asynchronously, so the first read after a write
-/// can still answer with the previous value. When the window expires the last
-/// observation is still returned, with `confirmed: false`: a caller that treats
-/// that as failure has its error, and one that wants to report the current
-/// state has it without paying for another request.
-///
-pub(crate) async fn poll_readback<T, Fut>(
-    fetch: impl FnMut() -> Fut,
-    accepted: impl Fn(&T) -> bool,
-) -> Result<Readback<T>, HackmdError>
-where
-    Fut: std::future::Future<Output = Result<T, HackmdError>>,
-{
-    poll_readback_with_policy(fetch, accepted, READBACK_WINDOW, READBACK_FIRST_DELAY).await
-}
-
-async fn poll_readback_with_policy<T, Fut>(
-    mut fetch: impl FnMut() -> Fut,
-    accepted: impl Fn(&T) -> bool,
-    window: Duration,
-    first_delay: Duration,
-) -> Result<Readback<T>, HackmdError>
-where
-    Fut: std::future::Future<Output = Result<T, HackmdError>>,
-{
-    let started = tokio::time::Instant::now();
-    let deadline = started + window;
-    let mut delay = first_delay;
-    let mut attempts = 0_u8;
-    loop {
-        attempts = attempts.saturating_add(1);
-        let Ok(result) = tokio::time::timeout_at(deadline, fetch()).await else {
-            crate::retry::record_readback(attempts, started.elapsed());
-            return Err(HackmdError::ReadbackTimeout);
-        };
-        let value = match result {
-            Ok(value) => value,
-            Err(error) => {
-                crate::retry::record_readback(attempts, started.elapsed());
-                return Err(error);
-            }
-        };
-        if accepted(&value) {
-            crate::retry::record_readback(attempts, started.elapsed());
-            return Ok(Readback {
-                value,
-                confirmed: true,
-            });
-        }
-        if tokio::time::Instant::now() + delay >= deadline {
-            crate::retry::record_readback(attempts, started.elapsed());
-            return Ok(Readback {
-                value,
-                confirmed: false,
-            });
-        }
-        tokio::time::sleep(delay).await;
-        delay = delay.saturating_mul(2);
-    }
 }
 
 /// Builds the path segments for a workspace-scoped route. Personal routes start
@@ -692,184 +721,6 @@ fn workspace_route<'a>(workspace: &'a Workspace, resource: &[&'a str]) -> Vec<&'
             segments
         }
     }
-}
-
-fn request_error(error: &reqwest::Error, method: String, path: String) -> HackmdError {
-    if error.is_timeout() {
-        HackmdError::Timeout { method, path }
-    } else {
-        HackmdError::Network { method, path }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct RateLimitHeaders {
-    user_limit: Option<u32>,
-    user_remaining: Option<u32>,
-    reset_after: Option<u64>,
-}
-
-impl RateLimitHeaders {
-    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
-        Self {
-            user_limit: parse_header(headers, "x-ratelimit-userlimit"),
-            user_remaining: parse_header(headers, "x-ratelimit-userremaining"),
-            reset_after: parse_header(headers, "x-ratelimit-userreset"),
-        }
-    }
-
-    fn detail(self) -> String {
-        match (self.user_remaining, self.user_limit, self.reset_after) {
-            (None, None, None) => "quota headers unavailable".to_owned(),
-            (remaining, limit, reset) => format!(
-                "remaining {}/{}, reset after {} seconds",
-                optional_number(remaining),
-                optional_number(limit),
-                optional_number(reset)
-            ),
-        }
-    }
-}
-
-fn parse_header<T>(headers: &reqwest::header::HeaderMap, name: &str) -> Option<T>
-where
-    T: std::str::FromStr,
-{
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-}
-
-fn optional_number<T: std::fmt::Display>(value: Option<T>) -> String {
-    value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
-}
-
-fn map_status_error(
-    status: StatusCode,
-    method: String,
-    path: String,
-    body: &[u8],
-    token: &str,
-    rate_limit: RateLimitHeaders,
-) -> HackmdError {
-    let body_detail = bounded_body(body, token);
-    match status {
-        StatusCode::UNAUTHORIZED => HackmdError::Unauthorized { method, path },
-        StatusCode::FORBIDDEN => HackmdError::Forbidden { method, path },
-        StatusCode::NOT_FOUND => HackmdError::NotFound { method, path },
-        StatusCode::CONFLICT => HackmdError::Conflict { method, path },
-        StatusCode::TOO_MANY_REQUESTS => HackmdError::RateLimited {
-            method,
-            path,
-            detail: combine_details(rate_limit.detail(), &body_detail),
-        },
-        status if status.is_server_error() => HackmdError::Upstream {
-            method,
-            path,
-            status,
-            detail: nonempty_detail(body_detail),
-        },
-        status => HackmdError::Api {
-            method,
-            path,
-            status,
-            detail: nonempty_detail(body_detail),
-        },
-    }
-}
-
-fn combine_details(mut primary: String, secondary: &str) -> String {
-    if !secondary.is_empty() {
-        primary.push_str(": ");
-        primary.push_str(secondary);
-    }
-    primary
-}
-
-fn nonempty_detail(detail: String) -> String {
-    if detail.is_empty() {
-        "no response detail".to_owned()
-    } else {
-        detail
-    }
-}
-
-fn bounded_body(body: &[u8], token: &str) -> String {
-    const MAX_CHARS: usize = 300;
-    let text = String::from_utf8_lossy(body).replace(token, "[REDACTED]");
-    let mut chars = text.chars();
-    let mut bounded: String = chars.by_ref().take(MAX_CHARS).collect();
-    if chars.next().is_some() {
-        bounded.push('…');
-    }
-    bounded
-}
-
-#[derive(Debug, Error)]
-pub(crate) enum HackmdError {
-    #[error(
-        "{method} {path}: HACKMD_API_TOKEN is not configured; set it in the server environment and restart the MCP server"
-    )]
-    MissingToken { method: String, path: String },
-    #[error("failed to build the HackMD HTTP client")]
-    ClientBuild,
-    #[error("failed to serialize a validated HackMD request payload")]
-    InvalidPayload,
-    #[error("configured HACKMD_API_URL cannot be used as an API base URL")]
-    InvalidBaseUrl,
-    #[error("HackMD API path segments such as note IDs and team paths must not be empty")]
-    EmptyPathSegment,
-    #[error(
-        "POST {path}: HackMD rejected the image as too large (413); resize it below 5 MB and retry"
-    )]
-    ImageTooLarge { path: String },
-    #[error("team workspace {team_path:?} is not available to this HackMD account")]
-    UnknownTeam { team_path: String },
-    #[error("{method} {path}: request timed out; check network connectivity and retry")]
-    Timeout { method: String, path: String },
-    #[error("HackMD write read-back exceeded its bounded verification window")]
-    ReadbackTimeout,
-    #[error("{method} {path}: network request failed; check connectivity and HACKMD_API_URL")]
-    Network { method: String, path: String },
-    #[error(
-        "{method} {path}: 401 unauthorized; verify HACKMD_API_TOKEN and restart the MCP server"
-    )]
-    Unauthorized { method: String, path: String },
-    #[error("{method} {path}: 403 forbidden; verify note/team permissions for this token")]
-    Forbidden { method: String, path: String },
-    #[error("{method} {path}: 404 not found; verify the note ID and workspace team_path")]
-    NotFound { method: String, path: String },
-    #[error("{method} {path}: 409 conflict; the requested permalink may already be in use")]
-    Conflict { method: String, path: String },
-    #[error("{method} {path}: 429 rate limited ({detail}); wait before retrying")]
-    RateLimited {
-        method: String,
-        path: String,
-        detail: String,
-    },
-    #[error("{method} {path}: upstream HackMD error ({status}): {detail}; retry later")]
-    Upstream {
-        method: String,
-        path: String,
-        status: StatusCode,
-        detail: String,
-    },
-    #[error("{method} {path}: HackMD API error ({status}): {detail}")]
-    Api {
-        method: String,
-        path: String,
-        status: StatusCode,
-        detail: String,
-    },
-    #[error("{method} {path}: HackMD returned invalid JSON in a {status} response")]
-    InvalidJson {
-        method: String,
-        path: String,
-        status: StatusCode,
-    },
-    #[error("{method} {path}: HackMD returned an empty response where JSON was required")]
-    EmptyResponse { method: String, path: String },
 }
 
 #[cfg(test)]
@@ -1464,6 +1315,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dot_segments_fail_before_they_can_change_the_route() {
+        let client = HackmdClient::new(Config::for_tests()).expect("test client should build");
+        for segments in [&["notes", "."][..], &["teams", "..", "notes", "id"][..]] {
+            let error = client
+                .request_json::<Value>(Method::DELETE, segments, NO_BODY)
+                .await
+                .expect_err("dot segments must be refused");
+            assert_eq!(
+                error.to_string(),
+                "HackMD API path segments such as note IDs and team paths must not be . or .."
+            );
+        }
+        // Dots inside an ID are ordinary characters.
+        assert!(client.url_for_segments(&["notes", "a.b", "..c"]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_refused_before_it_is_read() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/big", 200, "0123456789"),
+            Scenario::new("GET", "/v1/big", 200, "0123456789"),
+        ]);
+        let url = format!("{}/big", server.api_url);
+        let response = reqwest::get(&url).await.expect("fixture should answer");
+        assert!(matches!(
+            super::read_body_capped(response, 4).await,
+            Err(super::BodyError::TooLarge)
+        ));
+        let response = reqwest::get(&url).await.expect("fixture should answer");
+        assert!(matches!(
+            super::read_body_capped(response, 10).await,
+            Ok(body) if body == b"0123456789"
+        ));
+        server.finish();
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_reset_beyond_the_backoff_cap_is_not_retried() {
+        let server = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes",
+            429,
+            r#"{"error":"slow down"}"#,
+        )
+        .response_header("retry-after", "60")]);
+        let error = server
+            .client()
+            .request_json::<Value>(Method::GET, &["notes"], NO_BODY)
+            .await
+            .expect_err("a long reset should come straight back");
+        assert!(matches!(error, HackmdError::RateLimited { .. }));
+        assert_eq!(server.finish().len(), 1, "no retry inside the reset window");
+    }
+
+    #[tokio::test]
     async fn blank_resource_identifier_fails_before_token_or_network() {
         let client = HackmdClient::new(Config::for_tests()).expect("test client should build");
         assert!(matches!(
@@ -1581,57 +1487,5 @@ mod tests {
             Err(HackmdError::Upstream { .. })
         ));
         post_server.finish();
-    }
-
-    #[tokio::test]
-    async fn readback_policy_bounds_the_fetch_itself() {
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            super::poll_readback_with_policy(
-                std::future::pending::<Result<Value, HackmdError>>,
-                |_| true,
-                Duration::from_millis(10),
-                Duration::from_millis(1),
-            ),
-        )
-        .await
-        .expect("the readback policy must bound a stuck fetch");
-
-        assert!(matches!(result, Err(HackmdError::ReadbackTimeout)));
-    }
-
-    #[tokio::test]
-    async fn readback_policy_returns_the_last_bounded_observation() {
-        let result = super::poll_readback_with_policy(
-            || std::future::ready(Ok::<_, HackmdError>("old")),
-            |value| *value == "new",
-            Duration::from_millis(10),
-            Duration::from_millis(20),
-        )
-        .await
-        .expect("a completed fetch should remain observable");
-
-        assert_eq!(result.value, "old");
-        assert!(!result.confirmed);
-    }
-
-    #[test]
-    fn api_errors_convert_to_caller_visible_tool_errors() {
-        let result = crate::reply::error(
-            HackmdError::Unauthorized {
-                method: "GET".to_owned(),
-                path: "/v1/me".to_owned(),
-            }
-            .to_string(),
-        );
-
-        assert_eq!(result.is_error, Some(true));
-        assert!(
-            result.content[0]
-                .as_text()
-                .expect("tool error should contain text")
-                .text
-                .contains("401 unauthorized")
-        );
     }
 }

@@ -36,6 +36,17 @@ pub(crate) enum BodySizeError {
     },
 }
 
+impl crate::reply::ToolError for BodySizeError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        use crate::reply::ErrorKind;
+
+        match self {
+            Self::ConfirmationRequired { .. } => ErrorKind::ConfirmationRequired,
+            Self::TooLarge { .. } => ErrorKind::TooLarge,
+        }
+    }
+}
+
 /// Applies the body limits to one side of a sync, named in the error as
 /// `side` ("remote body", "local file").
 pub(crate) fn check_body_size(
@@ -64,6 +75,18 @@ pub(crate) enum LocalBodyError {
     Size(#[from] BodySizeError),
 }
 
+impl crate::reply::ToolError for LocalBodyError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        use crate::reply::ErrorKind;
+
+        match self {
+            Self::NotAFile | Self::NotUtf8 => ErrorKind::InvalidInput,
+            Self::Access(error) => error.kind(),
+            Self::Size(error) => error.kind(),
+        }
+    }
+}
+
 /// Reads a tracked Markdown file under the body limits. The size is judged on
 /// the opened file before reading, and the read stops one byte past the
 /// maximum, so an oversized file is refused without ever being loaded whole,
@@ -73,29 +96,31 @@ pub(crate) fn read_local_body(
     path: &Path,
     confirmed: bool,
 ) -> Result<String, LocalBodyError> {
-    let file = files
-        .open_read(path)
-        // Only a missing file is "not a file" to the caller. Anything else, a
-        // permission error or a policy refusal, is reported as itself so it
-        // points at what actually needs fixing.
-        .map_err(|error| match error {
-            LocalAccessError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
-                LocalBodyError::NotAFile
-            }
-            other => LocalBodyError::Access(other),
-        })?;
-    let metadata = file.metadata().map_err(|_| LocalBodyError::NotAFile)?;
-    if !metadata.is_file() {
-        return Err(LocalBodyError::NotAFile);
-    }
-    let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
-    check_body_size("local file", size, confirmed)?;
-    let mut bytes = Vec::with_capacity(size);
-    file.take(u64::try_from(BODY_MAX_BYTES + 1).unwrap_or(u64::MAX))
-        .read_to_end(&mut bytes)
-        .map_err(LocalAccessError::Io)?;
-    check_body_size("local file", bytes.len(), confirmed)?;
-    String::from_utf8(bytes).map_err(|_| LocalBodyError::NotUtf8)
+    crate::local::offload(|| {
+        let file = files
+            .open_read(path)
+            // Only a missing file is "not a file" to the caller. Anything else,
+            // a permission error or a policy refusal, is reported as itself so
+            // it points at what actually needs fixing.
+            .map_err(|error| match error {
+                LocalAccessError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                    LocalBodyError::NotAFile
+                }
+                other => LocalBodyError::Access(other),
+            })?;
+        let metadata = file.metadata().map_err(|_| LocalBodyError::NotAFile)?;
+        if !metadata.is_file() {
+            return Err(LocalBodyError::NotAFile);
+        }
+        let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        check_body_size("local file", size, confirmed)?;
+        let mut bytes = Vec::with_capacity(size);
+        file.take(u64::try_from(BODY_MAX_BYTES + 1).unwrap_or(u64::MAX))
+            .read_to_end(&mut bytes)
+            .map_err(LocalAccessError::Io)?;
+        check_body_size("local file", bytes.len(), confirmed)?;
+        String::from_utf8(bytes).map_err(|_| LocalBodyError::NotUtf8)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

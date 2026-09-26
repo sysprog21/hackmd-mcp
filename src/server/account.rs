@@ -25,7 +25,7 @@ impl HackmdServer {
     ) -> rmcp::model::CallToolResult {
         match self.account().await {
             Ok(profile) => profile_result(&profile),
-            Err(error) => reply::error(error.to_string()),
+            Err(error) => reply::error(&error),
         }
     }
 }

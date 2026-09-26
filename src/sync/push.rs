@@ -116,7 +116,7 @@ pub(crate) enum PushNoteError {
     #[error("HackMD accepted the update for note {note_id}, but read-back content did not match")]
     ReadbackMismatch { note_id: String },
     #[error(
-        "HackMD updated note {note_id}, but local sync state could not be persisted; run hackmd_pull_note before the next push"
+        "HackMD updated note {note_id}, but local sync state could not be persisted; run hackmd_pull_note with overwrite_local: true before the next push"
     )]
     StatePersistenceAfterWrite {
         note_id: String,
@@ -134,6 +134,26 @@ pub(crate) enum PushNoteError {
     State(#[from] StateError),
     #[error(transparent)]
     Api(#[from] HackmdError),
+}
+
+impl crate::reply::ToolError for PushNoteError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        use crate::reply::ErrorKind;
+
+        match self {
+            Self::Access(error) => error.kind(),
+            Self::LocalBody(error) => error.kind(),
+            Self::RelativePath | Self::TrackingMismatch => ErrorKind::InvalidInput,
+            Self::OverwriteConfirmationRequired => ErrorKind::ConfirmationRequired,
+            Self::MissingRemoteContent { .. } => ErrorKind::Upstream,
+            Self::ReadbackMismatch { .. } => ErrorKind::Readback,
+            Self::StatePersistenceAfterWrite { .. } => ErrorKind::PartialWrite,
+            Self::SnapshotNotOurs { .. } => ErrorKind::LocalAccess,
+            Self::Reference(error) => error.kind(),
+            Self::State(error) => error.kind(),
+            Self::Api(error) => error.kind(),
+        }
+    }
 }
 
 pub(crate) async fn push_note(
@@ -224,9 +244,16 @@ async fn push_resolved(
         baseline_path: &tracked.baseline_path,
     };
     if matches!(guard.strategy, PushStrategy::Safe) {
-        let local_digest = body_digest(&local);
-        let remote_digest = body_digest(&remote);
+        let (local_digest, remote_digest) =
+            crate::local::offload(|| (body_digest(&local), body_digest(&remote)));
         let remote_hash = body_hash_from_digest(&remote_digest);
+
+        // A merge names the remote it was built against. If the remote has
+        // moved since, even back to the baseline, writing the merge would bring
+        // back whatever that move removed.
+        let merged_against_other_remote = guard
+            .expected_remote_hash
+            .is_some_and(|expected| expected != remote_hash);
 
         // Always judged against the recorded baseline first, so a remote-only
         // change is never mistaken for a local one, whatever hash is supplied.
@@ -253,7 +280,8 @@ async fn push_resolved(
                     ..output(&target, PushStatus::RemoteChanged)
                 }));
             }
-            ChangeState::Conflict => {
+            ChangeState::LocalOnly if !merged_against_other_remote => {}
+            ChangeState::Conflict | ChangeState::LocalOnly => {
                 // The conflict is the result; a snapshot that cannot be saved
                 // is reported beside it rather than replacing it with an error.
                 let (snapshot_path, snapshot_error) =
@@ -270,7 +298,6 @@ async fn push_resolved(
                     ..output(&target, PushStatus::Conflict)
                 }));
             }
-            ChangeState::LocalOnly => {}
         }
     } else if remote == local {
         let result = output(&target, PushStatus::NothingToPush);
@@ -280,11 +307,13 @@ async fn push_resolved(
     client
         .update_note_content(&note.workspace, &note.note_id, &local)
         .await?;
-    let readback = crate::client::poll_readback(
-        || client.get_note(&note.workspace, &note.note_id),
-        |readback| readback.content.as_deref() == Some(local.as_str()),
-    )
-    .await?;
+    let readback = client
+        .poll_readback(
+            local.len(),
+            || client.get_note(&note.workspace, &note.note_id),
+            |readback| readback.content.as_deref() == Some(local.as_str()),
+        )
+        .await?;
     if !readback.confirmed {
         return Err(PushNoteError::ReadbackMismatch {
             note_id: note.note_id,
@@ -347,10 +376,10 @@ fn write_snapshot(
     remote_hash: &str,
 ) -> Result<PathBuf, PushNoteError> {
     let snapshot_path = state.local_path.with_extension("remote.md");
-    files.allow(&snapshot_path)?;
+    files.allow_write(&snapshot_path)?;
     if files.entry(&snapshot_path)?.is_some() {
         let existing = files.read_capped(&snapshot_path, BODY_MAX_BYTES + 1)?;
-        let ours = std::str::from_utf8(&existing).ok().map(body_hash);
+        let ours = crate::local::offload(|| std::str::from_utf8(&existing).ok().map(body_hash));
         if ours.is_none() || ours != state.remote_snapshot_hash {
             return Err(PushNoteError::SnapshotNotOurs {
                 path: snapshot_path,
@@ -468,8 +497,7 @@ fn advance_state(
     remote_timestamp: Option<i64>,
 ) -> Result<(), StateError> {
     let state = state.advance(body, remote_timestamp)?;
-    files.state().persist_from_sync(&state, body)?;
-    Ok(())
+    files.state().persist_from_sync(&state, body)
 }
 
 #[cfg(test)]
@@ -716,7 +744,7 @@ mod tests {
         assert!(
             output
                 .baseline_path
-                .ends_with("personal--note-id.baseline.md")
+                .ends_with("personal--note%2Did.baseline.md")
         );
         assert_eq!(output.local_path, local_path);
         assert!(output.snapshot_path.is_none());
@@ -841,6 +869,39 @@ mod tests {
         // someone else's remote edit.
         assert_eq!(output.status, PushStatus::RemoteChanged);
         assert_eq!(fixture.finish().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_merge_is_not_pushed_once_the_remote_it_merged_has_moved() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline plus merged remote edit")
+            .expect("local fixture should write");
+
+        // The remote edit that was merged has since been reverted, so the
+        // remote is back at the baseline and the file looks locally changed.
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/note-id",
+            200,
+            r#"{"id":"note-id","title":"Note","content":"baseline"}"#,
+        )]);
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        let mut merged = input(&local_path, PushStrategy::Safe, false);
+        merged.expected_remote_hash = Some(crate::sync::state::body_hash("remote edit"));
+
+        let output = push_note(&fixture.client(), &files, merged)
+            .await
+            .expect("comparison should succeed")
+            .expect("tracked note should resolve");
+
+        assert_eq!(output.status, PushStatus::Conflict);
+        assert_eq!(
+            output.remote_body_hash,
+            Some(crate::sync::state::body_hash("baseline"))
+        );
+        assert_eq!(fixture.finish().len(), 1, "nothing may be written");
     }
 
     #[tokio::test]

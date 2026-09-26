@@ -197,6 +197,12 @@ pub(crate) enum PayloadError {
     EmptyFolderPatch,
 }
 
+impl crate::reply::ToolError for PayloadError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        crate::reply::ErrorKind::InvalidInput
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 /// Read in `HackMD`'s camel case, written out in snake case like every other
 /// tool field.

@@ -1,4 +1,4 @@
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::{CallToolResult, ContentBlock, MetaObject};
 use serde::Serialize;
 
 /// A successful reply: a one-line summary, the output as JSON text, and the
@@ -45,8 +45,69 @@ pub(crate) fn wire_name<T: Serialize>(value: &T) -> String {
     }
 }
 
-pub(crate) fn error(message: impl Into<String>) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(message)])
+/// A stable class for a failed call, reported as `_meta.error_kind` beside
+/// the message so an agent can decide what to do next without parsing text.
+/// The names are a contract: add to them, never rename one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ErrorKind {
+    /// No token, or `HackMD` rejected it: fix the configuration and restart.
+    Auth,
+    /// The token lacks permission for this note, folder, or team.
+    Forbidden,
+    /// The note, folder, or team does not exist for this account.
+    NotFound,
+    /// `HackMD` refused the change as conflicting, such as a permalink in use.
+    Conflict,
+    /// Out of quota; wait for the reset before retrying.
+    RateLimited,
+    /// A connection failure or timeout; retrying may succeed.
+    Network,
+    /// `HackMD` failed or answered with something unusable; retry later.
+    Upstream,
+    /// `HackMD` rejected the request for another reason.
+    Api,
+    /// The write was sent but could not be confirmed.
+    Readback,
+    /// The write landed but a follow-up step failed: do not repeat the write.
+    PartialWrite,
+    /// A body, file, or response is over a size limit.
+    TooLarge,
+    /// Retrying with the confirmation flag named in the message would proceed.
+    ConfirmationRequired,
+    /// The local file has edits a pull would discard.
+    UnpushedChanges,
+    /// The input is malformed or unsupported; change it before retrying.
+    InvalidInput,
+    /// A patch did not apply to the current note body; re-read and regenerate
+    /// it.
+    PatchRejected,
+    /// A local path is outside what this server may touch.
+    LocalAccess,
+    /// A local file or the sync store could not be read or written.
+    LocalIo,
+    /// The local file has no sync record; pull it first.
+    NotTracked,
+    /// The sync record is damaged or inconsistent; re-pull or untrack.
+    SyncState,
+    /// The server itself is misconfigured.
+    Internal,
+}
+
+/// An error a tool can return: its message, and its class.
+pub(crate) trait ToolError: std::fmt::Display {
+    fn kind(&self) -> ErrorKind;
+}
+
+pub(crate) fn error(error: &impl ToolError) -> CallToolResult {
+    let mut result = CallToolResult::error(vec![ContentBlock::text(error.to_string())]);
+    let kind = serde_json::to_value(error.kind()).expect("error kind serializes");
+    result
+        .meta
+        .get_or_insert_with(MetaObject::default)
+        .0
+        .insert("error_kind".to_owned(), kind);
+    result
 }
 
 #[cfg(test)]
@@ -77,8 +138,8 @@ mod tests {
     }
 
     #[test]
-    fn error_is_a_caller_visible_tool_error() {
-        let result = error("note_ref did not resolve");
+    fn error_is_a_caller_visible_tool_error_with_its_kind() {
+        let result = error(&crate::sync::state::StateError::NotTracked);
 
         assert_eq!(result.is_error, Some(true));
         assert_eq!(result.structured_content, None);
@@ -87,7 +148,11 @@ mod tests {
                 .as_text()
                 .expect("error content should be text")
                 .text,
-            "note_ref did not resolve"
+            "local Markdown file is not tracked; pull it before sync operations"
+        );
+        assert_eq!(
+            result.meta.expect("errors carry _meta").0.get("error_kind"),
+            Some(&json!("not_tracked"))
         );
     }
 }

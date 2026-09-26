@@ -37,11 +37,15 @@ Three layers, each with its own error enum, converted at the boundary:
    stands alone. One tool family per file; `server.rs` only dispatches.
 3. `src/server/{account,note,folder,sync}.rs` declare the `#[tool]`s, one named router per
    family, combined by `HackmdServer::router`. `server.rs` itself holds only the wiring:
-   construction, the `ServerHandler` impl, and the shared reply helpers. Each tool carries its
-   RMCP annotations and converts results through `reply::{structured, unresolved, error}`;
+   construction and the `ServerHandler` impl; the shared reply helpers live in `reply.rs`.
+   Each tool carries its RMCP annotations and converts results through
+   `reply::{structured, unresolved, error}`;
    handler bodies stay at match-and-format length. A success carries a one-line summary, the
    output as JSON text, and the same output as flat `structuredContent` (no wrapper key), so a
-   client that reads only `content` still sees the data.
+   client that reads only `content` still sees the data. A failure carries its message and
+   `_meta.error_kind`, a stable `reply::ErrorKind` name: every domain error enum implements
+   `reply::ToolError` with an exhaustive `match`, so a new variant cannot compile unclassified.
+   Kind names are a contract; add, never rename.
 4. The surface is 19 tools, kept small on purpose. Account-wide lists are `source` values on
    `hackmd_list_notes` (`history`, `trash`), teams come back with `hackmd_get_me`, and a
    conflicted push writes its own `*.remote.md` snapshot. Prefer a parameter on an existing
@@ -77,6 +81,11 @@ Cross-cutting pieces:
 - `sync::state` keeps a `by-path/<hash>` pointer from each tracked file to its sidecar, so a
   lookup is one read rather than a scan. It is a hint only: the loader verifies what it finds
   and falls back to scanning, which is also what keeps state from older builds loadable.
+  One file has at most one record: `persist_from_sync` removes any other note's record for the
+  same file before writing, and a scan that finds two refuses rather than picking one, because
+  the loser would push this file's body to the wrong note. Keys escape `-` so the `--`
+  separator is unambiguous; records under the older hyphen-bare key are still found, checked
+  against their own identity, and moved on the next sync of that note.
 - `sync::state` is the local sync store under `HACKMD_MCP_STATE_DIR`. Per tracked note it keeps a
   JSON sidecar plus a baseline copy of the body. State files go through `write_private_atomic`
   (0600 on unix); the user's own Markdown file goes through `write_local_atomic`, which
@@ -111,15 +120,23 @@ Cross-cutting pieces:
   counts stay meaningful.
 - `paging.rs` owns the limit/offset contract for every list tool: `HackMD` returns whole
   collections, so filtering, sorting, and paging all happen locally.
-- `client::poll_readback` absorbs `HackMD`'s asynchronous write visibility. Any read-back after
-  a write goes through it rather than trusting a single immediate GET.
+- `HackmdClient::poll_readback` (its polling policy in `client/readback.rs`) absorbs `HackMD`'s
+  asynchronous write visibility. Any read-back after a write goes through it rather than trusting a single
+  immediate GET; it takes the written body's size, and its window grows with it. Folder order
+  is a whole-map PUT with no conditional write, so `set_folder_order` reads it back and reports
+  an order another client overwrote rather than claiming success. `client/error.rs` holds
+  `HackmdError` and the status-to-error mapping, including redaction.
 - `local::LocalFiles` owns everything on this machine: the `StateStore` and the optional
   `HACKMD_MCP_WORKSPACE_ROOT` confinement. The root is canonicalized and opened once at
   startup, and both the policy check and every capability operation use that one handle; a
   root moved or replaced afterwards is refused until restart. The
   server passes it to the four tools that touch local paths; `HackmdClient` is HTTP only and
   knows nothing about the filesystem. Any new tool that accepts a caller-supplied path calls
-  `files.allow` before doing anything else.
+  `files.allow` before doing anything else, or `files.allow_write` when it will write there:
+  with no root configured, that also refuses files agents load as instructions (`CLAUDE.md`,
+  `AGENTS.md`, `SKILL.md`, `.claude/`, `.github/`, ...). The blocking `LocalFiles` and
+  `StateStore` methods run through `local::offload` themselves; a handler only wraps other
+  heavy work, such as hashing a body.
 - `observability.rs` sends JSON tracing to stderr only. Stdout belongs to the MCP transport;
   a stray `println!` corrupts the protocol and `tests/stdio.rs` will catch it.
 

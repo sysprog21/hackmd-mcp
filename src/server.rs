@@ -59,6 +59,10 @@ pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
                 "local file tools will refuse every path until the server restarts with this root present"
             ),
         }
+    } else {
+        tracing::warn!(
+            "HACKMD_MCP_WORKSPACE_ROOT is unset: local file tools accept any absolute path; set it to confine them"
+        );
     }
     let client = Arc::new(HackmdClient::new(config)?);
     if !client.has_api_token() {
@@ -495,10 +499,10 @@ mod tests {
             .await
             .expect("tool error should remain a protocol success");
         assert_eq!(result.is_error, Some(true));
-        assert_eq!(
-            result.meta.expect("final error should have metadata").0["retry"]["attempts"],
-            2
-        );
+        let meta = result.meta.expect("final error should have metadata").0;
+        assert_eq!(meta["retry"]["attempts"], 2);
+        // Both entries survive: the retry scope adds to the kind, not over it.
+        assert_eq!(meta["error_kind"], "upstream");
         stop_protocol(client, server_task).await;
         error_fixture.finish();
     }
@@ -586,10 +590,10 @@ mod tests {
             .await
             .expect("failed readback should remain a tool response");
         assert_eq!(result.is_error, Some(true));
-        assert_eq!(
-            result.meta.expect("failed readback should emit metadata").0["retry"]["readback_attempts"],
-            1
-        );
+        let meta = result.meta.expect("failed readback should emit metadata").0;
+        assert_eq!(meta["retry"]["readback_attempts"], 1);
+        // The read-back itself failed with a 500, which is what gets classed.
+        assert_eq!(meta["error_kind"], "upstream");
         stop_protocol(client, server_task).await;
         failed.finish();
     }

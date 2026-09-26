@@ -55,6 +55,21 @@ pub(crate) enum CheckNoteSyncError {
     Api(#[from] HackmdError),
 }
 
+impl crate::reply::ToolError for CheckNoteSyncError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        use crate::reply::ErrorKind;
+
+        match self {
+            Self::Access(error) => error.kind(),
+            Self::RelativePath => ErrorKind::InvalidInput,
+            Self::LocalBody(error) => error.kind(),
+            Self::MissingRemoteContent { .. } => ErrorKind::Upstream,
+            Self::State(error) => error.kind(),
+            Self::Api(error) => error.kind(),
+        }
+    }
+}
+
 pub(crate) async fn check_note_sync(
     client: &HackmdClient,
     files: &LocalFiles,
@@ -76,8 +91,8 @@ pub(crate) async fn check_note_sync(
         .ok_or_else(|| CheckNoteSyncError::MissingRemoteContent {
             note_id: tracked.state.internal_id.clone(),
         })?;
-    let local_digest = body_digest(&local);
-    let remote_digest = body_digest(&remote);
+    let (local_digest, remote_digest) =
+        crate::local::offload(|| (body_digest(&local), body_digest(&remote)));
     let status = match classify_changes(&tracked.baseline_digest, &local_digest, &remote_digest) {
         ChangeState::InSync => SyncStatus::InSync,
         ChangeState::LocalOnly => SyncStatus::LocalChanged,

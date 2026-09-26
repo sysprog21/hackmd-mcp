@@ -70,6 +70,15 @@ pub(crate) enum GetNoteError {
     Api(#[from] HackmdError),
 }
 
+impl crate::reply::ToolError for GetNoteError {
+    fn kind(&self) -> crate::reply::ErrorKind {
+        match self {
+            Self::Reference(error) => error.kind(),
+            Self::Api(error) => error.kind(),
+        }
+    }
+}
+
 pub(crate) async fn get_note(
     client: &HackmdClient,
     input: GetNoteInput,

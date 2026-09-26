@@ -14,121 +14,17 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::FutureExt;
-use reqwest::{Method, StatusCode, Url};
-use serde_json::{Value, json};
+use reqwest::{Method, StatusCode};
+use serde_json::json;
 
-struct LiveApi {
-    http: reqwest::Client,
-    base: Url,
-    token: String,
-}
+#[path = "support/liveapi.rs"]
+#[allow(
+    dead_code,
+    reason = "shared by live-readonly and live-destructive; each uses a subset"
+)]
+mod liveapi;
 
-impl LiveApi {
-    fn from_env() -> Self {
-        assert_eq!(
-            std::env::var("HACKMD_RUN_LIVE_TESTS").as_deref(),
-            Ok("1"),
-            "set HACKMD_RUN_LIVE_TESTS=1 to acknowledge destructive live tests"
-        );
-        assert_eq!(
-            std::env::var("HACKMD_CONFIRM_DESTRUCTIVE_LIVE_TESTS").as_deref(),
-            Ok("YES"),
-            "set HACKMD_CONFIRM_DESTRUCTIVE_LIVE_TESTS=YES to confirm writes and cleanup"
-        );
-        let token = std::env::var("HACKMD_LIVE_TEST_TOKEN")
-            .expect("set a dedicated HACKMD_LIVE_TEST_TOKEN; the normal server token is refused");
-        assert!(
-            !token.trim().is_empty(),
-            "live test token must not be empty"
-        );
-        let base = std::env::var("HACKMD_LIVE_TEST_API_URL")
-            .unwrap_or_else(|_| "https://api.hackmd.io/v1".to_owned());
-        let base = Url::parse(&base).expect("HACKMD_LIVE_TEST_API_URL must be a valid URL");
-        assert_eq!(base.scheme(), "https", "live API URL must use HTTPS");
-        Self {
-            http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("live HTTP client should build"),
-            base,
-            token,
-        }
-    }
-
-    fn url(&self, segments: &[&str]) -> Url {
-        let mut url = self.base.clone();
-        let mut path = url
-            .path_segments_mut()
-            .expect("HTTPS live API URL must support path segments");
-        path.pop_if_empty();
-        path.extend(segments);
-        drop(path);
-        url
-    }
-
-    async fn request(
-        &self,
-        method: Method,
-        segments: &[&str],
-        body: Option<&Value>,
-    ) -> (StatusCode, Option<Value>) {
-        let mut request = self
-            .http
-            .request(method, self.url(segments))
-            .bearer_auth(&self.token);
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        let response = request
-            .send()
-            .await
-            .expect("live API request should complete");
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .expect("live response body should read");
-        let value = (!bytes.is_empty()).then(|| {
-            serde_json::from_slice(&bytes)
-                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
-        });
-        (status, value)
-    }
-
-    async fn json(&self, method: Method, segments: &[&str], body: Option<&Value>) -> Value {
-        let (status, value) = self.request(method, segments, body).await;
-        assert!(status.is_success(), "live API returned {status}: {value:?}");
-        value.expect("live API response should contain JSON")
-    }
-
-    async fn empty_ok(&self, method: Method, segments: &[&str], body: Option<&Value>) {
-        let (status, value) = self.request(method, segments, body).await;
-        assert!(status.is_success(), "live API returned {status}: {value:?}");
-    }
-
-    async fn delete_note(&self, note_id: &str) {
-        self.empty_ok(Method::DELETE, &["notes", note_id], None)
-            .await;
-    }
-
-    async fn cleanup_delete(&self, segments: &[&str], resource: &str) {
-        match self
-            .http
-            .delete(self.url(segments))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => {}
-            Ok(response) => eprintln!(
-                "cleanup failed for {resource}: status={}",
-                response.status()
-            ),
-            Err(error) => eprintln!("cleanup failed for {resource}: transport error: {error}"),
-        }
-    }
-}
+use liveapi::LiveApi;
 
 #[derive(Default)]
 struct Fixtures {
@@ -165,7 +61,7 @@ async fn cleanup(api: &LiveApi, fixtures: &mut Fixtures) {
     reason = "one linear live workflow keeps fixture creation, assertions, and cleanup ordering auditable"
 )]
 async fn personal_crud_folder_order_trash_and_restore() {
-    let api = LiveApi::from_env();
+    let api = LiveApi::destructive_from_env();
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after epoch")
@@ -278,7 +174,7 @@ async fn personal_crud_folder_order_trash_and_restore() {
 #[ignore = "requires explicit destructive HackMD live-test team environment"]
 #[allow(clippy::too_many_lines, reason = "one guarded team contract probe")]
 async fn team_folder_updates_and_image_route_are_measured() {
-    let api = LiveApi::from_env();
+    let api = LiveApi::destructive_from_env();
     let team_path = std::env::var("HACKMD_LIVE_TEST_TEAM_PATH")
         .expect("set an isolated HACKMD_LIVE_TEST_TEAM_PATH for the team probe");
     assert!(!team_path.trim().is_empty());
