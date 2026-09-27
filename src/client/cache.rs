@@ -403,16 +403,7 @@ fn note_heap_bytes(note: &NoteResponse) -> usize {
     });
     let folders = note.folder_paths.iter().fold(
         note.folder_paths.capacity() * std::mem::size_of::<crate::dto::FolderPathResponse>(),
-        |sum, folder| {
-            sum.saturating_add(
-                folder.id.capacity()
-                    + folder.name.capacity()
-                    + optional(folder.parent_id.as_ref())
-                    + optional(folder.icon.as_ref())
-                    + optional(folder.color.as_ref())
-                    + optional(folder.client_id.as_ref()),
-            )
-        },
+        |sum, folder| sum.saturating_add(folder.id.capacity()),
     );
     strings
         .saturating_add(tags)

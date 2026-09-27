@@ -103,15 +103,13 @@ pub(crate) fn read_local_body(
             // a permission error or a policy refusal, is reported as itself so
             // it points at what actually needs fixing.
             .map_err(|error| match error {
+                LocalAccessError::NotRegular { .. } => LocalBodyError::NotAFile,
                 LocalAccessError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
                     LocalBodyError::NotAFile
                 }
                 other => LocalBodyError::Access(other),
             })?;
-        let metadata = file.metadata().map_err(|_| LocalBodyError::NotAFile)?;
-        if !metadata.is_file() {
-            return Err(LocalBodyError::NotAFile);
-        }
+        let metadata = file.metadata().map_err(LocalAccessError::Io)?;
         let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
         check_body_size("local file", size, confirmed)?;
         let mut bytes = Vec::with_capacity(size);

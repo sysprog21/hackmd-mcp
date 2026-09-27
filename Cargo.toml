@@ -38,6 +38,9 @@ tracing-opentelemetry = { version = "0.33", optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "std"] }
 url = "2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 futures-util = "0.3"
 rmcp = { version = "3", default-features = false, features = ["client", "transport-worker"] }

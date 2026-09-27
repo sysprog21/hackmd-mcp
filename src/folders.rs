@@ -54,8 +54,10 @@ pub(crate) struct UpdateFolderInput {
     /// personal workspace.
     #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
-    /// Internal folder ID from `hackmd_list_folders`.
-    pub(crate) folder_id: String,
+    /// Internal folder ID from `hackmd_list_folders`. Required to change the
+    /// folder's own fields; omit it with `child_order` to order the top-level
+    /// folders.
+    pub(crate) folder_id: Option<String>,
     /// New non-empty name; unlike other fields, name cannot be null.
     pub(crate) name: Option<String>,
     /// New description, null to clear, or omit to preserve.
@@ -75,6 +77,24 @@ pub(crate) struct UpdateFolderInput {
     #[serde(default, deserialize_with = "deserialize_patch_field")]
     #[schemars(with = "Option<String>")]
     parent_folder_id: PatchField,
+    /// Complete desired order of the direct child folders of `folder_id`, or
+    /// of the top-level folders when `folder_id` is omitted. The parent is
+    /// named by `folder_id`, not `parent_folder_id`. Works in personal
+    /// workspaces too.
+    #[serde(alias = "folder_ids")]
+    pub(crate) child_order: Option<Vec<String>>,
+}
+
+impl UpdateFolderInput {
+    /// Whether any of the folder's own fields is being changed, as opposed to
+    /// only the order of its children.
+    fn changes_fields(&self) -> bool {
+        self.name.is_some()
+            || self.description.is_specified()
+            || self.icon.is_specified()
+            || self.color.is_specified()
+            || self.parent_folder_id.is_specified()
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -89,19 +109,6 @@ pub(crate) struct DeleteFolderInput {
     /// Required only when the folder has child folders.
     #[serde(default)]
     pub(crate) confirm: bool,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SetFolderOrderInput {
-    /// Team path (from `hackmd_get_me`) of a team workspace; omit for the
-    /// personal workspace.
-    #[serde(default, rename = "team_path", alias = "workspace")]
-    pub(crate) workspace: Workspace,
-    /// Parent folder ID. Omit or use null to order top-level folders.
-    pub(crate) parent_folder_id: Option<String>,
-    /// Complete desired order for this parent's direct child folders.
-    pub(crate) folder_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -141,9 +148,20 @@ pub(crate) struct DeleteFolderOutput {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct FolderOrderOutput {
+pub(crate) struct UpdateFolderOutput {
     #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
+    /// The folder as read back, when its own fields changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) folder: Option<FolderResponse>,
+    /// The order written, when `child_order` was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) child_order: Option<ChildOrder>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ChildOrder {
+    /// The parent folder ID, or `root` for the top level.
     pub(crate) parent: String,
     pub(crate) folder_ids: Vec<String>,
 }
@@ -152,6 +170,20 @@ pub(crate) struct FolderOrderOutput {
 pub(crate) enum FolderError {
     #[error("folder name must not be empty")]
     EmptyName,
+    #[error("nothing to update: give the fields to change, child_order, or both")]
+    NothingToUpdate,
+    #[error("folder_id is required to change a folder's own fields")]
+    MissingFolderId,
+    #[error(
+        "child_order orders the children of folder_id (omit it for the top level); parent_folder_id would move the folder, which HackMD does not support"
+    )]
+    OrderParentAsFolderId,
+    #[error("folder {folder_id} was updated, but setting its child order failed: {source}")]
+    OrderAfterUpdate {
+        folder_id: String,
+        #[source]
+        source: Box<FolderError>,
+    },
     #[error("folder {folder_id:?} does not exist in the selected workspace")]
     NotFound { folder_id: String },
     #[error("folder_ids contains duplicate folder ID {folder_id:?}")]
@@ -180,11 +212,15 @@ impl crate::reply::ToolError for FolderError {
 
         match self {
             Self::EmptyName
+            | Self::NothingToUpdate
+            | Self::MissingFolderId
+            | Self::OrderParentAsFolderId
             | Self::DuplicateOrderId { .. }
             | Self::Limit(..)
             | Self::UnsupportedPersonalUpdate
             | Self::UnsupportedFolderMove => ErrorKind::InvalidInput,
             Self::NotFound { .. } => ErrorKind::NotFound,
+            Self::OrderAfterUpdate { .. } => ErrorKind::PartialWrite,
             Self::ReadbackMismatch { .. } | Self::OrderReadbackMismatch { .. } => {
                 ErrorKind::Readback
             }
@@ -194,48 +230,37 @@ impl crate::reply::ToolError for FolderError {
     }
 }
 
-pub(crate) async fn set_folder_order(
+async fn set_child_order(
     client: &HackmdClient,
-    input: SetFolderOrderInput,
-) -> Result<FolderOrderOutput, FolderError> {
-    let mut seen = HashSet::new();
-    for folder_id in &input.folder_ids {
-        if !seen.insert(folder_id) {
-            return Err(FolderError::DuplicateOrderId {
-                folder_id: folder_id.clone(),
-            });
-        }
-    }
-    let parent = input.parent_folder_id.unwrap_or_else(|| "root".to_owned());
+    workspace: &Workspace,
+    parent: Option<&str>,
+    folder_ids: Vec<String>,
+) -> Result<ChildOrder, FolderError> {
+    let parent = parent.unwrap_or("root").to_owned();
 
     // HackMD stores the order as one map and offers no conditional write, so
     // this is read-modify-write. The window cannot be closed from here, but a
     // write that was itself overwritten can be seen: the read-back must show
     // this parent's entry as written, or the caller is told to try again.
-    let mut order: BTreeMap<String, Vec<String>> =
-        client.get_folder_order(&input.workspace).await?;
-    order.insert(parent.clone(), input.folder_ids.clone());
-    client.set_folder_order(&input.workspace, &order).await?;
+    let mut order: BTreeMap<String, Vec<String>> = client.get_folder_order(workspace).await?;
+    order.insert(parent.clone(), folder_ids.clone());
+    client.set_folder_order(workspace, &order).await?;
     let readback = client
         .poll_readback(
             0,
-            || client.get_folder_order(&input.workspace),
+            || client.get_folder_order(workspace),
             // An empty order may come back as no entry at all.
             |current| {
                 current
                     .get(&parent)
-                    .map_or(input.folder_ids.is_empty(), |ids| *ids == input.folder_ids)
+                    .map_or(folder_ids.is_empty(), |ids| *ids == folder_ids)
             },
         )
         .await?;
     if !readback.confirmed {
         return Err(FolderError::OrderReadbackMismatch { parent });
     }
-    Ok(FolderOrderOutput {
-        workspace: input.workspace,
-        parent,
-        folder_ids: input.folder_ids,
-    })
+    Ok(ChildOrder { parent, folder_ids })
 }
 
 pub(crate) async fn list_folders(
@@ -293,47 +318,111 @@ pub(crate) async fn create_folder(
 pub(crate) async fn update_folder(
     client: &HackmdClient,
     input: UpdateFolderInput,
-) -> Result<FolderOutput, FolderError> {
-    if input
-        .name
-        .as_deref()
-        .is_some_and(|name| name.trim().is_empty())
+) -> Result<UpdateFolderOutput, FolderError> {
+    // How the retired order tool named the parent. Said plainly here rather
+    // than as a folder-move refusal, which would not explain what to send.
+    if input.child_order.is_some()
+        && input.folder_id.is_none()
+        && input.parent_folder_id.is_specified()
     {
-        return Err(FolderError::EmptyName);
+        return Err(FolderError::OrderParentAsFolderId);
     }
-    if matches!(input.workspace, Workspace::Personal) {
-        return Err(FolderError::UnsupportedPersonalUpdate);
+    let changes_fields = input.changes_fields();
+    if !changes_fields && input.child_order.is_none() {
+        return Err(FolderError::NothingToUpdate);
     }
-    if input.parent_folder_id.into_request().is_some() {
-        return Err(FolderError::UnsupportedFolderMove);
+
+    // Checked before anything is written, so a bad order cannot fail the call
+    // after the fields already changed.
+    if let Some(folder_ids) = &input.child_order {
+        ensure_distinct(folder_ids)?;
     }
-    let payload = UpdateFolderRequest {
-        name: input.name,
-        description: input.description.into_request(),
-        icon: input.icon.into_request(),
-        color: input.color.into_request(),
+    let UpdateFolderInput {
+        workspace,
+        folder_id,
+        name,
+        description,
+        icon,
+        color,
+        parent_folder_id,
+        child_order,
+    } = input;
+
+    let folder = if changes_fields {
+        let folder_id = folder_id.as_deref().ok_or(FolderError::MissingFolderId)?;
+        if name.as_deref().is_some_and(|name| name.trim().is_empty()) {
+            return Err(FolderError::EmptyName);
+        }
+        if matches!(workspace, Workspace::Personal) {
+            return Err(FolderError::UnsupportedPersonalUpdate);
+        }
+        if parent_folder_id.is_specified() {
+            return Err(FolderError::UnsupportedFolderMove);
+        }
+        let payload = UpdateFolderRequest {
+            name,
+            description: description.into_request(),
+            icon: icon.into_request(),
+            color: color.into_request(),
+        };
+        Some(update_fields(client, &workspace, folder_id, &payload).await?)
+    } else {
+        None
     };
-    payload.validate()?;
-    client
-        .update_folder(&input.workspace, &input.folder_id, &payload)
-        .await?;
+    let child_order = match child_order {
+        Some(folder_ids) => Some(
+            set_child_order(client, &workspace, folder_id.as_deref(), folder_ids)
+                .await
+                // The fields are already written: say so, or a retry would look
+                // like it had to redo them.
+                .map_err(|source| match &folder {
+                    Some(folder) => FolderError::OrderAfterUpdate {
+                        folder_id: folder.id.clone(),
+                        source: Box::new(source),
+                    },
+                    None => source,
+                })?,
+        ),
+        None => None,
+    };
+    Ok(UpdateFolderOutput {
+        workspace,
+        folder,
+        child_order,
+    })
+}
+
+fn ensure_distinct(folder_ids: &[String]) -> Result<(), FolderError> {
+    let mut seen = HashSet::new();
+    match folder_ids.iter().find(|folder_id| !seen.insert(*folder_id)) {
+        Some(folder_id) => Err(FolderError::DuplicateOrderId {
+            folder_id: folder_id.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Writes a folder's own fields and waits until a read shows them.
+async fn update_fields(
+    client: &HackmdClient,
+    workspace: &Workspace,
+    folder_id: &str,
+    payload: &UpdateFolderRequest,
+) -> Result<FolderResponse, FolderError> {
+    client.update_folder(workspace, folder_id, payload).await?;
     let folder = client
         .poll_readback(
             0,
-            || client.get_folder(&input.workspace, &input.folder_id),
-            |folder| folder_matches_update(folder, &payload),
+            || client.get_folder(workspace, folder_id),
+            |folder| folder_matches_update(folder, payload),
         )
         .await?;
     if !folder.confirmed {
         return Err(FolderError::ReadbackMismatch {
-            folder_id: input.folder_id.clone(),
+            folder_id: folder_id.to_owned(),
         });
     }
-    let folder = folder.value;
-    Ok(FolderOutput {
-        workspace: input.workspace,
-        folder,
-    })
+    Ok(folder.value)
 }
 
 fn folder_matches_update(folder: &FolderResponse, update: &UpdateFolderRequest) -> bool {
@@ -389,9 +478,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CreateFolderInput, DeleteFolderInput, FolderError, FolderWorkspaceInput,
-        SetFolderOrderInput, UpdateFolderInput, create_folder, delete_folder, list_folders,
-        set_folder_order, update_folder,
+        CreateFolderInput, DeleteFolderInput, FolderError, FolderWorkspaceInput, UpdateFolderInput,
+        create_folder, delete_folder, list_folders, update_folder,
     };
     use crate::{
         client::HackmdClient,
@@ -418,6 +506,11 @@ mod tests {
         }))
         .expect("value should deserialize");
         assert!(matches!(set.color, PatchField::Set(Some(value)) if value == "#fff"));
+    }
+
+    fn root_order(folder_ids: &[String]) -> UpdateFolderInput {
+        serde_json::from_value(json!({ "child_order": folder_ids }))
+            .expect("order input should deserialize")
     }
 
     #[tokio::test]
@@ -539,7 +632,7 @@ mod tests {
         let output = update_folder(&fixture.client(), input)
             .await
             .expect("eventual folder update should succeed");
-        assert_eq!(output.folder.name, "New");
+        assert_eq!(output.folder.expect("fields changed").name, "New");
         fixture.finish();
     }
 
@@ -616,17 +709,98 @@ mod tests {
                 r#"{"root":["b","a"],"other":["keep"]}"#,
             ),
         ]);
-        let output = set_folder_order(
+        let output = update_folder(
             &fixture.client(),
-            SetFolderOrderInput {
-                workspace: Workspace::Personal,
-                parent_folder_id: None,
-                folder_ids: vec!["b".to_owned(), "a".to_owned()],
-            },
+            root_order(&["b".to_owned(), "a".to_owned()]),
         )
         .await
         .expect("order should update");
-        assert_eq!(output.parent, "root");
+        let order = output.child_order.expect("the order should be reported");
+        assert_eq!(order.parent, "root");
+        assert!(output.folder.is_none());
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn update_refuses_what_it_cannot_do_before_any_request() {
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        for (input, expected) in [
+            (json!({"folder_id": "f"}), "nothing to update"),
+            (
+                json!({"team_path": "t", "name": "N"}),
+                "folder_id is required",
+            ),
+            (
+                json!({"parent_folder_id": null, "folder_ids": ["a"]}),
+                "child_order orders the children of folder_id",
+            ),
+            (
+                json!({"child_order": ["a", "b", "a"]}),
+                "folder_ids contains duplicate folder ID",
+            ),
+        ] {
+            let input: UpdateFolderInput =
+                serde_json::from_value(input).expect("input should deserialize");
+            let error = update_folder(&client, input)
+                .await
+                .expect_err("the input should be refused");
+            assert!(error.to_string().starts_with(expected), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn child_order_under_a_folder_uses_that_folder_as_parent() {
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/folders/folder-order", 200, r#"{"root":["p"]}"#),
+            Scenario::new("PUT", "/v1/folders/folder-order", 204, "")
+                .expect_body("the order under p", |body| {
+                    body == r#"{"order":{"p":["b","a"],"root":["p"]}}"#
+                }),
+            Scenario::new(
+                "GET",
+                "/v1/folders/folder-order",
+                200,
+                r#"{"root":["p"],"p":["b","a"]}"#,
+            ),
+        ]);
+        let input = serde_json::from_value(json!({"folder_id": "p", "child_order": ["b", "a"]}))
+            .expect("input should deserialize");
+        let output = update_folder(&fixture.client(), input)
+            .await
+            .expect("order should update");
+        assert_eq!(output.child_order.expect("order reported").parent, "p");
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn an_order_failing_after_the_fields_changed_is_a_partial_write() {
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new("PATCH", "/v1/teams/t/folders/f", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/teams/t/folders/f",
+                200,
+                r#"{"id":"f","name":"New"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams/t/folders/folder-order",
+                500,
+                r#"{"error":"down"}"#,
+            ),
+        ]);
+        let input = serde_json::from_value(json!({
+            "team_path": "t", "folder_id": "f", "name": "New", "child_order": ["a"]
+        }))
+        .expect("input should deserialize");
+        let error = update_folder(&fixture.client_without_retry("fixture-token"), input)
+            .await
+            .expect_err("the order step should fail");
+        assert!(matches!(error, FolderError::OrderAfterUpdate { .. }));
+        assert_eq!(
+            crate::reply::ToolError::kind(&error),
+            crate::reply::ErrorKind::PartialWrite
+        );
         fixture.finish();
     }
 
@@ -639,13 +813,9 @@ mod tests {
             (204, ""),
             (200, r#"{"root":["old"],"other":["theirs"]}"#),
         ]);
-        let error = set_folder_order(
+        let error = update_folder(
             &fixture.client(),
-            SetFolderOrderInput {
-                workspace: Workspace::Personal,
-                parent_folder_id: None,
-                folder_ids: vec!["b".to_owned(), "a".to_owned()],
-            },
+            root_order(&["b".to_owned(), "a".to_owned()]),
         )
         .await
         .expect_err("a lost order must not be reported as set");
@@ -665,16 +835,9 @@ mod tests {
             Scenario::new("PUT", "/v1/folders/folder-order", 204, ""),
             Scenario::new("GET", "/v1/folders/folder-order", 200, "{}"),
         ]);
-        set_folder_order(
-            &fixture.client(),
-            SetFolderOrderInput {
-                workspace: Workspace::Personal,
-                parent_folder_id: None,
-                folder_ids: Vec::new(),
-            },
-        )
-        .await
-        .expect("an emptied order should confirm");
+        update_folder(&fixture.client(), root_order(&[]))
+            .await
+            .expect("an emptied order should confirm");
         fixture.finish();
     }
 

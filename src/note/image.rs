@@ -49,8 +49,6 @@ pub(crate) struct UploadNoteImageOutput {
 pub(crate) enum UploadNoteImageError {
     #[error(transparent)]
     Access(#[from] LocalAccessError),
-    #[error("image_path must be absolute")]
-    RelativePath,
     #[error("image_path is not a readable regular file")]
     InvalidFile,
     #[error("image_path is not a PNG, JPEG, GIF, or WebP image")]
@@ -79,10 +77,9 @@ impl crate::reply::ToolError for UploadNoteImageError {
 
         match self {
             Self::Access(error) => error.kind(),
-            Self::RelativePath
-            | Self::InvalidFile
-            | Self::UnsupportedFormat
-            | Self::TeamUnsupported => ErrorKind::InvalidInput,
+            Self::InvalidFile | Self::UnsupportedFormat | Self::TeamUnsupported => {
+                ErrorKind::InvalidInput
+            }
             Self::TooLarge { .. } => ErrorKind::TooLarge,
             Self::ConfirmationRequired { .. } => ErrorKind::ConfirmationRequired,
             Self::Reference(error) => error.kind(),
@@ -107,39 +104,54 @@ fn ensure_supported_image(header: &[u8]) -> Result<(), UploadNoteImageError> {
         .ok_or(UploadNoteImageError::UnsupportedFormat)
 }
 
-pub(crate) async fn upload_note_image(
-    client: &HackmdClient,
+/// Opens the image, checks its size and leading bytes, and rewinds it for
+/// the upload.
+fn open_image(
     files: &LocalFiles,
-    input: UploadNoteImageInput,
-) -> Result<Result<UploadNoteImageOutput, NoteResolution>, UploadNoteImageError> {
-    if !input.image_path.is_absolute() {
-        return Err(UploadNoteImageError::RelativePath);
-    }
-    files.allow(&input.image_path)?;
+    input: &UploadNoteImageInput,
+) -> Result<(std::fs::File, u64), UploadNoteImageError> {
+    // A missing or special file is simply not an image to upload; a path the
+    // confinement refuses is reported as that, so it can be fixed.
     let mut image = files
         .open_read(&input.image_path)
-        .map_err(|_| UploadNoteImageError::InvalidFile)?;
-    let metadata = image
+        .map_err(|error| match error {
+            LocalAccessError::NotRegular { .. } | LocalAccessError::Io(_) => {
+                UploadNoteImageError::InvalidFile
+            }
+            other => UploadNoteImageError::Access(other),
+        })?;
+    let size_bytes = image
         .metadata()
-        .map_err(|_| UploadNoteImageError::InvalidFile)?;
-    if !metadata.is_file() {
-        return Err(UploadNoteImageError::InvalidFile);
-    }
-    let size_bytes = metadata.len();
+        .map_err(|_| UploadNoteImageError::InvalidFile)?
+        .len();
     if size_bytes > IMAGE_MAX_BYTES {
         return Err(UploadNoteImageError::TooLarge { size_bytes });
     }
     if size_bytes > IMAGE_WARNING_BYTES && !input.confirm_large_file {
         return Err(UploadNoteImageError::ConfirmationRequired { size_bytes });
     }
-    let mut header = [0_u8; 12];
-    let header_len = image
-        .read(&mut header)
+
+    // `take` then `read_to_end`, not one `read`: a single read may return fewer
+    // bytes than asked, and a WebP needs all twelve.
+    let mut header = Vec::with_capacity(12);
+    (&mut image)
+        .take(12)
+        .read_to_end(&mut header)
         .map_err(|_| UploadNoteImageError::InvalidFile)?;
-    ensure_supported_image(&header[..header_len])?;
+    ensure_supported_image(&header)?;
     image
         .seek(SeekFrom::Start(0))
         .map_err(|_| UploadNoteImageError::InvalidFile)?;
+    Ok((image, size_bytes))
+}
+
+pub(crate) async fn upload_note_image(
+    client: &HackmdClient,
+    files: &LocalFiles,
+    input: UploadNoteImageInput,
+) -> Result<Result<UploadNoteImageOutput, NoteResolution>, UploadNoteImageError> {
+    files.allow(&input.image_path)?;
+    let (image, size_bytes) = crate::local::offload(|| open_image(files, &input))?;
     let resolution = crate::note::reference::resolve_note_ref(
         client,
         input.workspace,
@@ -260,7 +272,9 @@ mod tests {
         .expect("input should deserialize");
         assert!(matches!(
             upload_note_image(&client, &files(), relative).await,
-            Err(UploadNoteImageError::RelativePath)
+            Err(UploadNoteImageError::Access(
+                crate::local::LocalAccessError::Relative { .. }
+            ))
         ));
 
         let oversized = tempfile::NamedTempFile::new().expect("temp image should create");

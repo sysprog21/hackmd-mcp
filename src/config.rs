@@ -31,7 +31,11 @@ const SUPPORTED_ENV_KEYS: [&str; 4] = [
 /// Parsed from a working-directory `.env` but never honored there. The state
 /// directory holds full private note bodies, and a `.env` shipped in someone
 /// else's repository could otherwise have them written into its own tree.
-const ENVIRONMENT_ONLY_KEY: &str = "HACKMD_MCP_STATE_DIR";
+///
+/// `HACKMD_MCP_WORKSPACE_ROOT` is honored from `.env`, so a user who confines
+/// the server there stays confined, but such a root is not trusted: see
+/// `Config::workspace_root_trusted`.
+const ENVIRONMENT_ONLY_KEYS: [&str; 1] = ["HACKMD_MCP_STATE_DIR"];
 
 /// Application configuration loaded from the local process environment.
 #[derive(Debug)]
@@ -43,6 +47,7 @@ pub(crate) struct Config {
     retry: RetryConfig,
     state_dir: PathBuf,
     workspace_root: Option<PathBuf>,
+    workspace_root_trusted: bool,
     list_cache_ttl: Duration,
 }
 
@@ -52,10 +57,12 @@ impl Config {
             .ok()
             .map(|directory| load_dotenv(&directory.join(".env")))
             .unwrap_or_default();
-        if dotenv.remove(ENVIRONMENT_ONLY_KEY).is_some() {
-            tracing::warn!(
-                "the working-directory .env sets {ENVIRONMENT_ONLY_KEY}, which is honored only from the environment; tracked notes elsewhere will look untracked"
-            );
+        for key in ENVIRONMENT_ONLY_KEYS {
+            if dotenv.remove(key).is_some() {
+                tracing::warn!(
+                    "the working-directory .env sets {key}, which is honored only from the environment; set it there instead"
+                );
+            }
         }
         let inherited = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
 
@@ -71,7 +78,10 @@ impl Config {
         {
             return Err(ConfigError::DotenvApiUrlWithInheritedToken);
         }
-        Self::from_getter(|key| std::env::var(key).ok().or_else(|| dotenv.get(key).cloned()))
+        let mut config =
+            Self::from_getter(|key| std::env::var(key).ok().or_else(|| dotenv.get(key).cloned()))?;
+        config.workspace_root_trusted = inherited("HACKMD_MCP_WORKSPACE_ROOT").is_some();
+        Ok(config)
     }
 
     fn from_getter(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self, ConfigError> {
@@ -114,6 +124,7 @@ impl Config {
             retry: RetryConfig::default(),
             state_dir,
             workspace_root,
+            workspace_root_trusted: true,
             list_cache_ttl: LIST_CACHE_TTL,
         })
     }
@@ -146,6 +157,14 @@ impl Config {
     /// original behavior of accepting any absolute path.
     pub(crate) fn workspace_root(&self) -> Option<&Path> {
         self.workspace_root.as_deref()
+    }
+
+    /// Whether the workspace root came from the inherited environment. One
+    /// from a working-directory `.env` still confines, but that file may be
+    /// someone else's: a root of `/` would confine nothing, so the refusal to
+    /// write files agents load as instructions stays on beneath it.
+    pub(crate) const fn workspace_root_trusted(&self) -> bool {
+        self.workspace_root_trusted
     }
 
     pub(crate) const fn retry(&self) -> RetryConfig {

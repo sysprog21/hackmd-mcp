@@ -94,6 +94,12 @@ pub(crate) async fn resolve_note_ref(
     }
 }
 
+/// Whether `note_ref` names a note by `@owner/slug`, which only finds notes
+/// that are live in a workspace list.
+pub(crate) fn is_slug_url(note_ref: &str) -> bool {
+    matches!(parse_note_ref(note_ref), Ok(ParsedNoteRef::Scoped { .. }))
+}
+
 fn parse_note_ref(note_ref: &str) -> Result<ParsedNoteRef, NoteRefError> {
     let value = note_ref.trim();
     if value.is_empty() {

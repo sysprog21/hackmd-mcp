@@ -615,6 +615,7 @@ dependencies = [
  "fastrand",
  "futures-util",
  "httpdate",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

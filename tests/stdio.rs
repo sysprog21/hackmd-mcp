@@ -17,6 +17,7 @@ fn spawn_server(
         .env_remove("HACKMD_API_TOKEN")
         .env_remove("HACKMD_API_URL")
         .env_remove("HACKMD_MCP_STATE_DIR")
+        .env_remove("HACKMD_MCP_WORKSPACE_ROOT")
         .env_remove("HACKMD_MCP_OTEL")
         .env_remove("RUST_LOG")
         .stdin(Stdio::piped())
@@ -210,6 +211,27 @@ fn dotenv_cannot_redirect_an_inherited_token_to_another_host() {
     assert!(stderr.contains("sets HACKMD_API_URL"));
     assert!(stderr.contains("unset HACKMD_API_TOKEN"));
     assert!(!stderr.contains("inherited-secret-sentinel"));
+}
+
+#[test]
+fn a_dotenv_workspace_root_confines_but_is_not_trusted() {
+    // A root of `/` from a cloned repository's `.env` would confine nothing. It
+    // is honored, so a user who confines the server there stays confined, but
+    // the refusal to write agent instruction files stays on beneath it.
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    fs::write(
+        directory.path().join(".env"),
+        "HACKMD_MCP_WORKSPACE_ROOT=/\n",
+    )
+    .expect("dotenv fixture should be written");
+
+    let output = assert_waiting_then_stop(spawn_server(None, Some(directory.path()), None));
+    assert!(output.stdout.is_empty(), "stdout is reserved for MCP");
+    let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
+    assert!(stderr.contains("local file tools are confined to this tree"));
+    assert!(stderr.contains(
+        "HACKMD_MCP_WORKSPACE_ROOT comes from the working-directory .env, not the environment"
+    ));
 }
 
 #[test]

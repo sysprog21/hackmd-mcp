@@ -20,6 +20,9 @@ use crate::sync::state::StateStore;
 pub(crate) struct LocalFiles {
     state: StateStore,
     root: Option<WorkspaceRoot>,
+    /// Refuse to write files agents load as instructions. On without a root,
+    /// and on beneath a root the user did not set in their own environment.
+    guard_instructions: bool,
 }
 
 /// `HACKMD_MCP_WORKSPACE_ROOT`, resolved and opened once. Both the policy check
@@ -98,6 +101,10 @@ pub(crate) enum Entry {
 
 #[derive(Debug, Error)]
 pub(crate) enum LocalAccessError {
+    #[error("{} must be an absolute path", path.display())]
+    Relative { path: PathBuf },
+    #[error("{} is not a regular file", path.display())]
+    NotRegular { path: PathBuf },
     #[error("{} contains a .. component; name the destination directly", path.display())]
     Traversal { path: PathBuf },
     #[error(
@@ -135,6 +142,7 @@ impl crate::reply::ToolError for LocalAccessError {
             | Self::MissingRoot { .. }
             | Self::ReplacedRoot { .. }
             | Self::AgentInstructions { .. } => ErrorKind::LocalAccess,
+            Self::Relative { .. } | Self::NotRegular { .. } => ErrorKind::InvalidInput,
             Self::Io(_) => ErrorKind::LocalIo,
         }
     }
@@ -193,8 +201,16 @@ impl LocalFiles {
     pub(crate) fn new(state_dir: PathBuf, root: Option<PathBuf>) -> Self {
         Self {
             state: StateStore::new(state_dir),
+            guard_instructions: root.is_none(),
             root: root.map(WorkspaceRoot::open),
         }
+    }
+
+    /// Keeps the instruction-file refusal on beneath the root, for a root that
+    /// came from a file the user may not have written.
+    pub(crate) fn guarding_instructions(mut self) -> Self {
+        self.guard_instructions = true;
+        self
     }
 
     pub(crate) fn state(&self) -> &StateStore {
@@ -217,6 +233,13 @@ impl LocalFiles {
     /// inside that tree: an agent acting on a note that tells it to write
     /// `~/.zshrc` gets an error instead of a shell profile.
     pub(crate) fn allow(&self, path: &Path) -> Result<(), LocalAccessError> {
+        // Relative to what would be the server's own working directory, which
+        // the caller neither chose nor can see.
+        if !path.is_absolute() {
+            return Err(LocalAccessError::Relative {
+                path: path.to_path_buf(),
+            });
+        }
         let Some((canonical, _)) = self.root_for(path)? else {
             return Ok(());
         };
@@ -231,15 +254,16 @@ impl LocalFiles {
     }
 
     /// `allow`, for a path about to be written. Without a root there is no
-    /// tree the user chose, so the files agents load as instructions are
-    /// refused too: a note must not be able to talk an agent into pulling
-    /// itself over `CLAUDE.md` or into a skills directory.
+    /// tree the user chose, and a root from a working-directory `.env` may not
+    /// be the user's choice either, so in both cases the files agents load as
+    /// instructions are refused too: a note must not be able to talk an agent
+    /// into pulling itself over `CLAUDE.md` or into a skills directory.
     pub(crate) fn allow_write(&self, path: &Path) -> Result<(), LocalAccessError> {
         self.allow(path)?;
 
         // Judged on the path as spelled and as resolved, so a symlinked
         // directory such as `/tmp/x -> /repo/.claude` cannot hide one.
-        if self.root.is_none()
+        if self.guard_instructions
             && (is_agent_instruction_path(path)
                 || is_agent_instruction_path(&resolve_existing_prefix(path)))
         {
@@ -301,11 +325,35 @@ impl LocalFiles {
         })
     }
 
+    /// Opens a regular file for reading and refuses anything else. The open
+    /// itself is non-blocking: opening a FIFO would otherwise wait for a
+    /// writer, hanging the tool call and pinning a runtime worker, and a check
+    /// made before opening could be raced by swapping one in. The handle it
+    /// returns is what gets checked. For a regular file the flag changes
+    /// nothing, so reads behave as usual.
     pub(crate) fn open_read(&self, path: &Path) -> Result<fs::File, LocalAccessError> {
-        let Some((dir, relative)) = self.confined(path)? else {
-            return Ok(fs::File::open(path)?);
+        let file = match self.confined(path)? {
+            None => {
+                let mut options = fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+                options.open(path)?
+            }
+            Some((dir, relative)) => {
+                let mut options = cap_std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                cap_std::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+                dir.open_with(relative, &options)?.into_std()
+            }
         };
-        Ok(dir.open(relative)?.into_std())
+        if !file.metadata()?.is_file() {
+            return Err(LocalAccessError::NotRegular {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(file)
     }
 
     /// Removes a file, through the root's capability when one is configured.
@@ -329,10 +377,10 @@ impl LocalFiles {
         create_parent_dirs: bool,
     ) -> Result<(), LocalAccessError> {
         crate::local::offload(|| {
+            // The same refusal `allow_write` gives up front, repeated where the
+            // write happens so no caller can skip it.
+            self.allow_write(path)?;
             let Some((dir, relative)) = self.confined(path)? else {
-                // The same refusal `allow_write` gives up front, repeated where
-                // the unconfined write happens so no caller can skip it.
-                self.allow_write(path)?;
                 if create_parent_dirs && let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -464,6 +512,45 @@ mod tests {
         assert_eq!(super::offload(|| "no runtime needed"), "no runtime needed");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_instead_of_blocking_the_read() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let fifo = directory.path().join("pipe.md");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should run");
+        assert!(made.success());
+        for files in [
+            LocalFiles::new(directory.path().join("state"), None),
+            LocalFiles::new(
+                directory.path().join("state"),
+                Some(directory.path().to_path_buf()),
+            ),
+        ] {
+            let error = files
+                .open_read(&fifo)
+                .expect_err("a FIFO is not a regular file");
+            assert_eq!(
+                error.to_string(),
+                format!("{} is not a regular file", fifo.display())
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_path_is_refused_as_invalid_input() {
+        use crate::reply::{ErrorKind, ToolError};
+
+        let files = LocalFiles::new("/tmp/state".into(), None);
+        let error = files
+            .allow("notes/note.md".as_ref())
+            .expect_err("a relative path must be refused");
+        assert_eq!(error.to_string(), "notes/note.md must be an absolute path");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+
     #[test]
     fn without_a_root_agent_instruction_files_are_not_written() {
         let files = LocalFiles::new("/tmp/state".into(), None);
@@ -502,6 +589,29 @@ mod tests {
         assert!(matches!(
             files.allow_write(&link.join("rules/note.md")),
             Err(LocalAccessError::AgentInstructions { .. })
+        ));
+    }
+
+    #[test]
+    fn a_root_from_dotenv_confines_and_still_refuses_instruction_files() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let files = LocalFiles::new(
+            directory.path().join("state"),
+            Some(directory.path().to_path_buf()),
+        )
+        .guarding_instructions();
+        assert!(matches!(
+            files.allow_write(&directory.path().join("CLAUDE.md")),
+            Err(LocalAccessError::AgentInstructions { .. })
+        ));
+        assert!(
+            files
+                .allow_write(&directory.path().join("notes.md"))
+                .is_ok()
+        );
+        assert!(matches!(
+            files.allow_write("/elsewhere/notes.md".as_ref()),
+            Err(LocalAccessError::OutsideRoot { .. })
         ));
     }
 

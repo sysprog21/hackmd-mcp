@@ -40,14 +40,16 @@ take precedence over `.env`. The server reads only these keys:
   the inherited environment, never from `.env`: the directory holds full note bodies,
   and a `.env` in someone else's repository must not be able to redirect them.
 - `HACKMD_MCP_WORKSPACE_ROOT` — optional tree that `hackmd_pull_note`,
-  `hackmd_push_note`, `hackmd_check_note_sync`, and `hackmd_upload_note_image` are
-  confined to. It must be absolute. Set it and a note
+  `hackmd_push_note`, `hackmd_get_note` with a `local_path`, and
+  `hackmd_upload_note_image` are confined to. It must be absolute. Set it and a note
   that tells an agent to access outside that tree is rejected; capability-relative
   operations stay confined if a symlink is swapped concurrently. Unset, any absolute
   path is accepted, except that a pull will not write a file coding agents load as
   instructions (`CLAUDE.md`, `AGENTS.md`, `SKILL.md`, and the like, or anything under
   `.claude/`, `.github/`, `.cursor/` and similar), and the server logs a warning at
-  startup.
+  startup. A root set only in a working-directory `.env` still confines, but since that
+  file may belong to someone else's repository (whose root could be `/`), the refusal to
+  write agent instruction files stays on beneath it too.
 
 A `.env` in the working directory may not redirect a token that came from the environment: if
 `HACKMD_API_TOKEN` is inherited and only that file sets `HACKMD_API_URL`, the server refuses to

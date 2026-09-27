@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -7,8 +9,10 @@ use crate::{
     dto::{
         CommentPermission, NotePermission, NotePublishType, NoteResponse, SimpleUserProfileResponse,
     },
+    local::LocalFiles,
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution, ResolvedNoteRef},
+    sync::check::{CheckNoteSyncError, CheckNoteSyncOutput, check_note_sync},
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -20,11 +24,18 @@ pub(crate) struct GetNoteInput {
     #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
     /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
-    pub(crate) note_ref: String,
+    /// Give this or `local_path`, not both.
+    pub(crate) note_ref: Option<String>,
     /// Bypass the 60-second account and note-list caches when resolving an
     /// `@owner/slug` URL.
     #[serde(default)]
     pub(crate) refresh: bool,
+    /// Instead of `note_ref`: the absolute path of a Markdown file tracked by
+    /// `hackmd_pull_note`. The result is then that file's sync state, compared
+    /// three ways against its baseline and the remote note, without writing:
+    /// `in_sync`, `local_changed`, `remote_changed`, or `conflict`, with the
+    /// SHA-256 of each body.
+    pub(crate) local_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -36,6 +47,10 @@ pub(crate) struct NoteDetail {
     /// and echoing a large note back only spends context.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) content: Option<String>,
+    /// SHA-256 of the body as read. Pass it back as `expected_hash` on
+    /// `hackmd_update_note` to write only if nobody changed the body since.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) body_hash: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) tags: Vec<String>,
     #[serde(rename = "team_path")]
@@ -64,8 +79,14 @@ pub(crate) struct NoteDetail {
 
 #[derive(Debug, Error)]
 pub(crate) enum GetNoteError {
+    #[error("give either note_ref or local_path")]
+    NoteRefOrLocalPath,
+    #[error("local_path is looked up in the local sync records; omit team_path and refresh")]
+    SyncFilters,
     #[error(transparent)]
     Reference(#[from] NoteRefError),
+    #[error(transparent)]
+    Sync(#[from] CheckNoteSyncError),
     #[error(transparent)]
     Api(#[from] HackmdError),
 }
@@ -73,28 +94,51 @@ pub(crate) enum GetNoteError {
 impl crate::reply::ToolError for GetNoteError {
     fn kind(&self) -> crate::reply::ErrorKind {
         match self {
+            Self::NoteRefOrLocalPath | Self::SyncFilters => crate::reply::ErrorKind::InvalidInput,
             Self::Reference(error) => error.kind(),
+            Self::Sync(error) => error.kind(),
             Self::Api(error) => error.kind(),
         }
     }
 }
 
+/// One note, or the sync state of a tracked file.
+/// Tagged with `mode` (`note` or `sync`) so a caller can tell the two shapes
+/// apart without guessing.
+#[derive(Debug, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub(crate) enum GetNoteOutput {
+    Note(Box<NoteDetail>),
+    Sync(CheckNoteSyncOutput),
+}
+
 pub(crate) async fn get_note(
     client: &HackmdClient,
+    files: &LocalFiles,
     input: GetNoteInput,
-) -> Result<Result<NoteDetail, NoteResolution>, GetNoteError> {
-    let resolution = crate::note::reference::resolve_note_ref(
-        client,
-        input.workspace,
-        &input.note_ref,
-        input.refresh,
-    )
-    .await?;
+) -> Result<Result<GetNoteOutput, NoteResolution>, GetNoteError> {
+    let note_ref = match (input.note_ref, input.local_path) {
+        (Some(note_ref), None) => note_ref,
+        (None, Some(local_path)) => {
+            // The record names the note, so a team or a cache bypass here would
+            // only look like it mattered.
+            if input.workspace != Workspace::Personal || input.refresh {
+                return Err(GetNoteError::SyncFilters);
+            }
+            let sync = check_note_sync(client, files, &local_path).await?;
+            return Ok(Ok(GetNoteOutput::Sync(sync)));
+        }
+        _ => return Err(GetNoteError::NoteRefOrLocalPath),
+    };
+    let resolution =
+        crate::note::reference::resolve_note_ref(client, input.workspace, &note_ref, input.refresh)
+            .await?;
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
     let response = client.get_note(&note.workspace, &note.note_id).await?;
-    Ok(Ok(normalize_note(note, response)))
+    let detail = crate::local::offload(|| normalize_note(note, response));
+    Ok(Ok(GetNoteOutput::Note(Box::new(detail))))
 }
 
 pub(crate) fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> NoteDetail {
@@ -103,6 +147,7 @@ pub(crate) fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> 
         id: note.id,
         short_id: note.short_id,
         title: note.title,
+        body_hash: note.content.as_deref().map(crate::sync::state::body_hash),
         content: note.content,
         description: note.description,
         tags: note.tags,
@@ -205,15 +250,20 @@ mod tests {
         )]);
         let output = super::get_note(
             &fixture.client(),
+            &crate::fixture::scratch_files(),
             GetNoteInput {
                 workspace: Workspace::Personal,
-                note_ref: "internal-id".to_owned(),
+                note_ref: Some("internal-id".to_owned()),
                 refresh: false,
+                local_path: None,
             },
         )
         .await
         .expect("direct get should succeed")
         .expect("direct reference should resolve");
+        let super::GetNoteOutput::Note(output) = output else {
+            panic!("a note_ref should return the note");
+        };
         assert_eq!(output.id, "internal-id");
         fixture.finish();
     }
@@ -242,16 +292,50 @@ mod tests {
         ]);
         let output = super::get_note(
             &fixture.client(),
+            &crate::fixture::scratch_files(),
             GetNoteInput {
                 workspace: Workspace::Personal,
-                note_ref: "https://hackmd.io/@alice/slug".to_owned(),
+                note_ref: Some("https://hackmd.io/@alice/slug".to_owned()),
                 refresh: false,
+                local_path: None,
             },
         )
         .await
         .expect("scoped get should succeed")
         .expect("scoped reference should resolve");
+        let super::GetNoteOutput::Note(output) = output else {
+            panic!("a note_ref should return the note");
+        };
         assert_eq!(output.id, "resolved-id");
         fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn exactly_one_of_note_ref_and_local_path_is_taken() {
+        let client = crate::client::HackmdClient::new(crate::config::Config::for_tests())
+            .expect("client should build");
+        let files = crate::fixture::scratch_files();
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({"note_ref": "id", "local_path": "/tmp/note.md"}),
+        ] {
+            let input: GetNoteInput =
+                serde_json::from_value(input).expect("input should deserialize");
+            assert!(matches!(
+                super::get_note(&client, &files, input).await,
+                Err(super::GetNoteError::NoteRefOrLocalPath)
+            ));
+        }
+        for input in [
+            serde_json::json!({"local_path": "/tmp/note.md", "refresh": true}),
+            serde_json::json!({"local_path": "/tmp/note.md", "team_path": "core"}),
+        ] {
+            let input: GetNoteInput =
+                serde_json::from_value(input).expect("input should deserialize");
+            assert!(matches!(
+                super::get_note(&client, &files, input).await,
+                Err(super::GetNoteError::SyncFilters)
+            ));
+        }
     }
 }

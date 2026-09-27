@@ -7,4 +7,3 @@ pub(crate) mod image;
 pub(crate) mod list;
 pub(crate) mod patch;
 pub(crate) mod reference;
-pub(crate) mod trash;

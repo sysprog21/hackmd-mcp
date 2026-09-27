@@ -107,10 +107,30 @@ fn nonempty_detail(detail: String) -> String {
 
 fn bounded_body(body: &[u8], token: &str) -> String {
     const MAX_CHARS: usize = 300;
-    let text = String::from_utf8_lossy(body).replace(token, "[REDACTED]");
+
+    // Only the start of the body can be shown, so only the start is decoded: an
+    // error body can be as large as the response cap. The cut leaves room for
+    // the longest UTF-8 encoding of every shown character plus a whole token,
+    // so a token that begins within them is still found and replaced.
+    let cut = body.len().min(MAX_CHARS * 4 + token.len());
+    let truncated = cut < body.len();
+    let mut text = String::from_utf8_lossy(&body[..cut]).replace(token, "[REDACTED]");
+
+    // Each replacement shortens the text, which can pull a token split by the
+    // cut into the characters shown. Whatever prefix of it the cut left at the
+    // end goes.
+    if truncated
+        && let Some(partial) = token
+            .char_indices()
+            .rev()
+            .map(|(end, _)| &token[..end])
+            .find(|prefix| !prefix.is_empty() && text.ends_with(prefix))
+    {
+        text.truncate(text.len() - partial.len());
+    }
     let mut chars = text.chars();
     let mut bounded: String = chars.by_ref().take(MAX_CHARS).collect();
-    if chars.next().is_some() {
+    if truncated || chars.next().is_some() {
         bounded.push('…');
     }
     bounded
@@ -148,6 +168,10 @@ pub(crate) enum HackmdError {
     Timeout { method: String, path: String },
     #[error("HackMD write read-back exceeded its bounded verification window")]
     ReadbackTimeout,
+    #[error("HackMD accepted the update for note {note_id}, but read-back content did not match")]
+    ReadbackMismatch { note_id: String },
+    #[error("remote note {note_id} has no Markdown content")]
+    MissingContent { note_id: String },
     #[error("{method} {path}: network request failed; check connectivity and HACKMD_API_URL")]
     Network { method: String, path: String },
     #[error(
@@ -205,7 +229,8 @@ impl crate::reply::ToolError for HackmdError {
                 ErrorKind::Upstream
             }
             Self::Api { .. } => ErrorKind::Api,
-            Self::ReadbackTimeout => ErrorKind::Readback,
+            Self::ReadbackTimeout | Self::ReadbackMismatch { .. } => ErrorKind::Readback,
+            Self::MissingContent { .. } => ErrorKind::Upstream,
             Self::ResponseTooLarge { .. } | Self::ImageTooLarge { .. } => ErrorKind::TooLarge,
             Self::InvalidPayload | Self::EmptyPathSegment | Self::DotPathSegment => {
                 ErrorKind::InvalidInput
@@ -238,5 +263,35 @@ mod tests {
             result.meta.expect("errors carry _meta").0.get("error_kind"),
             Some(&serde_json::json!("auth"))
         );
+    }
+
+    #[test]
+    fn body_errors_keep_their_kinds() {
+        use crate::reply::{ErrorKind, ToolError};
+
+        let note_id = "n".to_owned();
+        assert_eq!(
+            HackmdError::MissingContent {
+                note_id: note_id.clone()
+            }
+            .kind(),
+            ErrorKind::Upstream
+        );
+        assert_eq!(
+            HackmdError::ReadbackMismatch { note_id }.kind(),
+            ErrorKind::Readback
+        );
+    }
+
+    #[test]
+    fn a_token_split_by_the_cut_is_not_shown() {
+        // Each redaction shortens the text, so without care the start of the
+        // token the cut split lands inside the characters shown.
+        let token = "t".repeat(40) + &"k".repeat(24);
+        let body = token.repeat(40);
+        let shown = super::bounded_body(body.as_bytes(), &token);
+        assert!(!shown.contains('t') && !shown.contains('k'), "{shown}");
+        assert!(shown.starts_with("[REDACTED][REDACTED]"));
+        assert!(shown.ends_with('…'));
     }
 }

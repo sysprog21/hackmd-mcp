@@ -7,8 +7,12 @@ use thiserror::Error;
 use crate::{
     client::HackmdClient,
     dto::NoteResponse,
+    local::LocalFiles,
     models::Workspace,
     paging::{InvalidLimit, PageMeta, default_limit, paginate, validate_limit},
+    sync::tracking::{
+        ListTrackedNotesInput, ListTrackedNotesOutput, TrackingError, list_tracked_notes,
+    },
 };
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -18,8 +22,9 @@ pub(crate) struct ListNotesInput {
     #[serde(default)]
     pub(crate) source: NoteSource,
     /// Team path (from `hackmd_get_me`) of a team workspace; omit for the
-    /// personal workspace. Only the `workspace` source takes a team; history
-    /// and trash are account-wide.
+    /// personal workspace. History and trash are account-wide and take no
+    /// team; for `tracked` a team narrows the records to that team's notes,
+    /// and omitting it lists every workspace's.
     #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
     /// Maximum notes returned after filtering (default 20, maximum 100).
@@ -55,8 +60,14 @@ pub(crate) enum NoteSource {
     Workspace,
     /// Recently viewed notes from every workspace, with `last_visit`.
     History,
-    /// Trashed personal notes; `hackmd_restore_note` brings one back.
+    /// Trashed personal notes; `hackmd_delete_note` with `restore: true`
+    /// brings one back.
     Trash,
+    /// Local Markdown files tracked by `hackmd_pull_note`, with the note each
+    /// syncs to and its baseline hash. Read from local state only: `query`
+    /// matches the note ID or path, `team_path` narrows to one team, and
+    /// `tags`, `sort`, and `refresh` do not apply.
+    Tracked,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -121,6 +132,10 @@ pub(crate) enum ListNotesError {
     Limit(#[from] InvalidLimit),
     #[error("source {0} is account-wide; omit team_path")]
     AccountWideSource(&'static str),
+    #[error("source tracked lists local sync records; tags, sort, and refresh do not apply")]
+    TrackedFilters,
+    #[error(transparent)]
+    Tracking(#[from] TrackingError),
     #[error(transparent)]
     Api(#[from] crate::client::HackmdError),
 }
@@ -130,14 +145,82 @@ impl crate::reply::ToolError for ListNotesError {
         use crate::reply::ErrorKind;
 
         match self {
-            Self::Limit(..) | Self::AccountWideSource(..) => ErrorKind::InvalidInput,
+            Self::Limit(..) | Self::AccountWideSource(..) | Self::TrackedFilters => {
+                ErrorKind::InvalidInput
+            }
+            Self::Tracking(error) => error.kind(),
             Self::Api(error) => error.kind(),
+        }
+    }
+}
+
+/// A remote note list, or the local tracked records: the same page shape
+/// either way, with different entries.
+/// Tagged with `mode` (`notes` or `tracked`) so a caller can tell the two
+/// entry shapes apart without guessing.
+#[derive(Debug, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub(crate) enum ListOutput {
+    Notes(ListNotesOutput),
+    Tracked(ListTrackedNotesOutput),
+}
+
+impl ListOutput {
+    pub(crate) fn meta(&self) -> &PageMeta {
+        match self {
+            Self::Notes(output) => &output.meta,
+            Self::Tracked(output) => &output.meta,
         }
     }
 }
 
 pub(crate) async fn list_notes(
     client: &HackmdClient,
+    files: &LocalFiles,
+    input: ListNotesInput,
+) -> Result<ListOutput, ListNotesError> {
+    let source = match input.source {
+        NoteSource::Workspace => RemoteSource::Workspace,
+        NoteSource::History => RemoteSource::History,
+        NoteSource::Trash => RemoteSource::Trash,
+        NoteSource::Tracked => return list_tracked(files, &input).map(ListOutput::Tracked),
+    };
+    Ok(ListOutput::Notes(list_remote(client, source, input).await?))
+}
+
+fn list_tracked(
+    files: &LocalFiles,
+    input: &ListNotesInput,
+) -> Result<ListTrackedNotesOutput, ListNotesError> {
+    if !input.tags.is_empty() || input.sort.is_some() || input.refresh {
+        return Err(ListNotesError::TrackedFilters);
+    }
+
+    // An omitted team lists every workspace's records, not only personal ones:
+    // `Workspace` cannot tell "omitted" from "personal", and listing everything
+    // is what a caller without a team means here.
+    Ok(list_tracked_notes(
+        files,
+        &ListTrackedNotesInput {
+            limit: input.limit,
+            offset: input.offset,
+            query: input.query.as_deref(),
+            team: Some(&input.workspace).filter(|team| **team != Workspace::Personal),
+        },
+    )?)
+}
+
+/// The sources `HackMD` itself lists.
+#[derive(Debug, Clone, Copy)]
+enum RemoteSource {
+    Workspace,
+    History,
+    Trash,
+}
+
+async fn list_remote(
+    client: &HackmdClient,
+    source: RemoteSource,
     input: ListNotesInput,
 ) -> Result<ListNotesOutput, ListNotesError> {
     validate_limit(input.limit)?;
@@ -151,18 +234,18 @@ pub(crate) async fn list_notes(
 
     // Only a workspace list has a default order; history and trash keep the
     // order `HackMD` returns unless a sort is asked for.
-    let sort = match input.source {
-        NoteSource::Workspace => Some(input.sort.unwrap_or(NoteSort::LastChangedDesc)),
-        NoteSource::History | NoteSource::Trash => input.sort,
+    let sort = match source {
+        RemoteSource::Workspace => Some(input.sort.unwrap_or(NoteSort::LastChangedDesc)),
+        RemoteSource::History | RemoteSource::Trash => input.sort,
     };
-    match input.source {
-        NoteSource::Workspace => {
+    match source {
+        RemoteSource::Workspace => {
             let notes = client.list_notes(&input.workspace, input.refresh).await?;
             Ok(filter_sort_page(&notes, &input, sort, |_| {
                 input.workspace.clone()
             }))
         }
-        NoteSource::History => {
+        RemoteSource::History => {
             account_wide("history")?;
             let notes = client.get_history().await?;
             Ok(filter_sort_page(&notes, &input, sort, |note| {
@@ -173,7 +256,7 @@ pub(crate) async fn list_notes(
                     })
             }))
         }
-        NoteSource::Trash => {
+        RemoteSource::Trash => {
             account_wide("trash")?;
             let notes = client.list_trash().await?;
             Ok(filter_sort_page(&notes, &input, sort, |_| {
@@ -242,7 +325,7 @@ fn matches_query(note: &NoteResponse, query: &str) -> bool {
 /// Whether `value` contains `needle`, which is already lowercase. Every note
 /// field is searched on every query, so the common all-ASCII case compares in
 /// place; anything else takes Unicode lowercasing, which can change length.
-fn contains_folded(value: &str, needle: &str) -> bool {
+pub(crate) fn contains_folded(value: &str, needle: &str) -> bool {
     if value.is_ascii() && needle.is_ascii() {
         let (value, needle) = (value.as_bytes(), needle.as_bytes());
         return needle.is_empty()
@@ -281,7 +364,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ListNotesError, ListNotesInput, NoteSort, NoteSource, filter_sort_page, list_notes,
+        ListNotesError, ListNotesInput, ListNotesOutput, ListOutput, NoteSort, NoteSource,
+        filter_sort_page, list_notes,
     };
     use crate::{
         client::HackmdClient,
@@ -317,7 +401,67 @@ mod tests {
         }
     }
 
-    fn page(notes: &[NoteResponse], input: &ListNotesInput) -> super::ListNotesOutput {
+    /// A remote source, which must come back as a note list.
+    async fn remote(
+        client: &HackmdClient,
+        input: ListNotesInput,
+    ) -> Result<ListNotesOutput, ListNotesError> {
+        match list_notes(client, &crate::fixture::scratch_files(), input).await? {
+            ListOutput::Notes(output) => Ok(output),
+            ListOutput::Tracked(_) => panic!("a remote source listed tracked records"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tracked_source_lists_local_records_and_refuses_remote_filters() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        std::fs::write(&local_path, "baseline").expect("local fixture should write");
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        let mut tracked = input();
+        tracked.source = NoteSource::Tracked;
+        tracked.query = Some("NOTE-ID".to_owned());
+        let ListOutput::Tracked(output) = list_notes(&client, &files, tracked)
+            .await
+            .expect("tracked records should list without a request")
+        else {
+            panic!("the tracked source should list tracked records");
+        };
+        assert_eq!(output.notes.len(), 1);
+        assert_eq!(output.notes[0].note_id, "note-id");
+
+        // A team narrows the records; this one is personal.
+        let mut other_team = input();
+        other_team.source = NoteSource::Tracked;
+        other_team.workspace = Workspace::Team {
+            team_path: "core".to_owned(),
+        };
+        let ListOutput::Tracked(output) = list_notes(&client, &files, other_team)
+            .await
+            .expect("a team filter should list")
+        else {
+            panic!("the tracked source should list tracked records");
+        };
+        assert!(output.notes.is_empty());
+
+        for refuse in [
+            |input: &mut ListNotesInput| input.sort = Some(NoteSort::TitleAsc),
+            |input: &mut ListNotesInput| input.tags = vec!["t".to_owned()],
+            |input: &mut ListNotesInput| input.refresh = true,
+        ] {
+            let mut filtered = input();
+            filtered.source = NoteSource::Tracked;
+            refuse(&mut filtered);
+            assert!(matches!(
+                list_notes(&client, &files, filtered).await,
+                Err(ListNotesError::TrackedFilters)
+            ));
+        }
+    }
+
+    fn page(notes: &[NoteResponse], input: &ListNotesInput) -> ListNotesOutput {
         filter_sort_page(notes, input, Some(NoteSort::LastChangedDesc), |_| {
             Workspace::Personal
         })
@@ -453,7 +597,7 @@ mod tests {
         history.source = NoteSource::History;
         history.limit = 1;
         history.offset = 1;
-        let output = list_notes(&client, history)
+        let output = remote(&client, history)
             .await
             .expect("history should succeed");
         assert_eq!(output.meta.total, 2);
@@ -466,7 +610,7 @@ mod tests {
 
         let mut wrapped = input();
         wrapped.source = NoteSource::History;
-        let output = list_notes(&client, wrapped)
+        let output = remote(&client, wrapped)
             .await
             .expect("wrapped history should succeed");
         assert_eq!(output.meta.count, 1);
@@ -489,7 +633,7 @@ mod tests {
         trash.source = NoteSource::Trash;
         trash.limit = 1;
         trash.offset = 1;
-        let page = list_notes(&client, trash)
+        let page = remote(&client, trash)
             .await
             .expect("trash page should succeed");
         assert_eq!(page.meta.total, 2);
@@ -500,7 +644,7 @@ mod tests {
 
         let mut trash = input();
         trash.source = NoteSource::Trash;
-        let empty = list_notes(&client, trash)
+        let empty = remote(&client, trash)
             .await
             .expect("empty trash should succeed");
         assert_eq!(empty.meta.total, 0);
@@ -518,7 +662,7 @@ mod tests {
                 team_path: "core".to_owned(),
             };
             assert!(matches!(
-                list_notes(&client, invalid).await,
+                remote(&client, invalid).await,
                 Err(ListNotesError::AccountWideSource(_))
             ));
         }
@@ -530,7 +674,7 @@ mod tests {
         let mut invalid = input();
         invalid.limit = 101;
         assert!(matches!(
-            list_notes(&client, invalid).await,
+            remote(&client, invalid).await,
             Err(ListNotesError::Limit(_))
         ));
     }

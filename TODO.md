@@ -239,8 +239,8 @@ dependency, or background task without a bound and an invalidation rule.
 
 - A bounded `hackmd_watch_note_sync` polling tool. A watch capped at 20 seconds
   of polling is not a watch, and the client can simply call
-  `hackmd_check_note_sync` again. Revisit only if a client demonstrates it
-  cannot re-invoke the check tool itself.
+  `hackmd_get_note` with the `local_path` again. Revisit only if a client
+  demonstrates it cannot re-invoke that check itself.
 - A three-way merge helper. Add it only if agents repeatedly fail to resolve the
   three files a conflict already hands them; if added, produce a separate
   `*.merge.md` with standard conflict markers and never auto-merge and push.

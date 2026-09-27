@@ -1,7 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use rmcp::schemars;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
@@ -10,13 +9,6 @@ use crate::{
     sync::state::{StateError, body_digest, body_hash_from_digest, timestamp_text},
     sync::{ChangeState, LocalBodyError, classify_changes, read_local_body},
 };
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CheckNoteSyncInput {
-    /// Absolute path of a Markdown file tracked by `hackmd_pull_note`.
-    pub(crate) local_path: PathBuf,
-}
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -43,12 +35,8 @@ pub(crate) struct CheckNoteSyncOutput {
 pub(crate) enum CheckNoteSyncError {
     #[error(transparent)]
     Access(#[from] LocalAccessError),
-    #[error("local_path must be absolute")]
-    RelativePath,
     #[error(transparent)]
     LocalBody(#[from] LocalBodyError),
-    #[error("remote note {note_id} has no Markdown content")]
-    MissingRemoteContent { note_id: String },
     #[error(transparent)]
     State(#[from] StateError),
     #[error(transparent)]
@@ -57,13 +45,9 @@ pub(crate) enum CheckNoteSyncError {
 
 impl crate::reply::ToolError for CheckNoteSyncError {
     fn kind(&self) -> crate::reply::ErrorKind {
-        use crate::reply::ErrorKind;
-
         match self {
             Self::Access(error) => error.kind(),
-            Self::RelativePath => ErrorKind::InvalidInput,
             Self::LocalBody(error) => error.kind(),
-            Self::MissingRemoteContent { .. } => ErrorKind::Upstream,
             Self::State(error) => error.kind(),
             Self::Api(error) => error.kind(),
         }
@@ -73,24 +57,16 @@ impl crate::reply::ToolError for CheckNoteSyncError {
 pub(crate) async fn check_note_sync(
     client: &HackmdClient,
     files: &LocalFiles,
-    input: CheckNoteSyncInput,
+    local_path: &Path,
 ) -> Result<CheckNoteSyncOutput, CheckNoteSyncError> {
-    if !input.local_path.is_absolute() {
-        return Err(CheckNoteSyncError::RelativePath);
-    }
-    files.allow(&input.local_path)?;
+    files.allow(local_path)?;
     // The record first: an untracked path fails before its file is read.
-    let tracked = files.state().load_for_local_path(&input.local_path)?;
+    let tracked = files.state().load_for_local_path(local_path)?;
     // Only looking needs no large-file confirmation, but the maximum holds.
-    let local = read_local_body(files, &input.local_path, true)?;
-    let remote_note = client
-        .get_note(&tracked.state.workspace, &tracked.state.internal_id)
+    let local = read_local_body(files, local_path, true)?;
+    let (remote_note, remote) = client
+        .get_note_body(&tracked.state.workspace, &tracked.state.internal_id)
         .await?;
-    let remote = remote_note
-        .content
-        .ok_or_else(|| CheckNoteSyncError::MissingRemoteContent {
-            note_id: tracked.state.internal_id.clone(),
-        })?;
     let (local_digest, remote_digest) =
         crate::local::offload(|| (body_digest(&local), body_digest(&remote)));
     let status = match classify_changes(&tracked.baseline_digest, &local_digest, &remote_digest) {
@@ -116,7 +92,7 @@ pub(crate) async fn check_note_sync(
 mod tests {
     use std::fs;
 
-    use super::{CheckNoteSyncInput, SyncStatus, check_note_sync};
+    use super::{SyncStatus, check_note_sync};
     use crate::fixture::{Scenario, SequenceServer};
     #[tokio::test]
     async fn classifies_all_four_sync_states_without_writes() {
@@ -160,15 +136,9 @@ mod tests {
             ("local", SyncStatus::Conflict),
         ] {
             fs::write(&local_path, local).expect("local fixture should update");
-            let output = check_note_sync(
-                &client,
-                &files,
-                CheckNoteSyncInput {
-                    local_path: local_path.clone(),
-                },
-            )
-            .await
-            .expect("check should succeed");
+            let output = check_note_sync(&client, &files, &local_path)
+                .await
+                .expect("check should succeed");
             assert_eq!(output.status, expected);
             assert!(output.remote_body_hash.starts_with("sha256:"));
             statuses.push(output.status);
@@ -194,7 +164,7 @@ mod tests {
         )]);
         let files = crate::fixture::tracked_files(directory.path(), "id", &local_path, "same body");
 
-        let output = check_note_sync(&fixture.client(), &files, CheckNoteSyncInput { local_path })
+        let output = check_note_sync(&fixture.client(), &files, &local_path)
             .await
             .expect("timestamp-only check should succeed");
         assert_eq!(output.status, SyncStatus::InSync);

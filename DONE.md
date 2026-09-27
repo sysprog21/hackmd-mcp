@@ -2,6 +2,18 @@
 
 ## Active roadmap — efficiency and reliability
 
+- [x] Shrink the tool surface to 14 and review again with Codex, Antigravity,
+  and Claude (2026-09-27). A patch is `hackmd_update_note`'s default body edit,
+  restore is `restore: true` on `hackmd_delete_note`, folder order is
+  `child_order` on `hackmd_update_folder`, tracked records are a `tracked`
+  source of `hackmd_list_notes`, and sync state is `hackmd_get_note` with a
+  `local_path`; merged outputs carry a `mode`. `hackmd_get_note` reports a
+  `body_hash` that `expected_hash` turns into a guard against overwriting a
+  body changed since it was read. A root from a working-directory `.env` still
+  confines but keeps the instruction-file refusal on; reads refuse FIFOs
+  without blocking; patches accept `*** End of File`, keep the majority line
+  ending, and redacted error bodies can no longer show a token the cut split.
+
 - [x] Analyze, harden, and simplify after review by Codex, Antigravity, and
   Claude (2026-09-26). A file has at most one sync record, so a pull over
   another note's file can no longer send a later push to that note; state keys

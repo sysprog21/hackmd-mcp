@@ -7,20 +7,20 @@ use thiserror::Error;
 use crate::{
     local::LocalFiles,
     models::Workspace,
-    paging::{InvalidLimit, PageMeta, default_limit, paginate, validate_limit},
+    note::list::contains_folded,
+    paging::{InvalidLimit, PageMeta, paginate, validate_limit},
     sync::state::StateError,
 };
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ListTrackedNotesInput {
-    /// Maximum tracked notes returned (default 20, maximum 100).
-    #[serde(default = "default_limit")]
-    #[schemars(range(min = 1, max = 100))]
+/// What `hackmd_list_notes` passes on for its `tracked` source.
+#[derive(Debug)]
+pub(crate) struct ListTrackedNotesInput<'a> {
     pub(crate) limit: usize,
-    /// Number of tracked notes to skip.
-    #[serde(default)]
     pub(crate) offset: usize,
+    /// Case-insensitive match against the note ID and the local path.
+    pub(crate) query: Option<&'a str>,
+    /// Only this team's records, when given.
+    pub(crate) team: Option<&'a Workspace>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -47,7 +47,8 @@ pub(crate) struct UntrackNoteInput {
     /// personal workspace.
     #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
-    /// Internal `HackMD` note ID shown by `hackmd_list_tracked_notes`.
+    /// Internal `HackMD` note ID, as `hackmd_list_notes` with source `tracked`
+    /// shows it.
     pub(crate) note_id: String,
     /// Required because private baseline and sidecar files will be deleted.
     #[serde(default)]
@@ -89,13 +90,24 @@ impl crate::reply::ToolError for TrackingError {
 
 pub(crate) fn list_tracked_notes(
     files: &LocalFiles,
-    input: &ListTrackedNotesInput,
+    input: &ListTrackedNotesInput<'_>,
 ) -> Result<ListTrackedNotesOutput, TrackingError> {
     validate_limit(input.limit)?;
+    let query = input
+        .query
+        .map(str::to_lowercase)
+        .filter(|query| !query.is_empty());
     let mut notes = files
         .state()
         .list_tracked()?
         .into_iter()
+        .filter(|state| input.team.is_none_or(|team| state.workspace == *team))
+        .filter(|state| {
+            query.as_deref().is_none_or(|query| {
+                contains_folded(&state.internal_id, query)
+                    || contains_folded(&state.local_path.to_string_lossy(), query)
+            })
+        })
         .map(|state| TrackedNoteSummary {
             workspace: state.workspace,
             note_id: state.internal_id,
@@ -136,29 +148,14 @@ mod tests {
     use super::{
         ListTrackedNotesInput, TrackingError, UntrackNoteInput, list_tracked_notes, untrack_note,
     };
-    use crate::{
-        local::LocalFiles,
-        models::Workspace,
-        sync::state::{StateError, TrackedNoteState},
-    };
+    use crate::{local::LocalFiles, models::Workspace, sync::state::StateError};
 
     fn tracked_files() -> (tempfile::TempDir, LocalFiles, std::path::PathBuf) {
         let directory = tempfile::tempdir().expect("temporary directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "baseline").expect("working Markdown should write");
-        let files = LocalFiles::new(directory.path().join("state"), None);
-        let state = TrackedNoteState::capture(
-            "note-id".to_owned(),
-            Workspace::Personal,
-            local_path.clone(),
-            "baseline",
-            Some(1234),
-        )
-        .expect("tracked state should capture");
-        files
-            .state()
-            .persist_from_sync(&state, "baseline")
-            .expect("tracked state should persist");
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
         (directory, files, local_path)
     }
 
@@ -172,6 +169,8 @@ mod tests {
             &ListTrackedNotesInput {
                 limit: 20,
                 offset: 0,
+                query: None,
+                team: None,
             },
         )
         .expect("tracked state should list without the working file");
@@ -180,7 +179,7 @@ mod tests {
         assert_eq!(output.notes[0].note_id, "note-id");
         assert_eq!(output.notes[0].local_path, local_path);
         assert_eq!(output.notes[0].baseline_hash.len(), 71);
-        assert_eq!(output.notes[0].last_observed_remote_timestamp, "1234");
+        assert_eq!(output.notes[0].last_observed_remote_timestamp, "1");
     }
 
     #[test]
@@ -253,7 +252,9 @@ mod tests {
                 &files,
                 &ListTrackedNotesInput {
                     limit: 101,
-                    offset: 0
+                    offset: 0,
+                    query: None,
+                    team: None,
                 }
             ),
             Err(TrackingError::Limit(_))
@@ -274,7 +275,9 @@ mod tests {
                 &files,
                 &ListTrackedNotesInput {
                     limit: 20,
-                    offset: 0
+                    offset: 0,
+                    query: None,
+                    team: None,
                 }
             )
             .expect("state should remain")

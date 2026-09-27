@@ -124,22 +124,10 @@ pub(crate) struct UpdateNoteRequest {
 }
 
 impl UpdateNoteRequest {
+    /// An empty request is refused one layer up, where the tool can say
+    /// which inputs would have changed something.
     pub(crate) fn validate(&self) -> Result<(), PayloadError> {
-        if self.is_empty() {
-            return Err(PayloadError::EmptyPatch);
-        }
         validate_permission_order(self.read_permission, self.write_permission)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.title.is_none()
-            && self.content.is_none()
-            && self.tags.is_none()
-            && self.description.is_none()
-            && self.read_permission.is_none()
-            && self.write_permission.is_none()
-            && self.permalink.is_none()
-            && self.parent_folder_id.is_none()
     }
 }
 
@@ -166,6 +154,11 @@ pub(crate) enum PatchField {
 }
 
 impl PatchField {
+    /// Whether the caller supplied the field at all, `null` included.
+    pub(crate) fn is_specified(&self) -> bool {
+        matches!(self, Self::Set(_))
+    }
+
     /// Converts to the request shape: an outer `None` omits the field, an
     /// inner `None` serializes an explicit JSON null.
     #[allow(
@@ -189,12 +182,8 @@ where
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum PayloadError {
-    #[error("PATCH body must contain at least one explicitly supplied field")]
-    EmptyPatch,
     #[error("writePermission cannot be more permissive than readPermission")]
     WriteMorePermissiveThanRead,
-    #[error("folder PATCH body must contain at least one explicitly supplied field")]
-    EmptyFolderPatch,
 }
 
 impl crate::reply::ToolError for PayloadError {
@@ -256,10 +245,10 @@ pub(crate) struct SimpleUserProfileResponse {
     pub(crate) biography: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-/// Read in `HackMD`'s camel case, written out in snake case like every other
-/// tool field.
-#[serde(rename_all(deserialize = "camelCase", serialize = "snake_case"))]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// A note as `HackMD` returns it. Only ever read: tools answer with their own
+/// output types built from it.
+#[serde(rename_all = "camelCase")]
 pub(crate) struct NoteResponse {
     pub(crate) id: String,
     pub(crate) title: String,
@@ -269,29 +258,14 @@ pub(crate) struct NoteResponse {
     pub(crate) created_at: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_optional_millis")]
     pub(crate) last_changed_at: Option<i64>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_millis",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_millis")]
     pub(crate) title_updated_at: Option<i64>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_millis",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_millis")]
     pub(crate) tags_updated_at: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_change_user: Option<SimpleUserProfileResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) publish_type: Option<NotePublishType>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_millis",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_millis")]
     pub(crate) published_at: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default, deserialize_with = "deserialize_optional_millis")]
     pub(crate) last_visit: Option<i64>,
     pub(crate) read_permission: Option<NotePermission>,
@@ -346,19 +320,11 @@ impl HistoryResponse {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-/// Read in `HackMD`'s camel case, written out in snake case like every other
-/// tool field.
-#[serde(rename_all(deserialize = "camelCase", serialize = "snake_case"))]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// One ancestor folder of a note. `HackMD` also sends its name, parent, icon,
+/// and color; only the ID is ever used, so only the ID is kept.
 pub(crate) struct FolderPathResponse {
     pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) parent_id: Option<String>,
-    pub(crate) icon: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) color: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) client_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -416,20 +382,6 @@ pub(crate) struct UpdateFolderRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[allow(clippy::option_option, reason = "outer None omits; inner None clears")]
     pub(crate) color: Option<Option<String>>,
-}
-
-impl UpdateFolderRequest {
-    pub(crate) fn validate(&self) -> Result<(), PayloadError> {
-        if self.name.is_none()
-            && self.description.is_none()
-            && self.icon.is_none()
-            && self.color.is_none()
-        {
-            Err(PayloadError::EmptyFolderPatch)
-        } else {
-            Ok(())
-        }
-    }
 }
 
 #[cfg(test)]
@@ -519,11 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_patch_is_rejected_and_absent_fields_are_omitted() {
-        assert_eq!(
-            UpdateNoteRequest::default().validate(),
-            Err(PayloadError::EmptyPatch)
-        );
+    fn explicit_empty_content_is_kept_and_absent_fields_are_omitted() {
         let payload = UpdateNoteRequest {
             content: Some(String::new()),
             ..UpdateNoteRequest::default()

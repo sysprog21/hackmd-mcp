@@ -103,18 +103,16 @@ pub(crate) struct PushNoteOutput {
 pub(crate) enum PushNoteError {
     #[error(transparent)]
     Access(#[from] LocalAccessError),
-    #[error("local_path must be absolute")]
-    RelativePath,
     #[error(transparent)]
     LocalBody(#[from] LocalBodyError),
     #[error("overwrite strategy requires confirm: true")]
     OverwriteConfirmationRequired,
     #[error("note_ref resolves to a different note than the one local_path was pulled from")]
     TrackingMismatch,
-    #[error("remote note {note_id} has no Markdown content")]
-    MissingRemoteContent { note_id: String },
-    #[error("HackMD accepted the update for note {note_id}, but read-back content did not match")]
-    ReadbackMismatch { note_id: String },
+    #[error(
+        "expected_remote_hash must be the remote_body_hash a conflict reported: sha256: and 64 lowercase hex digits"
+    )]
+    MalformedExpectedHash,
     #[error(
         "HackMD updated note {note_id}, but local sync state could not be persisted; run hackmd_pull_note with overwrite_local: true before the next push"
     )]
@@ -143,10 +141,8 @@ impl crate::reply::ToolError for PushNoteError {
         match self {
             Self::Access(error) => error.kind(),
             Self::LocalBody(error) => error.kind(),
-            Self::RelativePath | Self::TrackingMismatch => ErrorKind::InvalidInput,
+            Self::TrackingMismatch | Self::MalformedExpectedHash => ErrorKind::InvalidInput,
             Self::OverwriteConfirmationRequired => ErrorKind::ConfirmationRequired,
-            Self::MissingRemoteContent { .. } => ErrorKind::Upstream,
-            Self::ReadbackMismatch { .. } => ErrorKind::Readback,
             Self::StatePersistenceAfterWrite { .. } => ErrorKind::PartialWrite,
             Self::SnapshotNotOurs { .. } => ErrorKind::LocalAccess,
             Self::Reference(error) => error.kind(),
@@ -161,9 +157,6 @@ pub(crate) async fn push_note(
     files: &LocalFiles,
     input: PushNoteInput,
 ) -> Result<Result<PushNoteOutput, NoteResolution>, PushNoteError> {
-    if !input.local_path.is_absolute() {
-        return Err(PushNoteError::RelativePath);
-    }
     files.allow(&input.local_path)?;
     let local = validate_and_read_local(files, &input)?;
     let tracked = files.state().load_for_local_path(&input.local_path)?;
@@ -189,7 +182,7 @@ pub(crate) async fn push_note(
             return Err(PushNoteError::TrackingMismatch);
         }
     }
-    let remote_note = client.get_note(&note.workspace, &note.note_id).await?;
+    let (remote_note, remote) = client.get_note_body(&note.workspace, &note.note_id).await?;
     push_resolved(
         client,
         files,
@@ -199,16 +192,32 @@ pub(crate) async fn push_note(
         },
         tracked,
         note,
-        remote_note,
+        Remote {
+            body: remote,
+            last_changed_at: remote_note.last_changed_at,
+        },
         local,
     )
     .await
+}
+
+/// The remote body a push is judged against, and when it last changed.
+struct Remote {
+    body: String,
+    last_changed_at: Option<i64>,
 }
 
 fn validate_and_read_local(
     files: &LocalFiles,
     input: &PushNoteInput,
 ) -> Result<String, PushNoteError> {
+    if input
+        .expected_remote_hash
+        .as_deref()
+        .is_some_and(|hash| !crate::sync::state::is_body_hash(hash))
+    {
+        return Err(PushNoteError::MalformedExpectedHash);
+    }
     if matches!(input.strategy, PushStrategy::Overwrite) && !input.confirm {
         return Err(PushNoteError::OverwriteConfirmationRequired);
     }
@@ -225,15 +234,13 @@ async fn push_resolved(
     guard: Guard<'_>,
     tracked: crate::sync::state::LoadedTrackedState,
     note: crate::note::reference::ResolvedNoteRef,
-    remote_note: crate::dto::NoteResponse,
+    remote: Remote,
     local: String,
 ) -> Result<Result<PushNoteOutput, NoteResolution>, PushNoteError> {
-    let remote_timestamp = remote_note.last_changed_at;
-    let remote = remote_note
-        .content
-        .ok_or_else(|| PushNoteError::MissingRemoteContent {
-            note_id: note.note_id.clone(),
-        })?;
+    let Remote {
+        body: remote,
+        last_changed_at: remote_timestamp,
+    } = remote;
 
     // Every result reports the tracked canonical path, not the caller's
     // spelling of it, and the conflict snapshot is written beside that path.
@@ -304,28 +311,16 @@ async fn push_resolved(
         advance_state(files, tracked.state, &local, remote_timestamp)?;
         return Ok(Ok(result));
     }
-    client
-        .update_note_content(&note.workspace, &note.note_id, &local)
+    let written = client
+        .write_note_body(&note.workspace, &note.note_id, &local)
         .await?;
-    let readback = client
-        .poll_readback(
-            local.len(),
-            || client.get_note(&note.workspace, &note.note_id),
-            |readback| readback.content.as_deref() == Some(local.as_str()),
-        )
-        .await?;
-    if !readback.confirmed {
-        return Err(PushNoteError::ReadbackMismatch {
-            note_id: note.note_id,
-        });
-    }
     let result = output(&target, PushStatus::Pushed);
-    advance_state(files, tracked.state, &local, readback.value.last_changed_at).map_err(
-        |source| PushNoteError::StatePersistenceAfterWrite {
+    advance_state(files, tracked.state, &local, written.last_changed_at).map_err(|source| {
+        PushNoteError::StatePersistenceAfterWrite {
             note_id: note.note_id,
             source: Box::new(source),
-        },
-    )?;
+        }
+    })?;
     Ok(Ok(result))
 }
 
@@ -509,7 +504,7 @@ mod tests {
         push_resolved,
     };
     use crate::{
-        client::HackmdClient,
+        client::{HackmdClient, HackmdError},
         config::Config,
         fixture::{Scenario, SequenceServer},
         models::Workspace,
@@ -552,7 +547,7 @@ mod tests {
                 input(&local_path, PushStrategy::Safe, false)
             )
             .await,
-            Err(PushNoteError::ReadbackMismatch { .. })
+            Err(PushNoteError::Api(HackmdError::ReadbackMismatch { .. }))
         ));
         // The baseline must not advance to a body HackMD never confirmed.
         let loaded = files
@@ -600,8 +595,10 @@ mod tests {
                 workspace: Workspace::Personal,
                 note_id: "note-id".to_owned(),
             },
-            serde_json::from_str(r#"{"id":"note-id","title":"Note","content":"baseline"}"#)
-                .expect("remote fixture should deserialize"),
+            super::Remote {
+                body: "baseline".to_owned(),
+                last_changed_at: None,
+            },
             "local edit".to_owned(),
         )
         .await;
@@ -644,8 +641,10 @@ mod tests {
                 workspace: Workspace::Personal,
                 note_id: "note-id".to_owned(),
             },
-            serde_json::from_str(r#"{"id":"note-id","title":"Note","content":"baseline"}"#)
-                .expect("remote fixture should deserialize"),
+            super::Remote {
+                body: "baseline".to_owned(),
+                last_changed_at: None,
+            },
             "local edit".to_owned(),
         )
         .await;
@@ -869,6 +868,22 @@ mod tests {
         // someone else's remote edit.
         assert_eq!(output.status, PushStatus::RemoteChanged);
         assert_eq!(fixture.finish().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_expected_hash_is_refused_before_any_request() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "merged").expect("local fixture should write");
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        let mut merged = input(&local_path, PushStrategy::Safe, false);
+        merged.expected_remote_hash = Some("not-a-hash".to_owned());
+        assert!(matches!(
+            push_note(&client, &files, merged).await,
+            Err(PushNoteError::MalformedExpectedHash)
+        ));
     }
 
     #[tokio::test]

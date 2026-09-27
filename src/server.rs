@@ -23,7 +23,7 @@ impl HackmdServer {
         Self { client, files }
     }
 
-    /// The 19 tools, assembled from one router per family. Splitting them keeps
+    /// The 14 tools, assembled from one router per family. Splitting them keeps
     /// each file about a single part of the API; the router the transport sees
     /// is the same either way.
     ///
@@ -44,10 +44,17 @@ impl HackmdServer {
 
 pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    let files = Arc::new(LocalFiles::new(
+    let mut files = LocalFiles::new(
         config.state_dir().to_path_buf(),
         config.workspace_root().map(Path::to_path_buf),
-    ));
+    );
+    if config.workspace_root().is_some() && !config.workspace_root_trusted() {
+        tracing::warn!(
+            "HACKMD_MCP_WORKSPACE_ROOT comes from the working-directory .env, not the environment; files agents load as instructions stay refused beneath it"
+        );
+        files = files.guarding_instructions();
+    }
+    let files = Arc::new(files);
     if let Some(root) = config.workspace_root() {
         match files.probe_workspace_root() {
             Ok(()) => {
@@ -131,30 +138,25 @@ mod tests {
     use crate::client::HackmdClient;
     use crate::config::Config;
     use crate::fixture::{Scenario, SequenceServer};
-    use crate::server::account::{EmptyInput, profile_result};
+    use crate::server::account::{EmptyInput, profile_summary};
     use rmcp::{ServerHandler, ServiceExt, model::CallToolRequestParams};
     use serde_json::json;
     use std::sync::Arc;
 
-    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 19] = [
+    const EXPECTED_ANNOTATIONS: [(&str, bool, bool, bool); 14] = [
         ("hackmd_get_me", true, false, true),
         ("hackmd_list_notes", true, false, true),
         ("hackmd_get_note", true, false, true),
         ("hackmd_create_note", false, false, false),
-        ("hackmd_update_note", false, true, true),
+        ("hackmd_update_note", false, true, false),
         ("hackmd_delete_note", false, true, true),
-        ("hackmd_restore_note", false, false, true),
-        ("hackmd_edit_note", false, false, false),
         ("hackmd_list_folders", true, false, true),
         ("hackmd_create_folder", false, false, false),
         ("hackmd_update_folder", false, false, true),
         ("hackmd_delete_folder", false, true, true),
-        ("hackmd_set_folder_order", false, false, true),
         ("hackmd_upload_note_image", false, false, false),
         ("hackmd_pull_note", false, true, false),
         ("hackmd_push_note", false, true, true),
-        ("hackmd_check_note_sync", true, false, true),
-        ("hackmd_list_tracked_notes", true, false, true),
         ("hackmd_untrack_note", false, true, true),
     ];
 
@@ -336,7 +338,7 @@ mod tests {
             assert_eq!(annotations.read_only_hint, Some(read_only), "{name}");
             assert_eq!(annotations.destructive_hint, Some(destructive), "{name}");
             assert_eq!(annotations.idempotent_hint, Some(idempotent), "{name}");
-            let open_world = !matches!(name, "hackmd_list_tracked_notes" | "hackmd_untrack_note");
+            let open_world = name != "hackmd_untrack_note";
             assert_eq!(annotations.open_world_hint, Some(open_world), "{name}");
         }
         let discovery = tools
@@ -366,29 +368,32 @@ mod tests {
             .find(|tool| tool.name == "hackmd_upload_note_image")
             .expect("upload should exist");
         assert!(upload.input_schema["properties"].get("team_path").is_none());
-        let restore = tools
+        let delete = tools
             .iter()
-            .find(|tool| tool.name == "hackmd_restore_note")
-            .expect("restore should exist");
-        assert_eq!(restore.input_schema["required"], json!(["note_id"]));
+            .find(|tool| tool.name == "hackmd_delete_note")
+            .expect("delete should exist");
+        assert_eq!(delete.input_schema["required"], json!(["note_ref"]));
+        assert_eq!(
+            delete.input_schema["properties"]["restore"]["default"],
+            false
+        );
 
         let get_note = tools
             .iter()
             .find(|tool| tool.name == "hackmd_get_note")
             .expect("get-note tool should exist");
         assert_eq!(get_note.input_schema["additionalProperties"], false);
-        assert!(
-            get_note.input_schema["properties"]
-                .get("note_ref")
-                .is_some()
-        );
-        assert_eq!(get_note.input_schema["required"], json!(["note_ref"]));
+        for field in ["note_ref", "local_path"] {
+            assert!(get_note.input_schema["properties"].get(field).is_some());
+        }
+        // Either one names what to get, so neither is required on its own.
+        assert!(get_note.input_schema.get("required").is_none());
 
         for name in [
             "hackmd_create_note",
             "hackmd_update_note",
             "hackmd_delete_note",
-            "hackmd_edit_note",
+            "hackmd_update_folder",
         ] {
             let tool = tools
                 .iter()
@@ -407,19 +412,29 @@ mod tests {
         ] {
             assert!(create.input_schema["properties"].get(field).is_some());
         }
+    }
+
+    #[test]
+    fn merged_tools_take_their_folded_parameters() {
+        let tools = HackmdServer::router().list_all();
         let update = tools
             .iter()
             .find(|tool| tool.name == "hackmd_update_note")
             .expect("update tool should exist");
         assert_eq!(update.input_schema["required"], json!(["note_ref"]));
-        for field in ["comment_permission", "suggest_edit_permission"] {
+        for field in ["comment_permission", "suggest_edit_permission", "patch"] {
             assert!(update.input_schema["properties"].get(field).is_some());
         }
-        let edit = tools
+        let folder = tools
             .iter()
-            .find(|tool| tool.name == "hackmd_edit_note")
-            .expect("edit tool should exist");
-        assert_eq!(edit.input_schema["required"], json!(["note_ref", "patch"]));
+            .find(|tool| tool.name == "hackmd_update_folder")
+            .expect("folder update should exist");
+        assert!(
+            folder.input_schema["properties"]
+                .get("child_order")
+                .is_some()
+        );
+        assert!(folder.input_schema.get("required").is_none());
     }
 
     #[tokio::test]
@@ -537,7 +552,7 @@ mod tests {
         .await;
         let result = client
             .call_tool(call(
-                "hackmd_edit_note",
+                "hackmd_update_note",
                 json!({
                     "note_ref": "note-id",
                     "patch": "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch"
@@ -581,7 +596,7 @@ mod tests {
         .await;
         let result = client
             .call_tool(call(
-                "hackmd_edit_note",
+                "hackmd_update_note",
                 json!({
                     "note_ref": "note-id",
                     "patch": "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch"
@@ -640,7 +655,7 @@ mod tests {
         }))
         .expect("edit input should deserialize");
         let result = server
-            .edit_note(rmcp::handler::server::wrapper::Parameters(input))
+            .update_note(rmcp::handler::server::wrapper::Parameters(input))
             .await;
         assert_eq!(result.is_error, Some(true));
         assert_eq!(
@@ -664,7 +679,10 @@ mod tests {
             "teams": []
         }))
         .expect("profile fixture should deserialize");
-        let profile_result = profile_result(&profile);
+        let profile_result = crate::reply::respond(
+            Ok::<_, crate::client::HackmdError>(profile),
+            profile_summary,
+        );
         let expected = json!({
             "id": "user-id",
             "name": "Alice",
@@ -717,16 +735,6 @@ mod tests {
             assert_eq!(annotations.destructive_hint, Some(destructive), "{name}");
             assert_eq!(annotations.idempotent_hint, Some(idempotent), "{name}");
         }
-        let edit = listed
-            .tools
-            .iter()
-            .find(|tool| tool.name == "hackmd_edit_note")
-            .expect("edit tool should be listed");
-        assert_eq!(edit.input_schema["required"], json!(["note_ref", "patch"]));
-        let annotations = edit.annotations.as_ref().expect("annotations should exist");
-        assert_eq!(annotations.read_only_hint, Some(false));
-        assert_eq!(annotations.destructive_hint, Some(false));
-        assert_eq!(annotations.idempotent_hint, Some(false));
         let list = listed
             .tools
             .iter()
@@ -740,11 +748,9 @@ mod tests {
             .find(|tool| tool.name == "hackmd_update_note")
             .expect("update tool should be listed");
         assert_eq!(update.input_schema["required"], json!(["note_ref"]));
-        assert!(
-            update.input_schema["properties"]
-                .get("comment_permission")
-                .is_some()
-        );
+        for field in ["comment_permission", "patch"] {
+            assert!(update.input_schema["properties"].get(field).is_some());
+        }
         let pull = listed
             .tools
             .iter()
@@ -775,14 +781,16 @@ mod tests {
             "safe"
         );
         assert_eq!(push.input_schema["properties"]["confirm"]["default"], false);
-        let tracked = listed
-            .tools
-            .iter()
-            .find(|tool| tool.name == "hackmd_list_tracked_notes")
-            .expect("tracked-note list should be listed");
-        assert_eq!(tracked.input_schema["properties"]["limit"]["default"], 20);
-        assert_eq!(tracked.input_schema["properties"]["limit"]["maximum"], 100);
-        assert_eq!(tracked.input_schema["properties"]["offset"]["default"], 0);
+        assert!(
+            serde_json::Value::Object((*list.input_schema).clone())
+                .to_string()
+                .contains(r#""tracked""#),
+            "the tracked source should be advertised"
+        );
+        // The tracked source pages with the same limits the old tool had.
+        assert_eq!(list.input_schema["properties"]["limit"]["default"], 20);
+        assert_eq!(list.input_schema["properties"]["limit"]["minimum"], 1);
+        assert_eq!(list.input_schema["properties"]["offset"]["default"], 0);
         let untrack = listed
             .tools
             .iter()
@@ -873,7 +881,7 @@ mod tests {
         .await;
         let no_op = client
             .call_tool(call(
-                "hackmd_edit_note",
+                "hackmd_update_note",
                 json!({
                     "note_ref": "same",
                     "patch": "*** Begin Patch\n*** Update File: notes/same.md\n@@\n same\n*** End Patch"
@@ -889,7 +897,7 @@ mod tests {
 
         let conflict = client
             .call_tool(call(
-                "hackmd_edit_note",
+                "hackmd_update_note",
                 json!({
                     "note_ref": "conflict",
                     "patch": "*** Begin Patch\n*** Update File: notes/conflict.md\n@@\n-missing\n+new\n*** End Patch"
@@ -926,11 +934,13 @@ mod tests {
             .await
             .expect("resolved get should complete");
         assert_eq!(get.is_error, Some(false));
-        assert_eq!(get.structured_content.expect("get result")["id"], "note-id");
+        let get = get.structured_content.expect("get result");
+        assert_eq!(get["id"], "note-id");
+        assert_eq!(get["mode"], "note");
 
         let edit = client
             .call_tool(call(
-                "hackmd_edit_note",
+                "hackmd_update_note",
                 json!({
                     "note_ref":"note-id",
                     "patch":"*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch"
@@ -939,10 +949,9 @@ mod tests {
             .await
             .expect("edit should complete");
         assert_eq!(edit.is_error, Some(false));
-        assert_eq!(
-            edit.structured_content.expect("edit result")["changed"],
-            true
-        );
+        let edit = edit.structured_content.expect("edit result");
+        assert_eq!(edit["changed"], true);
+        assert_eq!(edit["mode"], "patched");
 
         let create = client
             .call_tool(call(
@@ -962,7 +971,10 @@ mod tests {
             .expect("delete should complete");
         assert_eq!(deleted.is_error, Some(false));
         let restored = client
-            .call_tool(call("hackmd_restore_note", json!({"note_id":"new-id"})))
+            .call_tool(call(
+                "hackmd_delete_note",
+                json!({"note_ref":"new-id","restore":true}),
+            ))
             .await
             .expect("restore should complete");
         assert_eq!(restored.is_error, Some(false));
@@ -1002,14 +1014,13 @@ mod tests {
         );
 
         let check = client
-            .call_tool(call("hackmd_check_note_sync", json!({"local_path":&path})))
+            .call_tool(call("hackmd_get_note", json!({"local_path":&path})))
             .await
             .expect("check should complete");
         assert_eq!(check.is_error, Some(false));
-        assert_eq!(
-            check.structured_content.expect("check result")["status"],
-            "in_sync"
-        );
+        let check = check.structured_content.expect("check result");
+        assert_eq!(check["status"], "in_sync");
+        assert_eq!(check["mode"], "sync");
 
         std::fs::write(&local_path, "local edit").expect("local edit should write");
         let push = client

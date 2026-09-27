@@ -36,6 +36,30 @@ pub(crate) fn unresolved(resolution: &crate::note::reference::NoteResolution) ->
     )
 }
 
+/// A tool's reply from its result: `summary` names a success, and an error
+/// keeps its kind.
+pub(crate) fn respond<T: Serialize, E: ToolError>(
+    result: Result<T, E>,
+    summary: impl FnOnce(&T) -> String,
+) -> CallToolResult {
+    match result {
+        Ok(output) => structured(summary(&output), &output),
+        Err(error) => self::error(&error),
+    }
+}
+
+/// `respond`, for a tool whose `note_ref` may not name exactly one note.
+pub(crate) fn respond_resolved<T: Serialize, E: ToolError>(
+    result: Result<Result<T, crate::note::reference::NoteResolution>, E>,
+    summary: impl FnOnce(&T) -> String,
+) -> CallToolResult {
+    match result {
+        Ok(Err(resolution)) => unresolved(&resolution),
+        Ok(Ok(output)) => structured(summary(&output), &output),
+        Err(error) => self::error(&error),
+    }
+}
+
 /// The name a unit enum variant has on the wire, for summaries that echo a
 /// status field without keeping a second copy of its spelling.
 pub(crate) fn wire_name<T: Serialize>(value: &T) -> String {

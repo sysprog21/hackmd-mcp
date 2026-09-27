@@ -32,24 +32,30 @@ Three layers, each with its own error enum, converted at the boundary:
    name the fix, not just the code. Nothing above it touches `reqwest`.
 2. Per-tool modules hold the input struct, the output struct, the domain error, and the tests
    for all of them. `src/note/` covers a single note or the note list (`crud`, `get`, `edit`,
-   `list`, `trash`, `image`, `patch`, `reference`); `src/sync/` covers the local-first sync
+   `list`, `image`, `patch`, `reference`); `src/sync/` covers the local-first sync
    tools and their state store (`pull`, `push`, `check`, `tracking`, `state`); `folders.rs`
    stands alone. One tool family per file; `server.rs` only dispatches.
 3. `src/server/{account,note,folder,sync}.rs` declare the `#[tool]`s, one named router per
    family, combined by `HackmdServer::router`. `server.rs` itself holds only the wiring:
    construction and the `ServerHandler` impl; the shared reply helpers live in `reply.rs`.
-   Each tool carries its RMCP annotations and converts results through
-   `reply::{structured, unresolved, error}`;
-   handler bodies stay at match-and-format length. A success carries a one-line summary, the
+   Each tool carries its RMCP annotations and converts results through `reply::respond`
+   (or `respond_resolved` when a `note_ref` may not resolve), so a handler body is one call
+   and its summary. A success carries a one-line summary, the
    output as JSON text, and the same output as flat `structuredContent` (no wrapper key), so a
    client that reads only `content` still sees the data. A failure carries its message and
    `_meta.error_kind`, a stable `reply::ErrorKind` name: every domain error enum implements
    `reply::ToolError` with an exhaustive `match`, so a new variant cannot compile unclassified.
    Kind names are a contract; add, never rename.
-4. The surface is 19 tools, kept small on purpose. Account-wide lists are `source` values on
-   `hackmd_list_notes` (`history`, `trash`), teams come back with `hackmd_get_me`, and a
-   conflicted push writes its own `*.remote.md` snapshot. Prefer a parameter on an existing
-   tool over a new tool with the same shape.
+4. The surface is 14 tools, kept small on purpose. Lists other than a workspace's are
+   `source` values on `hackmd_list_notes` (`history`, `trash`, and the local `tracked`
+   records); teams come back with `hackmd_get_me`; `hackmd_get_note` with a `local_path`
+   reports sync state; a `patch` on `hackmd_update_note` is the body edit; `restore: true`
+   on `hackmd_delete_note` undoes a personal deletion; `child_order` on
+   `hackmd_update_folder` sets folder order; and a conflicted push writes its own
+   `*.remote.md` snapshot. Prefer a parameter on an existing tool over a new tool with the
+   same shape. A merged tool carries the more cautious MCP hints of the tools it absorbed,
+   and a mode parameter that makes others meaningless refuses them rather than ignoring
+   them.
 
 Filenames carry no underscores: that is why related tools are grouped into directories rather
 than named `pull_note.rs`.
@@ -72,8 +78,13 @@ Cross-cutting pieces:
   successful tool result carrying candidates, not a tool error, so the agent can pick. That is
   why write paths return `Result<Result<Output, NoteResolution>, Error>`.
 - `note::patch::patch_path` mints `notes/{id}.md` or `teams/{team_path}/notes/{id}.md`
-  deliberately unencoded. `hackmd_edit_note` refuses any patch whose `*** Update File:` header
-  does not match exactly, so a patch written against one note can never land on another.
+  deliberately unencoded. A `hackmd_update_note` patch is refused unless its
+  `*** Update File:` header matches exactly, so a patch written against one note can never
+  land on another. `hackmd_get_note` reports a `body_hash`; passed back as `expected_hash`
+  with a patch or `content`, it refuses the write if the body changed since. `HackMD` has no
+  conditional write, so a change landing between that check and the PATCH still wins; the
+  hash catches every change made before the check, which is where a stale agent's edits
+  come from. A hunk closed by `*** End of File` must match the end of the body.
 - `note::patch` implements the `*** Begin Patch` format directly. Hunk context must match exactly
   once; ambiguous or missing context is an error rather than a guess. Text after `@@` is an
   anchor that must match exactly one line; the hunk is then matched only from that line on,
@@ -123,17 +134,20 @@ Cross-cutting pieces:
 - `HackmdClient::poll_readback` (its polling policy in `client/readback.rs`) absorbs `HackMD`'s
   asynchronous write visibility. Any read-back after a write goes through it rather than trusting a single
   immediate GET; it takes the written body's size, and its window grows with it. Folder order
-  is a whole-map PUT with no conditional write, so `set_folder_order` reads it back and reports
+  is a whole-map PUT with no conditional write, so `update_folder`'s `child_order` reads it back and reports
   an order another client overwrote rather than claiming success. `client/error.rs` holds
   `HackmdError` and the status-to-error mapping, including redaction.
 - `local::LocalFiles` owns everything on this machine: the `StateStore` and the optional
-  `HACKMD_MCP_WORKSPACE_ROOT` confinement. The root is canonicalized and opened once at
-  startup, and both the policy check and every capability operation use that one handle; a
+  `HACKMD_MCP_WORKSPACE_ROOT` confinement. A root from a working-directory `.env` is honored,
+  so a user who confines the server there stays confined, but it is not trusted
+  (`Config::workspace_root_trusted`): that file may be someone else's, with a root of `/`,
+  so the instruction-file refusal stays on beneath it (`LocalFiles::guarding_instructions`).
+  The root is canonicalized and opened once at startup, and both the policy check and every capability operation use that one handle; a
   root moved or replaced afterwards is refused until restart. The
-  server passes it to the four tools that touch local paths; `HackmdClient` is HTTP only and
+  server passes it to the tools that touch local paths or sync state; `HackmdClient` is HTTP only and
   knows nothing about the filesystem. Any new tool that accepts a caller-supplied path calls
   `files.allow` before doing anything else, or `files.allow_write` when it will write there:
-  with no root configured, that also refuses files agents load as instructions (`CLAUDE.md`,
+  with no root, or a root from `.env`, that also refuses files agents load as instructions (`CLAUDE.md`,
   `AGENTS.md`, `SKILL.md`, `.claude/`, `.github/`, ...). The blocking `LocalFiles` and
   `StateStore` methods run through `local::offload` themselves; a handler only wraps other
   heavy work, such as hashing a body.

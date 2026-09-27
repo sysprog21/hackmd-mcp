@@ -98,6 +98,18 @@ pub(crate) fn body_hash(body: &str) -> String {
     body_hash_from_digest(&body_digest(body))
 }
 
+/// Whether `value` is in the one format `body_hash` writes: `sha256:` and 64
+/// lowercase hex digits. A caller-supplied hash in any other shape can never
+/// match, and is better refused as input than reported as a conflict.
+pub(crate) fn is_body_hash(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 pub(crate) fn body_hash_from_digest(digest: &[u8; 32]) -> String {
     let mut hash = String::with_capacity(71);
     hash.push_str("sha256:");
@@ -1364,5 +1376,21 @@ mod tests {
             Some("sha256:snapshot")
         );
         assert!(store.untrack(&Workspace::Personal, "note-id").is_ok());
+    }
+
+    #[test]
+    fn only_the_format_body_hash_writes_is_a_body_hash() {
+        assert!(super::is_body_hash(&super::body_hash("any body")));
+        for value in [
+            "",
+            "sha256:",
+            "sha256:x",
+            &format!("SHA256:{}", "0".repeat(64)),
+            &format!("sha256:{}", "A".repeat(64)),
+            &format!("sha256:{}", "0".repeat(63)),
+            &format!(" sha256:{}", "0".repeat(64)),
+        ] {
+            assert!(!super::is_body_hash(value), "{value:?}");
+        }
     }
 }

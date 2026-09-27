@@ -62,8 +62,6 @@ pub(crate) struct PullNoteOutput {
 pub(crate) enum PullNoteError {
     #[error(transparent)]
     Access(#[from] LocalAccessError),
-    #[error("local_path must be absolute")]
-    RelativePath,
     #[error("local_path points to a directory")]
     DestinationDirectory,
     #[error("local_path already exists; retry with overwrite_local: true")]
@@ -78,8 +76,6 @@ pub(crate) enum PullNoteError {
     MissingParent,
     #[error("destination parent is not a directory")]
     InvalidParent,
-    #[error("remote note {note_id} has no Markdown content")]
-    MissingContent { note_id: String },
     #[error(transparent)]
     BodySize(#[from] BodySizeError),
     #[error(transparent)]
@@ -96,13 +92,11 @@ impl crate::reply::ToolError for PullNoteError {
 
         match self {
             Self::Access(error) => error.kind(),
-            Self::RelativePath
-            | Self::DestinationDirectory
-            | Self::NotMarkdown
-            | Self::InvalidParent => ErrorKind::InvalidInput,
+            Self::DestinationDirectory | Self::NotMarkdown | Self::InvalidParent => {
+                ErrorKind::InvalidInput
+            }
             Self::DestinationExists | Self::MissingParent => ErrorKind::ConfirmationRequired,
             Self::UnpushedLocalChanges => ErrorKind::UnpushedChanges,
-            Self::MissingContent { .. } => ErrorKind::Upstream,
             Self::BodySize(error) => error.kind(),
             Self::Reference(error) => error.kind(),
             Self::State(error) => error.kind(),
@@ -116,9 +110,6 @@ pub(crate) async fn pull_note(
     files: &LocalFiles,
     input: PullNoteInput,
 ) -> Result<Result<PullNoteOutput, NoteResolution>, PullNoteError> {
-    if !input.local_path.is_absolute() {
-        return Err(PullNoteError::RelativePath);
-    }
     files.allow_write(&input.local_path)?;
     validate_destination(files, &input)?;
     let resolution = crate::note::reference::resolve_note_ref(
@@ -131,12 +122,7 @@ pub(crate) async fn pull_note(
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
-    let remote = client.get_note(&note.workspace, &note.note_id).await?;
-    let body = remote
-        .content
-        .ok_or_else(|| PullNoteError::MissingContent {
-            note_id: note.note_id.clone(),
-        })?;
+    let (remote, body) = client.get_note_body(&note.workspace, &note.note_id).await?;
     let size_bytes = body.len();
     check_body_size("remote body", size_bytes, input.confirm_large_file)?;
 
@@ -419,7 +405,9 @@ mod tests {
         .expect("input should deserialize");
         assert!(matches!(
             pull_note(&client, &files, relative).await,
-            Err(PullNoteError::RelativePath)
+            Err(PullNoteError::Access(
+                crate::local::LocalAccessError::Relative { .. }
+            ))
         ));
 
         let directory = tempfile::tempdir().expect("temp directory should create");

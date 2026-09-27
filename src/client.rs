@@ -213,9 +213,69 @@ impl HackmdClient {
             .await
     }
 
+    /// A note with its Markdown body taken out, for the tools that work on
+    /// the body: a note that comes back without one is an error, not an
+    /// empty body.
+    pub(crate) async fn get_note_body(
+        &self,
+        workspace: &Workspace,
+        note_id: &str,
+    ) -> Result<(NoteResponse, String), HackmdError> {
+        let mut note = self.get_note(workspace, note_id).await?;
+        let body = note
+            .content
+            .take()
+            .ok_or_else(|| HackmdError::MissingContent {
+                note_id: note_id.to_owned(),
+            })?;
+        Ok((note, body))
+    }
+
+    /// Replaces a note's body and returns the first read that shows it. A
+    /// body that never shows up within the read-back window is an error, not
+    /// a success the caller would record.
+    pub(crate) async fn write_note_body(
+        &self,
+        workspace: &Workspace,
+        note_id: &str,
+        body: &str,
+    ) -> Result<NoteResponse, HackmdError> {
+        self.update_note_content(workspace, note_id, body).await?;
+        self.confirm_note_write(workspace, note_id, body.len(), |note| {
+            note.content.as_deref() == Some(body)
+        })
+        .await
+    }
+
+    /// Reads a just-written note until `accepted` holds, returning that read.
+    /// A write that never shows up within the read-back window is
+    /// `ReadbackMismatch`, not a success.
+    pub(crate) async fn confirm_note_write(
+        &self,
+        workspace: &Workspace,
+        note_id: &str,
+        written_bytes: usize,
+        accepted: impl Fn(&NoteResponse) -> bool,
+    ) -> Result<NoteResponse, HackmdError> {
+        let readback = self
+            .poll_readback(
+                written_bytes,
+                || self.get_note(workspace, note_id),
+                accepted,
+            )
+            .await?;
+        if readback.confirmed {
+            Ok(readback.value)
+        } else {
+            Err(HackmdError::ReadbackMismatch {
+                note_id: note_id.to_owned(),
+            })
+        }
+    }
+
     /// Updates only note content without cloning the caller's potentially
     /// large Markdown body into an owned DTO before JSON encoding.
-    pub(crate) async fn update_note_content(
+    async fn update_note_content(
         &self,
         workspace: &Workspace,
         note_id: &str,
@@ -889,6 +949,7 @@ mod tests {
         let filter_started = std::time::Instant::now();
         let page = crate::note::list::list_notes(
             &client,
+            &crate::fixture::scratch_files(),
             crate::note::list::ListNotesInput {
                 source: crate::note::list::NoteSource::Workspace,
                 workspace: Workspace::Personal,
@@ -903,8 +964,8 @@ mod tests {
         .await
         .expect("benchmark filter should succeed");
         let filter_elapsed = filter_started.elapsed();
-        assert_eq!(page.meta.total, 10_000);
-        assert_eq!(page.meta.count, 100);
+        assert_eq!(page.meta().total, 10_000);
+        assert_eq!(page.meta().count, 100);
 
         let (hits, misses, retained_bytes) = client.notes.stats();
         eprintln!(

@@ -12,7 +12,7 @@ pub(crate) enum PatchError {
     InvalidUpdateSection,
     #[error("patch targets {actual}, expected {expected}")]
     WrongTarget { actual: String, expected: String },
-    #[error("patch operation is not supported by hackmd_edit_note: {0}")]
+    #[error("patch operation is not supported by hackmd_update_note: {0}")]
     UnsupportedOperation(String),
     #[error("patch must contain at least one @@ hunk after the Update File header")]
     MissingHunk,
@@ -48,6 +48,9 @@ struct FilePatch {
 struct Hunk {
     anchor: Option<String>,
     lines: Vec<HunkLine>,
+    /// Closed by `*** End of File`: the hunk's old lines must be the last
+    /// lines of the body, and an addition-only hunk appends to it.
+    at_end: bool,
 }
 
 #[derive(Debug)]
@@ -90,9 +93,10 @@ pub(crate) fn apply_note_patch(
     Ok(join_lines(&lines, endings))
 }
 
-/// Line endings of the body being patched. A body that uses one style keeps it;
-/// a body that mixes both is rewritten to CRLF, because rejoining the lines has
-/// to pick one.
+/// Line endings of the body being patched. A body that uses one style keeps it.
+/// A body that mixes both is rejoined with whichever most of its lines use
+/// (LF on a tie), because rejoining has to pick one: a single pasted CRLF line
+/// must not rewrite every ending of an LF note.
 #[derive(Clone, Copy)]
 struct LineEndings {
     crlf: bool,
@@ -104,7 +108,10 @@ struct LineEndings {
 /// body the same way is what lets CRLF context match at all.
 fn split_lines(content: &str) -> (Vec<String>, LineEndings) {
     let endings = LineEndings {
-        crlf: content.contains("\r\n"),
+        crlf: {
+            let crlf = content.matches("\r\n").count();
+            crlf > content.matches('\n').count() - crlf
+        },
         trailing_newline: content.ends_with('\n'),
     };
     (content.lines().map(ToOwned::to_owned).collect(), endings)
@@ -120,8 +127,9 @@ fn join_lines(lines: &[String], endings: LineEndings) -> String {
     output
 }
 
-fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
-    let lines = patch.lines().collect::<Vec<_>>();
+/// Checks the envelope and the single `*** Update File:` header, returning
+/// the target and the hunk lines after it.
+fn update_section<'a>(lines: &'a [&'a str]) -> Result<(&'a str, &'a [&'a str]), PatchError> {
     if lines.first() != Some(&"*** Begin Patch") {
         return Err(PatchError::MissingBegin);
     }
@@ -152,6 +160,12 @@ fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
     {
         return Err(PatchError::InvalidUpdateSection);
     }
+    Ok((target, &body[1..]))
+}
+
+fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
+    let lines = patch.lines().collect::<Vec<_>>();
+    let (target, hunk_lines) = update_section(&lines)?;
 
     let mut hunks = Vec::new();
     let mut current: Option<Hunk> = None;
@@ -162,7 +176,7 @@ fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
     // its last cannot demand blank lines the note does not have, nor turn an
     // addition-only hunk into one that needs context.
     let mut pending_blank_lines = 0;
-    for line in body.iter().skip(1) {
+    for line in hunk_lines {
         if let Some(anchor) = line
             .strip_prefix("@@")
             .filter(|rest| rest.is_empty() || rest.starts_with(' '))
@@ -174,12 +188,33 @@ fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
             current = Some(Hunk {
                 anchor: (!anchor.is_empty() && !is_line_range(anchor)).then(|| anchor.to_owned()),
                 lines: Vec::new(),
+                at_end: false,
             });
             pending_blank_lines = 0;
             continue;
         }
         if line.is_empty() {
             pending_blank_lines += 1;
+            continue;
+        }
+
+        // Codex-style patches close a hunk that reaches the end of the body. It
+        // must follow a hunk's lines, and ties that hunk to the end.
+        if *line == "*** End of File" {
+            // It ends the hunk it closes, so a line after it has no hunk to
+            // join and is refused as such.
+            match current.take() {
+                Some(mut hunk) if !hunk.lines.is_empty() => {
+                    hunk.at_end = true;
+                    push_hunk(&mut hunks, hunk)?;
+                }
+                _ => {
+                    return Err(PatchError::MalformedHunk(
+                        "*** End of File must close a hunk that has lines",
+                    ));
+                }
+            }
+            pending_blank_lines = 0;
             continue;
         }
         let Some(Hunk { lines: hunk, .. }) = current.as_mut() else {
@@ -201,10 +236,12 @@ fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
             ));
         }
     }
-    let Some(hunk) = current else {
+    if let Some(hunk) = current {
+        push_hunk(&mut hunks, hunk)?;
+    }
+    if hunks.is_empty() {
         return Err(PatchError::MissingHunk);
-    };
-    push_hunk(&mut hunks, hunk)?;
+    }
     Ok(FilePatch {
         target: target.to_owned(),
         hunks,
@@ -238,6 +275,11 @@ fn push_hunk(hunks: &mut Vec<Hunk>, hunk: Hunk) -> Result<(), PatchError> {
     Ok(())
 }
 
+/// Whether a run of body lines is exactly the hunk's old side.
+fn window_eq(window: &[String], old: &[&str]) -> bool {
+    window.iter().map(String::as_str).eq(old.iter().copied())
+}
+
 fn apply_hunk(lines: &mut Vec<String>, hunk: Hunk) -> Result<(), PatchError> {
     // Search only from the anchor line on, so context that also appears before
     // the anchor no longer makes the hunk ambiguous.
@@ -265,11 +307,19 @@ fn apply_hunk(lines: &mut Vec<String>, hunk: Hunk) -> Result<(), PatchError> {
         .collect::<Vec<_>>();
     let replaced = if old.is_empty() {
         None
+    } else if hunk.at_end {
+        // Only the window that ends the body can match.
+        let position = lines
+            .len()
+            .checked_sub(old.len())
+            .filter(|&position| position >= start && window_eq(&lines[position..], &old))
+            .ok_or(PatchError::ContextNotFound)?;
+        Some((position, old.len()))
     } else {
         let offset = unique_index(
             lines[start..]
                 .windows(old.len())
-                .map(|window| window.iter().map(String::as_str).eq(old.iter().copied())),
+                .map(|window| window_eq(window, &old)),
         )
         .map_err(|found| match found {
             Found::None => PatchError::ContextNotFound,
@@ -290,6 +340,8 @@ fn apply_hunk(lines: &mut Vec<String>, hunk: Hunk) -> Result<(), PatchError> {
         Some((position, len)) => {
             lines.splice(position..position + len, new);
         }
+        // An addition closed by `*** End of File` appends to the body.
+        None if hunk.at_end => lines.extend(new),
         // An anchored addition goes directly below its anchor line.
         None if hunk.anchor.is_some() => {
             let below = start + 1;
@@ -479,12 +531,66 @@ mod tests {
     }
 
     #[test]
-    fn a_mixed_ending_body_is_normalized_to_crlf() {
+    fn a_mixed_ending_body_takes_the_ending_most_lines_use() {
         let patch = envelope("@@\n-old\n+new");
         assert_eq!(
-            apply_note_patch("intro\r\nold\n", &patch, TARGET),
-            Ok("intro\r\nnew\r\n".to_owned())
+            apply_note_patch("a\nb\r\nold\n", &patch, TARGET),
+            Ok("a\nb\nnew\n".to_owned())
         );
+        assert_eq!(
+            apply_note_patch("a\r\nb\nold\r\n", &patch, TARGET),
+            Ok("a\r\nb\r\nnew\r\n".to_owned())
+        );
+        // A tie keeps LF.
+        assert_eq!(
+            apply_note_patch("intro\r\nold\n", &patch, TARGET),
+            Ok("intro\nnew\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_end_of_file_hunk_matches_only_the_end_of_the_body() {
+        let patch = envelope("@@\n-old\n+new\n*** End of File");
+        assert_eq!(
+            apply_note_patch("intro\nold\n", &patch, TARGET),
+            Ok("intro\nnew\n".to_owned())
+        );
+        // The same line elsewhere is not the end.
+        assert_eq!(
+            apply_note_patch("old\nlast\n", &patch, TARGET),
+            Err(PatchError::ContextNotFound)
+        );
+        // Two copies are not ambiguous when only one ends the body.
+        assert_eq!(
+            apply_note_patch("old\nold\n", &patch, TARGET),
+            Ok("old\nnew\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_end_of_file_addition_appends() {
+        let patch = envelope("@@\n+tail\n*** End of File");
+        assert_eq!(
+            apply_note_patch("body\n", &patch, TARGET),
+            Ok("body\ntail\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_end_of_file_marker_out_of_place_is_refused() {
+        for body in [
+            "*** End of File\n@@\n+x",
+            "@@\n*** End of File",
+            "@@\n+x\n*** End of File\n+y",
+        ] {
+            assert!(
+                matches!(
+                    apply_note_patch("body\n", &envelope(body), TARGET),
+                    Err(PatchError::MalformedHunk(_) | PatchError::MissingHunk)
+                ),
+                "{body:?}"
+            );
+        }
     }
 
     #[test]

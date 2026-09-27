@@ -23,10 +23,7 @@ impl HackmdServer {
         &self,
         Parameters(EmptyInput {}): Parameters<EmptyInput>,
     ) -> rmcp::model::CallToolResult {
-        match self.account().await {
-            Ok(profile) => profile_result(&profile),
-            Err(error) => reply::error(&error),
-        }
+        reply::respond(self.account().await, profile_summary)
     }
 }
 
@@ -43,14 +40,13 @@ impl HackmdServer {
     }
 }
 
-pub(crate) fn profile_result(profile: &ProfileResponse) -> rmcp::model::CallToolResult {
-    let summary = format!(
+pub(crate) fn profile_summary(profile: &ProfileResponse) -> String {
+    format!(
         "Authenticated as {} (user_path: {}); {} team(s)",
         profile.name,
         profile.user_path,
         profile.teams.len()
-    );
-    reply::structured(summary, profile)
+    )
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

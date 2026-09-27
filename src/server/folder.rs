@@ -4,10 +4,7 @@ use rmcp::{handler::server::wrapper::Parameters, tool, tool_router};
 
 use super::HackmdServer;
 use crate::{
-    folders::{
-        CreateFolderInput, DeleteFolderInput, FolderWorkspaceInput, SetFolderOrderInput,
-        UpdateFolderInput,
-    },
+    folders::{CreateFolderInput, DeleteFolderInput, FolderWorkspaceInput, UpdateFolderInput},
     reply,
 };
 
@@ -28,16 +25,15 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<FolderWorkspaceInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::folders::list_folders(&self.client, input).await {
-            Ok(output) => reply::structured(
+        reply::respond(
+            crate::folders::list_folders(&self.client, input).await,
+            |output| {
                 format!(
                     "Found {} HackMD folder(s); returned {}",
                     output.meta.total, output.meta.count
-                ),
-                &output,
-            ),
-            Err(error) => reply::error(&error),
-        }
+                )
+            },
+        )
     }
 
     #[tool(
@@ -55,18 +51,15 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<CreateFolderInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::folders::create_folder(&self.client, input).await {
-            Ok(output) => reply::structured(
-                format!("Created HackMD folder {}", output.folder.id),
-                &output,
-            ),
-            Err(error) => reply::error(&error),
-        }
+        reply::respond(
+            crate::folders::create_folder(&self.client, input).await,
+            |output| format!("Created HackMD folder {}", output.folder.id),
+        )
     }
 
     #[tool(
         name = "hackmd_update_folder",
-        description = "Update team folder metadata and read back until PATCH is visible. Personal folder PATCH and all folder moves are unsupported by HackMD.",
+        description = "Update team folder metadata, and/or set the order of a folder's direct child folders with child_order. folder_id names the folder whose fields change and whose children child_order orders; omit it with child_order to order the top level, which works in personal workspaces too. Every change is read back until visible. HackMD does not support personal folder metadata updates or folder moves; the folder order is one shared map, so an order another client overwrote is reported rather than claimed.",
         annotations(
             title = "Update HackMD Folder",
             read_only_hint = false,
@@ -79,13 +72,22 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<UpdateFolderInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::folders::update_folder(&self.client, input).await {
-            Ok(output) => reply::structured(
-                format!("Updated HackMD folder {}", output.folder.id),
-                &output,
-            ),
-            Err(error) => reply::error(&error),
-        }
+        reply::respond(
+            crate::folders::update_folder(&self.client, input).await,
+            |output| match (&output.folder, &output.child_order) {
+                (Some(folder), Some(_)) => {
+                    format!(
+                        "Updated HackMD folder {} and set its child order",
+                        folder.id
+                    )
+                }
+                (Some(folder), None) => format!("Updated HackMD folder {}", folder.id),
+                (None, order) => format!(
+                    "Set HackMD folder order for {}",
+                    order.as_ref().map_or("root", |order| order.parent.as_str())
+                ),
+            },
+        )
     }
 
     #[tool(
@@ -103,43 +105,18 @@ impl HackmdServer {
         &self,
         Parameters(input): Parameters<DeleteFolderInput>,
     ) -> rmcp::model::CallToolResult {
-        match crate::folders::delete_folder(&self.client, input).await {
-            Ok(output) => {
-                let summary = if output.deleted {
+        reply::respond(
+            crate::folders::delete_folder(&self.client, input).await,
+            |output| {
+                if output.deleted {
                     format!("Deleted HackMD folder {}", output.folder_id)
                 } else {
                     format!(
                         "Folder {} has {} child folder(s); confirm deletion",
                         output.folder_id, output.child_count
                     )
-                };
-                reply::structured(summary, &output)
-            }
-            Err(error) => reply::error(&error),
-        }
-    }
-
-    #[tool(
-        name = "hackmd_set_folder_order",
-        description = "Set the direct-child order for one parent while preserving every unrelated entry in HackMD's whole folder-order map. Omit parent_folder_id for root.",
-        annotations(
-            title = "Set HackMD Folder Order",
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = true
+                }
+            },
         )
-    )]
-    pub(crate) async fn set_folder_order(
-        &self,
-        Parameters(input): Parameters<SetFolderOrderInput>,
-    ) -> rmcp::model::CallToolResult {
-        match crate::folders::set_folder_order(&self.client, input).await {
-            Ok(output) => reply::structured(
-                format!("Set HackMD folder order for {}", output.parent),
-                &output,
-            ),
-            Err(error) => reply::error(&error),
-        }
     }
 }

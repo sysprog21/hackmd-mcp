@@ -1,5 +1,4 @@
-use rmcp::schemars;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
@@ -9,25 +8,15 @@ use crate::{
     note::reference::{NoteRefError, NoteResolution},
 };
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
+/// What `hackmd_update_note` passes on when given a `patch`.
+#[derive(Debug)]
 pub(crate) struct EditNoteInput {
-    /// Team path (from `hackmd_get_me`) when a direct internal note ID belongs
-    /// to a team; omit for personal notes. `@owner/slug` URLs name their own
-    /// workspace.
-    #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
-    /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
     pub(crate) note_ref: String,
-    /// Bypass the 60-second account and note-list caches when resolving an
-    /// `@owner/slug` URL.
-    #[serde(default)]
     pub(crate) refresh: bool,
-    /// One patch envelope: `*** Begin Patch`, `*** Update File: <patch_path
-    /// from hackmd_get_note>`, then hunks each opened by `@@` whose lines start
-    /// with ` ` (context), `-` (remove), or `+` (add), then `*** End Patch`.
-    /// Context plus removed lines must match the current body exactly once.
     pub(crate) patch: String,
+    /// The `body_hash` the patch was written against, if the caller gave one.
+    pub(crate) expected_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -49,22 +38,52 @@ pub(crate) enum EditNoteError {
     Api(#[from] HackmdError),
     #[error(transparent)]
     Patch(#[from] PatchError),
-    #[error("GET returned note {note_id} without editable content")]
-    MissingContent { note_id: String },
-    #[error("HackMD accepted the edit for note {note_id}, but read-back content did not match")]
-    ReadbackMismatch { note_id: String },
+    #[error(transparent)]
+    BodyChanged(#[from] BodyChanged),
+}
+
+/// The body is no longer the one the caller read.
+#[derive(Debug, Error)]
+#[error(
+    "note {note_id} changed since it was read (body hash {actual}, expected {expected}); get it again and rebuild the change"
+)]
+pub(crate) struct BodyChanged {
+    pub(crate) note_id: String,
+    pub(crate) expected: String,
+    pub(crate) actual: String,
+}
+
+/// Refuses a body write when `expected` is given and the current body does
+/// not hash to it. `HackMD` has no conditional write, so a change landing
+/// between this read and the write still wins; this catches every change
+/// made before the read, which is where a stale agent's edits come from.
+pub(crate) fn ensure_unchanged(
+    note_id: &str,
+    body: &str,
+    expected: Option<&str>,
+) -> Result<(), BodyChanged> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = crate::local::offload(|| crate::sync::state::body_hash(body));
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(BodyChanged {
+            note_id: note_id.to_owned(),
+            expected: expected.to_owned(),
+            actual,
+        })
+    }
 }
 
 impl crate::reply::ToolError for EditNoteError {
     fn kind(&self) -> crate::reply::ErrorKind {
-        use crate::reply::ErrorKind;
-
         match self {
             Self::Reference(error) => error.kind(),
             Self::Api(error) => error.kind(),
             Self::Patch(error) => error.kind(),
-            Self::MissingContent { .. } => ErrorKind::Upstream,
-            Self::ReadbackMismatch { .. } => ErrorKind::Readback,
+            Self::BodyChanged(_) => crate::reply::ErrorKind::Conflict,
         }
     }
 }
@@ -83,31 +102,15 @@ pub(crate) async fn edit_note(
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
-    let response = client.get_note(&note.workspace, &note.note_id).await?;
-    let content = response
-        .content
-        .ok_or_else(|| EditNoteError::MissingContent {
-            note_id: note.note_id.clone(),
-        })?;
+    let (_, content) = client.get_note_body(&note.workspace, &note.note_id).await?;
+    ensure_unchanged(&note.note_id, &content, input.expected_hash.as_deref())?;
     let patch_path = crate::note::patch::patch_path(&note.workspace, &note.note_id);
     let updated = crate::note::patch::apply_note_patch(&content, &input.patch, &patch_path)?;
     let changed = updated != content;
     if changed {
         client
-            .update_note_content(&note.workspace, &note.note_id, &updated)
+            .write_note_body(&note.workspace, &note.note_id, &updated)
             .await?;
-        let readback = client
-            .poll_readback(
-                updated.len(),
-                || client.get_note(&note.workspace, &note.note_id),
-                |readback| readback.content.as_deref() == Some(updated.as_str()),
-            )
-            .await?;
-        if !readback.confirmed {
-            return Err(EditNoteError::ReadbackMismatch {
-                note_id: note.note_id,
-            });
-        }
     }
     Ok(Ok(EditNoteOutput {
         workspace: note.workspace,
@@ -122,6 +125,7 @@ pub(crate) async fn edit_note(
 mod tests {
     use super::{EditNoteError, EditNoteInput, edit_note};
     use crate::{
+        client::HackmdError,
         fixture::{Scenario, SequenceServer},
         models::Workspace,
         note::patch::PatchError,
@@ -133,12 +137,14 @@ mod tests {
             note_ref: "note-id".to_owned(),
             refresh: false,
             patch: patch.to_owned(),
+            expected_hash: None,
         }
     }
 
     #[tokio::test]
     async fn a_write_that_never_becomes_visible_is_an_error() {
         const OLD: &str = r#"{"id":"note-id","title":"Title","content":"old"}"#;
+
         // Fetch, PATCH, then a read-back that keeps showing the old body.
         let fixture = SequenceServer::spawn_repeating([(200, OLD), (202, ""), (200, OLD)]);
         let client = fixture.client();
@@ -149,11 +155,12 @@ mod tests {
             patch:
                 "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch"
                     .to_owned(),
+            expected_hash: None,
         };
 
         assert!(matches!(
             edit_note(&client, input).await,
-            Err(EditNoteError::ReadbackMismatch { .. })
+            Err(EditNoteError::Api(HackmdError::ReadbackMismatch { .. }))
         ));
     }
 
@@ -185,6 +192,59 @@ mod tests {
             .expect("reference should resolve");
         assert!(output.changed);
         assert_eq!(output.bytes, "new\n".len());
+        server.finish();
+    }
+
+    #[tokio::test]
+    async fn an_expected_hash_refuses_a_body_that_changed_since_it_was_read() {
+        let server = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/note-id",
+            200,
+            r#"{"id":"note-id","title":"Title","content":"old\nbrowser\n"}"#,
+        )]);
+        let mut stale = input(
+            "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch",
+        );
+        stale.expected_hash = Some(crate::sync::state::body_hash("old\n"));
+        let error = edit_note(&server.client(), stale)
+            .await
+            .expect_err("a changed body must not be written");
+        assert!(matches!(error, EditNoteError::BodyChanged(_)));
+        assert!(
+            error
+                .to_string()
+                .starts_with("note note-id changed since it was read")
+        );
+        assert_eq!(server.finish().len(), 1, "nothing may be written");
+    }
+
+    #[tokio::test]
+    async fn a_matching_expected_hash_lets_the_patch_through() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Title","content":"old\n"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Title","content":"new\n"}"#,
+            ),
+        ]);
+        let mut fresh = input(
+            "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch",
+        );
+        fresh.expected_hash = Some(crate::sync::state::body_hash("old\n"));
+        let output = edit_note(&server.client(), fresh)
+            .await
+            .expect("an unchanged body should be patched")
+            .expect("reference should resolve");
+        assert!(output.changed);
         server.finish();
     }
 
@@ -282,6 +342,7 @@ mod tests {
                 note_ref: "note-id".to_owned(),
                 refresh: false,
                 patch: patch.to_owned(),
+                expected_hash: None,
             },
         )
         .await

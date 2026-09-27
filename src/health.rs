@@ -60,6 +60,11 @@ struct ApiProbeCheck {
 pub async fn run_self_check(
     probe_api: bool,
 ) -> Result<SelfCheckReport, Box<dyn std::error::Error>> {
+    // Configuration warnings, such as a `.env` key that is ignored, go to
+    // stderr like the server's; this is the mode meant to surface them. A
+    // caller that already installed its own subscriber keeps it: logging is not
+    // what the self-check is checking.
+    let _observability = crate::observability::init().ok();
     self_check(Config::from_env()?, probe_api).await
 }
 
