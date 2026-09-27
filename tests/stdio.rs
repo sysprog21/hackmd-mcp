@@ -217,11 +217,16 @@ fn dotenv_cannot_redirect_an_inherited_token_to_another_host() {
 fn a_dotenv_workspace_root_confines_but_is_not_trusted() {
     // A root of `/` from a cloned repository's `.env` would confine nothing. It
     // is honored, so a user who confines the server there stays confined, but
-    // the refusal to write agent instruction files stays on beneath it.
+    // the refusal to write agent instruction files stays on beneath it. The
+    // directory itself stands in for the root: unlike `/`, it is absolute on
+    // every platform.
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     fs::write(
         directory.path().join(".env"),
-        "HACKMD_MCP_WORKSPACE_ROOT=/\n",
+        format!(
+            "HACKMD_MCP_WORKSPACE_ROOT=\"{}\"\n",
+            directory.path().display()
+        ),
     )
     .expect("dotenv fixture should be written");
 

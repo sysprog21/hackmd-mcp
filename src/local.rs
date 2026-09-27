@@ -483,15 +483,25 @@ fn resolve_existing_prefix(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use super::{LocalAccessError, LocalFiles};
 
+    /// `path` made absolute on this platform. A leading `/` is not enough on
+    /// Windows, where a path without a drive is relative to the current one.
+    fn abs(path: &str) -> PathBuf {
+        let root = if cfg!(windows) { r"C:\" } else { "/" };
+        Path::new(root).join(path)
+    }
+
     #[test]
     fn without_a_root_every_absolute_path_is_allowed() {
-        let files = LocalFiles::new("/tmp/state".into(), None);
-        assert!(files.allow("/etc/hosts".as_ref()).is_ok());
-        assert!(files.allow("/tmp/../etc/hosts".as_ref()).is_ok());
+        let files = LocalFiles::new(abs("tmp/state"), None);
+        assert!(files.allow(&abs("etc/hosts")).is_ok());
+        assert!(files.allow(&abs("tmp/../etc/hosts")).is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -543,7 +553,7 @@ mod tests {
     fn a_relative_path_is_refused_as_invalid_input() {
         use crate::reply::{ErrorKind, ToolError};
 
-        let files = LocalFiles::new("/tmp/state".into(), None);
+        let files = LocalFiles::new(abs("tmp/state"), None);
         let error = files
             .allow("notes/note.md".as_ref())
             .expect_err("a relative path must be refused");
@@ -553,28 +563,31 @@ mod tests {
 
     #[test]
     fn without_a_root_agent_instruction_files_are_not_written() {
-        let files = LocalFiles::new("/tmp/state".into(), None);
+        let files = LocalFiles::new(abs("tmp/state"), None);
         for refused in [
-            "/repo/CLAUDE.md",
-            "/repo/agents.md",
-            "/home/u/.claude/skills/x/SKILL.md",
-            "/repo/.github/copilot-instructions.md",
-            "/repo/.cursor/rules/note.md",
-        ] {
+            "repo/CLAUDE.md",
+            "repo/agents.md",
+            "home/u/.claude/skills/x/SKILL.md",
+            "repo/.github/copilot-instructions.md",
+            "repo/.cursor/rules/note.md",
+        ]
+        .map(abs)
+        {
             let error = files
-                .allow_write(refused.as_ref())
+                .allow_write(&refused)
                 .expect_err("agent instruction files must be refused");
             assert_eq!(
                 error.to_string(),
                 format!(
-                    "{refused} is a file coding agents load as instructions; set HACKMD_MCP_WORKSPACE_ROOT to a tree that may hold it"
+                    "{} is a file coding agents load as instructions; set HACKMD_MCP_WORKSPACE_ROOT to a tree that may hold it",
+                    refused.display()
                 )
             );
             // Reading one, say to check its sync state, is not the risk.
-            assert!(files.allow(refused.as_ref()).is_ok());
+            assert!(files.allow(&refused).is_ok());
         }
-        assert!(files.allow_write("/repo/docs/notes.md".as_ref()).is_ok());
-        assert!(files.allow_write("/repo/CLAUDE-notes.md".as_ref()).is_ok());
+        assert!(files.allow_write(&abs("repo/docs/notes.md")).is_ok());
+        assert!(files.allow_write(&abs("repo/CLAUDE-notes.md")).is_ok());
     }
 
     #[cfg(unix)]
@@ -610,7 +623,7 @@ mod tests {
                 .is_ok()
         );
         assert!(matches!(
-            files.allow_write("/elsewhere/notes.md".as_ref()),
+            files.allow_write(&abs("elsewhere/notes.md")),
             Err(LocalAccessError::OutsideRoot { .. })
         ));
     }
@@ -649,6 +662,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_out_of_the_tree_does_not_escape_it() {
         let directory = tempfile::tempdir().expect("temp directory should create");
@@ -656,11 +670,9 @@ mod tests {
         fs::create_dir(&root).expect("root should create");
         let outside = directory.path().join("outside.md");
         fs::write(&outside, "secret").expect("outside file should write");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, root.join("link.md")).expect("symlink should create");
 
         let files = LocalFiles::new(directory.path().join("state"), Some(root.clone()));
-        #[cfg(unix)]
         assert!(matches!(
             files.allow(&root.join("link.md")),
             Err(LocalAccessError::OutsideRoot { .. })
@@ -784,9 +796,9 @@ mod tests {
 
     #[test]
     fn a_missing_root_is_reported_rather_than_ignored() {
-        let files = LocalFiles::new("/tmp/state".into(), Some("/nonexistent/root".into()));
+        let files = LocalFiles::new(abs("tmp/state"), Some(abs("nonexistent/root")));
         assert!(matches!(
-            files.allow("/nonexistent/root/note.md".as_ref()),
+            files.allow(&abs("nonexistent/root/note.md")),
             Err(LocalAccessError::MissingRoot { .. })
         ));
     }
