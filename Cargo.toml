@@ -34,7 +34,7 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "time"] }
 tracing = "0.1"
-tracing-opentelemetry = { version = "0.33", optional = true }
+tracing-opentelemetry = { version = "0.34", optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "std"] }
 url = "2"
 
