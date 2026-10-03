@@ -154,6 +154,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "baseline").expect("working Markdown should write");
+        // As the record keeps it, which is what the tools report.
+        let local_path = local_path.canonicalize().expect("note path should resolve");
         let files =
             crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
         (directory, files, local_path)

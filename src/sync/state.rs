@@ -33,18 +33,22 @@ impl TrackedNoteState {
     /// Records the note as tracked at the moment `baseline_body` is what both
     /// `local_path` and `HackMD` hold. Every sync tool goes through here so the
     /// stored hash and file identity can never disagree with the baseline.
+    /// The record keeps `local_path` canonicalized, however the caller spelled
+    /// it. Hashes the body and touches the filesystem, so async callers run it
+    /// through `local::offload`.
     pub(crate) fn capture(
         internal_id: String,
         workspace: Workspace,
-        local_path: PathBuf,
+        local_path: impl AsRef<Path>,
         baseline_body: &str,
         remote_timestamp: Option<i64>,
     ) -> Result<Self, StateError> {
+        let local_file_identity = local_file_identity(local_path.as_ref())?;
         Ok(Self {
-            local_file_identity: local_file_identity(&local_path)?,
+            local_path: local_file_identity.canonical_path.clone(),
+            local_file_identity,
             internal_id,
             workspace,
-            local_path,
             baseline_body_hash: body_hash(baseline_body),
             last_observed_remote_timestamp: timestamp_text(remote_timestamp),
             remote_snapshot_hash: None,
@@ -61,7 +65,7 @@ impl TrackedNoteState {
         Self::capture(
             self.internal_id,
             self.workspace,
-            self.local_path,
+            &self.local_path,
             baseline_body,
             remote_timestamp,
         )
@@ -925,7 +929,10 @@ mod tests {
         assert!(matches!(&error, StateError::MissingBaseline { .. }));
         let message = error.to_string();
         assert!(message.contains("re-pull note note-id from the personal workspace"));
-        assert!(message.contains(&local_path.display().to_string()));
+
+        // Named as the record keeps it: canonical, which on Windows is the
+        // verbatim `\\?\` form rather than the temp path as spelled.
+        assert!(message.contains(&state.local_path.display().to_string()));
     }
 
     #[test]
@@ -1151,7 +1158,7 @@ mod tests {
         TrackedNoteState::capture(
             note_id.to_owned(),
             workspace,
-            local_path.to_path_buf(),
+            local_path,
             "baseline",
             Some(1),
         )

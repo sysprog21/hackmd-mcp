@@ -137,24 +137,22 @@ pub(crate) async fn pull_note(
         return Err(PullNoteError::UnpushedLocalChanges);
     }
     files.write_atomic(&input.local_path, body.as_bytes(), input.create_parent_dirs)?;
-    // The record keeps the canonical path, which is what push reports back.
-    let destination = input
-        .local_path
-        .canonicalize()
-        .map_err(LocalAccessError::Io)?;
-    let state = TrackedNoteState::capture(
-        note.note_id.clone(),
-        note.workspace.clone(),
-        destination.clone(),
-        &body,
-        remote.last_changed_at,
-    )?;
+    let state = crate::local::offload(|| {
+        TrackedNoteState::capture(
+            note.note_id.clone(),
+            note.workspace.clone(),
+            &input.local_path,
+            &body,
+            remote.last_changed_at,
+        )
+    })?;
     files.state().persist_from_sync(&state, &body)?;
     Ok(Ok(PullNoteOutput {
         workspace: note.workspace,
         note_id: note.note_id,
         title: remote.title,
-        local_path: destination,
+        // The canonical path the record keeps, which is what push reports back.
+        local_path: state.local_path,
         bytes: size_bytes,
     }))
 }
