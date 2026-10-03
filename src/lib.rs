@@ -1,0 +1,49 @@
+//! A local-first MCP server for the `HackMD` API.
+
+mod client;
+mod config;
+mod dto;
+mod folders;
+mod health;
+mod local;
+mod models;
+mod note;
+mod observability;
+mod paging;
+mod reply;
+mod retry;
+mod server;
+mod sync;
+
+#[cfg(test)]
+mod fixture;
+
+/// The package version exposed by the server binary.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub use health::{SelfCheckReport, run_self_check};
+
+/// Runs the MCP server over standard input and output until the client closes
+/// the transport.
+///
+/// Standard output is owned exclusively by the MCP transport. Operational
+/// diagnostics must use standard error through the tracing configuration.
+///
+/// # Errors
+///
+/// Returns an error if the stdio transport cannot start or terminates with a
+/// protocol or I/O failure.
+pub async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
+    let _observability = observability::init()?;
+    server::run_stdio().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VERSION;
+
+    #[test]
+    fn package_version_is_available() {
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
+    }
+}

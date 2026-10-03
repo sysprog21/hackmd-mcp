@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The live suite talks to the real API and stays ignored here.
+  HACKMD_RUN_LIVE_TESTS: ""
+
+jobs:
+  test:
+    # The three platforms differ in exactly the place this server touches the
+    # filesystem: the state directory, its permissions, and path canonicalization.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets --all-features
+
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  msrv:
+    # Turns the rust-version in Cargo.toml into a tested claim rather than an
+    # assertion. Build only: dev-dependencies are free to need something newer.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-features --locked
+
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # cargo audit itself rather than rustsec/audit-check, whose releases
+      # still run on Node.js 20; this workflow has no schedule for its issues.
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit

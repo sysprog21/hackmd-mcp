@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Workflow actions, such as actions/checkout, which otherwise fall behind
+  # until a deprecation warning points them out.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Rust dependencies. Minor and patch updates arrive as one weekly pull
+  # request; a major update gets its own, since it may need code changes. CI's
+  # msrv job builds with --locked, so an update that needs a newer Rust than
+  # the rust-version in Cargo.toml fails there rather than landing unnoticed.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        update-types: [minor, patch]
