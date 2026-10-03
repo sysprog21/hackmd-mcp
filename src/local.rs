@@ -370,22 +370,36 @@ impl LocalFiles {
     /// returns is what gets checked. For a regular file the flag changes
     /// nothing, so reads behave as usual.
     pub(crate) fn open_read(&self, path: &Path) -> Result<fs::File, LocalAccessError> {
-        let file = match self.confined(path)? {
+        let opened = match self.confined(path)? {
             None => {
                 let mut options = fs::OpenOptions::new();
                 options.read(true);
                 #[cfg(unix)]
                 std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
-                options.open(path)?
+                options.open(path)
             }
             Some((dir, relative)) => {
                 let mut options = cap_std::fs::OpenOptions::new();
                 options.read(true);
                 #[cfg(unix)]
                 cap_std::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
-                dir.open_with(relative, &options)?.into_std()
+                dir.open_with(relative, &options)
+                    .map(cap_std::fs::File::into_std)
             }
         };
+        // Windows refuses to open a directory at all, with "access denied",
+        // where Unix opens it and the check below refuses it. Either way the
+        // caller hears the same thing. Looking only after a failed open
+        // classifies the error; it decides nothing an attacker could race.
+        let file = opened.map_err(|error| {
+            if error.kind() == io::ErrorKind::PermissionDenied && path.is_dir() {
+                LocalAccessError::NotRegular {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                LocalAccessError::Io(error)
+            }
+        })?;
         if !file.metadata()?.is_file() {
             return Err(LocalAccessError::NotRegular {
                 path: path.to_path_buf(),

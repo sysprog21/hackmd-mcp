@@ -1036,6 +1036,33 @@ mod tests {
         fixture.finish();
     }
 
+    /// A file that is not UTF-8 text, or not a file at all, is refused
+    /// before any record is read or request made.
+    #[tokio::test]
+    async fn a_body_that_is_not_text_or_not_a_file_is_refused_before_network() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        let files = crate::fixture::unconfined_files(directory.path().join("state"));
+
+        let binary = directory.path().join("binary.md");
+        fs::write(&binary, [0xff, 0xfe, 0x00]).expect("binary fixture should write");
+        assert!(matches!(
+            push_note(&client, &files, input(&binary, PushStrategy::Safe, false)).await,
+            Err(PushNoteError::LocalBody(
+                crate::sync::LocalBodyError::NotUtf8
+            ))
+        ));
+
+        let folder = directory.path().join("folder.md");
+        fs::create_dir(&folder).expect("directory fixture should create");
+        assert!(matches!(
+            push_note(&client, &files, input(&folder, PushStrategy::Safe, false)).await,
+            Err(PushNoteError::LocalBody(
+                crate::sync::LocalBodyError::NotAFile
+            ))
+        ));
+    }
+
     #[tokio::test]
     async fn overwrite_requires_confirmation_before_network() {
         let directory = tempfile::tempdir().expect("temp directory should create");
