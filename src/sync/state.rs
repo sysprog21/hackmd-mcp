@@ -187,8 +187,7 @@ impl StateStore {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn root(&self) -> &Path {
+    pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 

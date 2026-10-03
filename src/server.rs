@@ -144,7 +144,7 @@ mod tests {
         ("hackmd_create_folder", false, false, false),
         ("hackmd_update_folder", false, false, true),
         ("hackmd_delete_folder", false, true, true),
-        ("hackmd_upload_note_image", false, false, false),
+        ("hackmd_upload_note_image", false, true, false),
         ("hackmd_pull_note", false, true, false),
         ("hackmd_push_note", false, true, true),
         ("hackmd_untrack_note", false, true, true),

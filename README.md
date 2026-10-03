@@ -47,9 +47,13 @@ take precedence over `.env`. The server reads only these keys:
   path is accepted, except that a pull will not write a file coding agents load as
   instructions (`CLAUDE.md`, `AGENTS.md`, `SKILL.md`, and the like, or anything under
   `.claude/`, `.github/`, `.cursor/` and similar), and the server logs a warning at
-  startup. A root set only in a working-directory `.env` still confines, but since that
-  file may belong to someone else's repository (whose root could be `/`), the refusal to
-  write agent instruction files stays on beneath it too.
+  startup. That list is best effort, not a boundary: `CLAUDE.md` can import any Markdown
+  file, so set the root if agents read the tree you pull into. A root set only in a
+  working-directory `.env` still confines, but since that file may belong to someone
+  else's repository (whose root could be `/`), the refusal to write agent instruction
+  files stays on beneath it too. `hackmd_upload_note_image` publishes the file at a
+  public link, so it requires a root set in the server's own environment (not only in
+  `.env`) and refuses every upload without one.
 
 A `.env` in the working directory may not redirect a token that came from the environment: if
 `HACKMD_API_TOKEN` is inherited and only that file sets `HACKMD_API_URL`, the server refuses to

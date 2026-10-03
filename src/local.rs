@@ -130,6 +130,16 @@ pub(crate) enum LocalAccessError {
         path.display()
     )]
     AgentInstructions { path: PathBuf },
+    #[error(
+        "{} is inside this server's sync state directory (HACKMD_MCP_STATE_DIR); choose another destination",
+        path.display()
+    )]
+    StateDirectory { path: PathBuf },
+    #[error(
+        "{} would be published at a public link, and HACKMD_MCP_WORKSPACE_ROOT is not set in the server's environment; set it there to the tree images may come from",
+        path.display()
+    )]
+    Unconfined { path: PathBuf },
     #[error("local file operation failed: {0}")]
     Io(#[from] io::Error),
 }
@@ -143,7 +153,9 @@ impl crate::reply::ToolError for LocalAccessError {
             | Self::OutsideRoot { .. }
             | Self::MissingRoot { .. }
             | Self::ReplacedRoot { .. }
-            | Self::AgentInstructions { .. } => ErrorKind::LocalAccess,
+            | Self::AgentInstructions { .. }
+            | Self::StateDirectory { .. }
+            | Self::Unconfined { .. } => ErrorKind::LocalAccess,
             Self::Relative { .. } | Self::NotRegular { .. } => ErrorKind::InvalidInput,
             Self::Io(_) => ErrorKind::LocalIo,
         }
@@ -163,10 +175,13 @@ pub(crate) fn offload<T>(work: impl FnOnce() -> T) -> T {
     }
 }
 
-/// Files that coding agents read as standing instructions, by name.
+/// Files that coding agents read as standing instructions, by name. The list
+/// is best effort: `CLAUDE.md` can import any Markdown file, so the real
+/// control is `HACKMD_MCP_WORKSPACE_ROOT`.
 const AGENT_INSTRUCTION_FILES: &[&str] = &[
     "agent.md",
     "agents.md",
+    "agents.override.md",
     "claude.md",
     "claude.local.md",
     "conventions.md",
@@ -174,13 +189,16 @@ const AGENT_INSTRUCTION_FILES: &[&str] = &[
     "gemini.md",
     "qwen.md",
     "skill.md",
+    "warp.md",
 ];
 
 /// Directories whose contents coding agents load as configuration, skills,
 /// or instructions.
 const AGENT_CONFIG_DIRS: &[&str] = &[
     ".agents",
+    ".aiassistant",
     ".amazonq",
+    ".augment",
     ".claude",
     ".clinerules",
     ".codex",
@@ -189,9 +207,11 @@ const AGENT_CONFIG_DIRS: &[&str] = &[
     ".gemini",
     ".github",
     ".junie",
+    ".kilocode",
     ".kiro",
     ".opencode",
     ".roo",
+    ".trae",
     ".windsurf",
 ];
 
@@ -199,14 +219,44 @@ const AGENT_CONFIG_DIRS: &[&str] = &[
 /// cannot be spelled past the check. Win32 drops trailing dots and spaces and
 /// opens `name:stream` as `name`; APFS and NTFS fold case beyond ASCII, so
 /// `agentſ.md` (long s) opens as `AGENTS.md` and a Kelvin sign as `k`.
-/// Upper- then lowercasing folds both the way the filesystem does.
+/// Upper- then lowercasing folds both the way the filesystem does. HFS+ also
+/// ignores invisible characters such as U+200C when it looks a name up, so
+/// `CLAUDE\u{200c}.md` opens as `CLAUDE.md` there; those are dropped first.
 fn fold_name(name: &str) -> String {
     let name = name.split_once(':').map_or(name, |(stem, _)| stem);
-    name.trim_end_matches(['.', ' '])
+    name.chars()
+        .filter(|&c| !is_default_ignorable(c))
+        .collect::<String>()
+        .trim_end_matches(['.', ' '])
         .chars()
         .flat_map(char::to_uppercase)
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+/// Unicode's `Default_Ignorable_Code_Point` set: characters that render as
+/// nothing, a superset of those HFS+ skips when comparing names.
+fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
 }
 
 /// Whether writing `path` could plant instructions an agent later follows.
@@ -329,6 +379,21 @@ impl LocalFiles {
         }
     }
 
+    /// `allow`, for a file about to be published at a public link. That needs
+    /// a tree the user chose: with no root, one confused tool call could
+    /// publish any screenshot or scanned document on the machine.
+    pub(crate) fn allow_publish(&self, path: &Path) -> Result<(), LocalAccessError> {
+        // A root from a working-directory `.env` may be someone else's, with
+        // a root of `/`: only one from the server's own environment counts,
+        // which is exactly when the instruction guard is off.
+        if self.root.is_none() || self.guard_instructions {
+            return Err(LocalAccessError::Unconfined {
+                path: path.to_path_buf(),
+            });
+        }
+        self.allow(path)
+    }
+
     /// `allow`, for a path about to be written. Without a root there is no
     /// tree the user chose, and a root from a working-directory `.env` may not
     /// be the user's choice either, so in both cases the files agents load as
@@ -337,13 +402,45 @@ impl LocalFiles {
     pub(crate) fn allow_write(&self, path: &Path) -> Result<(), LocalAccessError> {
         self.allow(path)?;
 
+        // `..` is refused for every write, root or not: beneath a directory
+        // that does not exist yet it cannot be resolved, so the checks below
+        // could not see where the path really lands.
+        if path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(LocalAccessError::Traversal {
+                path: path.to_path_buf(),
+            });
+        }
+        let resolved = resolve_existing_prefix(path);
+
         // Judged on the path as spelled and as resolved, so a symlinked
         // directory such as `/tmp/x -> /repo/.claude` cannot hide one.
         if self.guard_instructions
-            && (is_agent_instruction_path(path)
-                || is_agent_instruction_path(&resolve_existing_prefix(path)))
+            && (is_agent_instruction_path(path) || is_agent_instruction_path(&resolved))
         {
             return Err(LocalAccessError::AgentInstructions {
+                path: path.to_path_buf(),
+            });
+        }
+
+        // The sync state is this server's own, and is trusted on load: a note
+        // written over a sidecar or baseline would forge it. A relative state
+        // directory is made absolute first, or no absolute path would ever
+        // fall beneath it.
+        let state_root = std::path::absolute(self.state.root())
+            .unwrap_or_else(|_| self.state.root().to_path_buf());
+        // Judged both fully resolved and with only the parent resolved: a
+        // symlink as the final component resolves elsewhere, but the write
+        // replaces the link itself, where it stands.
+        let state_root = resolve_existing_prefix(&state_root);
+        let entry = match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => resolve_existing_prefix(parent).join(name),
+            _ => resolved.clone(),
+        };
+        if resolved.starts_with(&state_root) || entry.starts_with(&state_root) {
+            return Err(LocalAccessError::StateDirectory {
                 path: path.to_path_buf(),
             });
         }
@@ -673,6 +770,13 @@ mod tests {
             "repo/.claude./agents/note.md",
             "repo/.claude /agents/note.md",
             "repo/.claude::$INDEX_ALLOCATION/agents/note.md",
+            // Names HFS+ matches while skipping an invisible character.
+            "repo/CLAUDE\u{200c}.md",
+            "repo/.c\u{200d}laude/commands/x.md",
+            "repo/\u{feff}AGENTS.md",
+            "repo/AGENTS.override.md",
+            "repo/WARP.md",
+            "repo/.kilocode/rules/note.md",
         ]
         .map(abs)
         {
@@ -691,6 +795,81 @@ mod tests {
         }
         assert!(files.allow_write(&abs("repo/docs/notes.md")).is_ok());
         assert!(files.allow_write(&abs("repo/CLAUDE-notes.md")).is_ok());
+    }
+
+    /// A sidecar or baseline is trusted on load, so nothing may be written
+    /// over one, root or not.
+    #[test]
+    fn the_state_directory_is_never_a_destination() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let state = directory.path().join("state");
+        let files = LocalFiles::new(state.clone(), None);
+        for refused in [state.join("tracked/x.baseline.md"), state.join("notes.md")] {
+            assert!(matches!(
+                files.allow_write(&refused),
+                Err(LocalAccessError::StateDirectory { .. })
+            ));
+        }
+        assert!(
+            files
+                .allow_write(&directory.path().join("notes.md"))
+                .is_ok()
+        );
+
+        // Through a directory that does not exist yet, `..` cannot be
+        // resolved, so it is refused for writes even without a root.
+        let around = directory
+            .path()
+            .join("missing/../state/tracked/x.baseline.md");
+        assert!(matches!(
+            files.allow_write(&around),
+            Err(LocalAccessError::Traversal { .. })
+        ));
+
+        // A relative state directory still covers its absolute spelling.
+        let relative = LocalFiles::new(PathBuf::from("relative-state"), None);
+        let absolute = std::env::current_dir()
+            .expect("working directory should resolve")
+            .join("relative-state/tracked/x.baseline.md");
+        assert!(matches!(
+            relative.allow_write(&absolute),
+            Err(LocalAccessError::StateDirectory { .. })
+        ));
+    }
+
+    /// Publishing needs a root from the server's own environment; one from a
+    /// working-directory `.env` could be `/`.
+    #[test]
+    fn only_a_trusted_root_may_publish() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let image = directory.path().join("image.png");
+        let state = directory.path().join("state");
+        let from_env = LocalFiles::new(state.clone(), Some(directory.path().to_path_buf()));
+        assert!(from_env.allow_publish(&image).is_ok());
+        let from_dotenv =
+            LocalFiles::new(state, Some(directory.path().to_path_buf())).guarding_instructions();
+        assert!(matches!(
+            from_dotenv.allow_publish(&image),
+            Err(LocalAccessError::Unconfined { .. })
+        ));
+    }
+
+    /// A symlink inside the state directory resolves elsewhere, but a write
+    /// replaces the link where it stands, inside the state directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_the_state_directory_is_still_inside_it() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let state = directory.path().join("state");
+        fs::create_dir(&state).expect("state directory should create");
+        let link = state.join("forged.md");
+        std::os::unix::fs::symlink(directory.path().join("outside.md"), &link)
+            .expect("symlink should create");
+        let files = LocalFiles::new(state, None);
+        assert!(matches!(
+            files.allow_write(&link),
+            Err(LocalAccessError::StateDirectory { .. })
+        ));
     }
 
     #[cfg(unix)]

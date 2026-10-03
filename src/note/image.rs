@@ -156,7 +156,7 @@ pub(crate) async fn upload_note_image(
     files: &LocalFiles,
     input: UploadNoteImageInput,
 ) -> Result<Result<UploadNoteImageOutput, NoteResolution>, UploadNoteImageError> {
-    files.allow(&input.image_path)?;
+    files.allow_publish(&input.image_path)?;
     let (image, size_bytes, mime) = crate::local::offload(|| open_image(files, &input))?;
     let resolution = crate::note::reference::resolve_note_ref(
         client,
@@ -201,9 +201,13 @@ mod tests {
         upload_note_image,
     };
 
-    /// Local access with no configured root, matching the default deployment.
+    /// Local access confined to the temporary directory the test images are
+    /// written in: an upload needs a root.
     fn files() -> crate::local::LocalFiles {
-        crate::fixture::scratch_files()
+        crate::local::LocalFiles::new(
+            std::env::temp_dir().join("hackmd-mcp-test"),
+            Some(std::env::temp_dir()),
+        )
     }
 
     /// A PNG signature followed by a marker the multipart assertions can find.
@@ -268,6 +272,27 @@ mod tests {
         assert!(matches!(
             upload_note_image(&client, &files(), input).await,
             Err(UploadNoteImageError::UnsupportedFormat)
+        ));
+    }
+
+    /// With no root, nothing marks which images the user meant to share.
+    #[tokio::test]
+    async fn refuses_to_upload_without_a_workspace_root() {
+        let mut image = tempfile::NamedTempFile::new().expect("temp image should create");
+        image.write_all(PNG_FIXTURE).expect("image should write");
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        let input = UploadNoteImageInput {
+            workspace: crate::models::Workspace::Personal,
+            note_ref: "note-id".to_owned(),
+            refresh: false,
+            image_path: image.path().to_path_buf(),
+            confirm_large_file: false,
+        };
+        assert!(matches!(
+            upload_note_image(&client, &crate::fixture::scratch_files(), input).await,
+            Err(UploadNoteImageError::Access(
+                crate::local::LocalAccessError::Unconfined { .. }
+            ))
         ));
     }
 
