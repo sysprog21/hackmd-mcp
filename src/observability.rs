@@ -75,7 +75,7 @@ mod tests {
     fn request_ids_are_nonempty_and_unique() {
         let first = next_request_id();
         let second = next_request_id();
-        assert!(!first.is_empty());
+        assert_ne!(first, "");
         assert_ne!(first, second);
     }
 }

@@ -705,7 +705,7 @@ mod tests {
         assert!(output.folder_placement_requested);
         assert!(!output.folder_placement_confirmed);
         assert!(output.compatibility_patch_applied);
-        assert!(output.note.folder_ids.is_empty());
+        assert_eq!(output.note.folder_ids, Vec::<String>::new());
     }
 
     #[tokio::test]

@@ -177,7 +177,7 @@ async fn team_folder_updates_and_image_route_are_measured() {
     let api = LiveApi::destructive_from_env();
     let team_path = std::env::var("HACKMD_LIVE_TEST_TEAM_PATH")
         .expect("set an isolated HACKMD_LIVE_TEST_TEAM_PATH for the team probe");
-    assert!(!team_path.trim().is_empty());
+    assert_ne!(team_path.trim(), "");
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock should be after epoch")

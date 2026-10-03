@@ -444,7 +444,7 @@ mod tests {
         else {
             panic!("the tracked source should list tracked records");
         };
-        assert!(output.notes.is_empty());
+        assert_eq!(output.notes, []);
 
         for refuse in [
             |input: &mut ListNotesInput| input.sort = Some(NoteSort::TitleAsc),
