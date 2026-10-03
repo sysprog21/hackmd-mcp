@@ -9,7 +9,7 @@ use crate::{
     dto::NoteResponse,
     local::LocalFiles,
     models::Workspace,
-    paging::{InvalidLimit, PageMeta, default_limit, paginate, validate_limit},
+    paging::{InvalidLimit, PageMeta, contains_folded, default_limit, paginate, validate_limit},
     sync::tracking::{
         ListTrackedNotesInput, ListTrackedNotesOutput, TrackingError, list_tracked_notes,
     },
@@ -322,20 +322,6 @@ fn matches_query(note: &NoteResponse, query: &str) -> bool {
         || note.tags.iter().any(|tag| contains(tag))
 }
 
-/// Whether `value` contains `needle`, which is already lowercase. Every note
-/// field is searched on every query, so the common all-ASCII case compares in
-/// place; anything else takes Unicode lowercasing, which can change length.
-pub(crate) fn contains_folded(value: &str, needle: &str) -> bool {
-    if value.is_ascii() && needle.is_ascii() {
-        let (value, needle) = (value.as_bytes(), needle.as_bytes());
-        return needle.is_empty()
-            || value
-                .windows(needle.len())
-                .any(|window| window.eq_ignore_ascii_case(needle));
-    }
-    value.to_lowercase().contains(needle)
-}
-
 /// Whether `value` equals `lowered`, which is already lowercase, ignoring case.
 fn equals_folded(value: &str, lowered: &str) -> bool {
     if value.is_ascii() && lowered.is_ascii() {
@@ -496,7 +482,7 @@ mod tests {
         ] {
             let needle = needle.to_lowercase();
             assert_eq!(
-                super::contains_folded(value, &needle),
+                crate::paging::contains_folded(value, &needle),
                 value.to_lowercase().contains(&needle),
                 "{value} / {needle}"
             );

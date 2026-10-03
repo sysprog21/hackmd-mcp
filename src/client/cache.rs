@@ -39,9 +39,7 @@ pub(super) fn fresh<T: ?Sized>(
     slot: &Mutex<Option<(tokio::time::Instant, Arc<T>)>>,
     ttl: Duration,
 ) -> Option<Arc<T>> {
-    let slot = slot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let slot = lock(slot);
     slot.as_ref()
         .filter(|(stored, _)| stored.elapsed() < ttl)
         .map(|(_, value)| Arc::clone(value))
@@ -51,10 +49,15 @@ pub(super) fn store<T: ?Sized>(
     slot: &Mutex<Option<(tokio::time::Instant, Arc<T>)>>,
     value: Arc<T>,
 ) {
-    *slot
+    *lock(slot) = Some((tokio::time::Instant::now(), value));
+}
+
+/// Locks `mutex`, poisoned or not: every critical section here leaves the
+/// cache consistent, so a panic elsewhere is no reason to stop serving it.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        Some((tokio::time::Instant::now(), value));
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 const MAX_CACHED_WORKSPACES: usize = 32;
@@ -149,10 +152,7 @@ impl NotesCache {
     }
 
     pub(super) fn begin(&self, workspace: &Workspace, bypass_cache: bool) -> CacheLookup {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock(&self.state);
         if !bypass_cache && !self.ttl.is_zero() {
             state.access_clock = state.access_clock.wrapping_add(1);
             let access = state.access_clock;
@@ -211,10 +211,7 @@ impl NotesCache {
         flight: &Arc<CacheFlight>,
         notes: Option<&Arc<[NoteResponse]>>,
     ) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock(&self.state);
         let current = state
             .flights
             .get(workspace)
@@ -298,10 +295,7 @@ impl NotesCache {
     /// Hits, misses, and bytes held, for the benchmark that reports them.
     #[cfg(test)]
     pub(super) fn stats(&self) -> (u64, u64, usize) {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = lock(&self.state);
         (state.hits, state.misses, state.total_bytes)
     }
 
@@ -309,10 +303,7 @@ impl NotesCache {
     /// deliberate: a note can move between workspaces, and the map holds at
     /// most a handful of entries.
     pub(super) fn invalidate(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock(&self.state);
         state.generation = state.generation.wrapping_add(1);
         if !state.entries.is_empty() {
             state.evictions = state

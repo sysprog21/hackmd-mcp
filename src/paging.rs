@@ -1,4 +1,5 @@
-//! Local pagination shared by every list tool.
+//! Local pagination, and the case-folded matching behind its filters, shared
+//! by every list tool.
 //!
 //! `HackMD`'s list endpoints answer with the whole collection and accept no
 //! paging parameters, so the server fetches everything and cuts the page here.
@@ -56,6 +57,20 @@ pub(crate) fn paginate<T>(items: Vec<T>, offset: usize, limit: usize) -> (Vec<T>
             next_offset: has_more.then_some(end),
         },
     )
+}
+
+/// Whether `value` contains `needle`, which is already lowercase. Every note
+/// field is searched on every query, so the common all-ASCII case compares in
+/// place; anything else takes Unicode lowercasing, which can change length.
+pub(crate) fn contains_folded(value: &str, needle: &str) -> bool {
+    if value.is_ascii() && needle.is_ascii() {
+        let (value, needle) = (value.as_bytes(), needle.as_bytes());
+        return needle.is_empty()
+            || value
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle));
+    }
+    value.to_lowercase().contains(needle)
 }
 
 #[cfg(test)]

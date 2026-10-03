@@ -245,7 +245,7 @@ async fn set_child_order(
     let mut order: BTreeMap<String, Vec<String>> = client.get_folder_order(workspace).await?;
     order.insert(parent.clone(), folder_ids.clone());
     client.set_folder_order(workspace, &order).await?;
-    let readback = client
+    client
         .poll_readback(
             0,
             || client.get_folder_order(workspace),
@@ -256,10 +256,10 @@ async fn set_child_order(
                     .map_or(folder_ids.is_empty(), |ids| *ids == folder_ids)
             },
         )
-        .await?;
-    if !readback.confirmed {
-        return Err(FolderError::OrderReadbackMismatch { parent });
-    }
+        .await?
+        .confirmed_or(|| FolderError::OrderReadbackMismatch {
+            parent: parent.clone(),
+        })?;
     Ok(ChildOrder { parent, folder_ids })
 }
 
@@ -410,19 +410,16 @@ async fn update_fields(
     payload: &UpdateFolderRequest,
 ) -> Result<FolderResponse, FolderError> {
     client.update_folder(workspace, folder_id, payload).await?;
-    let folder = client
+    client
         .poll_readback(
             0,
             || client.get_folder(workspace, folder_id),
             |folder| folder_matches_update(folder, payload),
         )
-        .await?;
-    if !folder.confirmed {
-        return Err(FolderError::ReadbackMismatch {
+        .await?
+        .confirmed_or(|| FolderError::ReadbackMismatch {
             folder_id: folder_id.to_owned(),
-        });
-    }
-    Ok(folder.value)
+        })
 }
 
 fn folder_matches_update(folder: &FolderResponse, update: &UpdateFolderRequest) -> bool {

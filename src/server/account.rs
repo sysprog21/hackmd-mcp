@@ -1,10 +1,12 @@
 //! Account and workspace discovery.
 
-use rmcp::{handler::server::wrapper::Parameters, schemars, tool, tool_router};
-use serde::Deserialize;
+use rmcp::{handler::server::wrapper::Parameters, tool, tool_router};
 
 use super::HackmdServer;
-use crate::{client::HackmdError, dto::ProfileResponse, reply};
+use crate::{
+    account::{EmptyInput, get_me, profile_summary},
+    reply,
+};
 
 #[tool_router(router = account_router, vis = "pub(crate)")]
 impl HackmdServer {
@@ -23,32 +25,6 @@ impl HackmdServer {
         &self,
         Parameters(EmptyInput {}): Parameters<EmptyInput>,
     ) -> rmcp::model::CallToolResult {
-        reply::respond(self.account().await, profile_summary)
+        reply::respond(get_me(&self.client).await, profile_summary)
     }
 }
-
-impl HackmdServer {
-    /// The profile with its teams filled in. `/me` may carry them already; when
-    /// it does not, one `/teams` request supplies them. Both are fetched fresh:
-    /// this is the call an agent makes to see the account as it is now.
-    async fn account(&self) -> Result<ProfileResponse, HackmdError> {
-        let mut profile = self.client.get_me().await?;
-        if profile.teams.is_empty() {
-            profile.teams = self.client.list_teams(true).await?.to_vec();
-        }
-        Ok(profile)
-    }
-}
-
-pub(crate) fn profile_summary(profile: &ProfileResponse) -> String {
-    format!(
-        "Authenticated as {} (user_path: {}); {} team(s)",
-        profile.name,
-        profile.user_path,
-        profile.teams.len()
-    )
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct EmptyInput {}

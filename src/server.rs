@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use rmcp::ServiceExt;
 use tracing::Instrument;
@@ -44,17 +44,7 @@ impl HackmdServer {
 
 pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    let mut files = LocalFiles::new(
-        config.state_dir().to_path_buf(),
-        config.workspace_root().map(Path::to_path_buf),
-    );
-    if config.workspace_root().is_some() && !config.workspace_root_trusted() {
-        tracing::warn!(
-            "HACKMD_MCP_WORKSPACE_ROOT comes from the working-directory .env, not the environment; files agents load as instructions stay refused beneath it"
-        );
-        files = files.guarding_instructions();
-    }
-    let files = Arc::new(files);
+    let files = Arc::new(LocalFiles::from_config(&config));
     if let Some(root) = config.workspace_root() {
         match files.probe_workspace_root() {
             Ok(()) => {
@@ -71,10 +61,10 @@ pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
             "HACKMD_MCP_WORKSPACE_ROOT is unset: local file tools accept any absolute path; set it to confine them"
         );
     }
-    let client = Arc::new(HackmdClient::new(config)?);
-    if !client.has_api_token() {
+    if !config.has_api_token() {
         tracing::warn!("HACKMD_API_TOKEN is not set; API tools will return a configuration error");
     }
+    let client = Arc::new(HackmdClient::new(config)?);
 
     HackmdServer::new(client, files)
         .serve(rmcp::transport::stdio())
@@ -135,10 +125,10 @@ mod tests {
     }
 
     use super::HackmdServer;
+    use crate::account::{EmptyInput, profile_summary};
     use crate::client::HackmdClient;
     use crate::config::Config;
     use crate::fixture::{Scenario, SequenceServer};
-    use crate::server::account::{EmptyInput, profile_summary};
     use rmcp::{ServerHandler, ServiceExt, model::CallToolRequestParams};
     use serde_json::json;
     use std::sync::Arc;

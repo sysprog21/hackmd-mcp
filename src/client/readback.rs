@@ -27,6 +27,18 @@ pub(crate) struct Readback<T> {
     pub(crate) confirmed: bool,
 }
 
+impl<T> Readback<T> {
+    /// The value a confirmed read-back saw, or `mismatch()`: a write that
+    /// never showed up within the window is an error, not a success.
+    pub(crate) fn confirmed_or<E>(self, mismatch: impl FnOnce() -> E) -> Result<T, E> {
+        if self.confirmed {
+            Ok(self.value)
+        } else {
+            Err(mismatch())
+        }
+    }
+}
+
 /// Polls with the window sized to `written_bytes` and the standard first
 /// delay.
 pub(super) async fn poll_readback_sized<T, Fut>(

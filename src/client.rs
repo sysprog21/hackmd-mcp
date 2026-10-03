@@ -55,10 +55,6 @@ impl HackmdClient {
         })
     }
 
-    pub(crate) fn has_api_token(&self) -> bool {
-        self.config.has_api_token()
-    }
-
     /// Always asks `HackMD`, and refreshes the cached `userPath` on the way,
     /// along with the team list when `/me` carries one.
     pub(crate) async fn get_me(&self) -> Result<ProfileResponse, HackmdError> {
@@ -257,20 +253,15 @@ impl HackmdClient {
         written_bytes: usize,
         accepted: impl Fn(&NoteResponse) -> bool,
     ) -> Result<NoteResponse, HackmdError> {
-        let readback = self
-            .poll_readback(
-                written_bytes,
-                || self.get_note(workspace, note_id),
-                accepted,
-            )
-            .await?;
-        if readback.confirmed {
-            Ok(readback.value)
-        } else {
-            Err(HackmdError::ReadbackMismatch {
-                note_id: note_id.to_owned(),
-            })
-        }
+        self.poll_readback(
+            written_bytes,
+            || self.get_note(workspace, note_id),
+            accepted,
+        )
+        .await?
+        .confirmed_or(|| HackmdError::ReadbackMismatch {
+            note_id: note_id.to_owned(),
+        })
     }
 
     /// Updates only note content without cloning the caller's potentially

@@ -7,8 +7,7 @@ use thiserror::Error;
 use crate::{
     local::LocalFiles,
     models::Workspace,
-    note::list::contains_folded,
-    paging::{InvalidLimit, PageMeta, paginate, validate_limit},
+    paging::{InvalidLimit, PageMeta, contains_folded, paginate, validate_limit},
     sync::state::StateError,
 };
 

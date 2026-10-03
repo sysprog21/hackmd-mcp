@@ -291,7 +291,6 @@ pub(crate) async fn create_note(
                 parent_folder_id: Some(Some(folder_id.clone())),
                 ..UpdateNoteRequest::default()
             };
-            placement.validate()?;
             client
                 .update_note(&input.workspace, &note_id, &placement)
                 .await
@@ -334,11 +333,7 @@ pub(crate) async fn update_note(
     client: &HackmdClient,
     mut input: UpdateNoteInput,
 ) -> Result<Result<UpdateNoteOutput, NoteResolution>, CrudError> {
-    if input
-        .expected_hash
-        .as_deref()
-        .is_some_and(|hash| !crate::sync::state::is_body_hash(hash))
-    {
+    if crate::hash::is_malformed(input.expected_hash.as_deref()) {
         return Err(CrudError::MalformedExpectedHash);
     }
     if let Some(patch) = input.patch.take() {
@@ -513,7 +508,7 @@ mod tests {
                 update(json!({
                     "note_ref": "id",
                     "title": "T",
-                    "expected_hash": crate::sync::state::body_hash("")
+                    "expected_hash": crate::hash::body_hash("")
                 }))
             )
             .await,
@@ -559,7 +554,7 @@ mod tests {
         let input = serde_json::from_value(json!({
             "note_ref": "id",
             "content": "replacement",
-            "expected_hash": crate::sync::state::body_hash("as read")
+            "expected_hash": crate::hash::body_hash("as read")
         }))
         .expect("input should deserialize");
         assert!(matches!(

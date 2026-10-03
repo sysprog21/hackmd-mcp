@@ -76,7 +76,7 @@ async fn self_check(
     let api_origin = config.api_url().origin().ascii_serialization();
     let state_path = config.state_dir().to_path_buf();
     let root_path = config.workspace_root().map(PathBuf::from);
-    let files = LocalFiles::new(state_path.clone(), root_path.clone());
+    let files = LocalFiles::from_config(&config);
 
     let state_error = files
         .state()

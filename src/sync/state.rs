@@ -1,32 +1,87 @@
 use std::{
-    fmt::Write as _,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::models::Workspace;
+use sha2::{Digest, Sha256};
+
+use crate::{
+    hash::{body_digest, body_hash, body_hash_from_digest, push_hex},
+    models::Workspace,
+};
 
 /// Persistent metadata for one locally tracked note.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(try_from = "StoredState", into = "StoredState")]
 pub(crate) struct TrackedNoteState {
     pub(crate) internal_id: String,
-    #[serde(with = "crate::models::tagged")]
     pub(crate) workspace: Workspace,
+    /// The tracked file, canonicalized: what lookups match and what results
+    /// report.
     pub(crate) local_path: PathBuf,
     pub(crate) baseline_body_hash: String,
     pub(crate) last_observed_remote_timestamp: String,
-    pub(crate) local_file_identity: LocalFileIdentity,
     /// Hash of the `*.remote.md` a conflicted push last wrote. A later
     /// conflict replaces that file only while it still has exactly this
     /// content, so a file the user wrote or edited is never overwritten.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) remote_snapshot_hash: Option<String>,
+}
+
+/// A sidecar as written. The path appears twice, once inside
+/// `local_file_identity`, because older builds look files up there; in
+/// memory it is one field, so the two can never be read apart. A sidecar
+/// whose copies disagree was edited by hand or torn, and is refused as
+/// corrupt rather than trusted by either copy.
+#[derive(Deserialize, Serialize)]
+struct StoredState {
+    internal_id: String,
+    #[serde(with = "crate::models::tagged")]
+    workspace: Workspace,
+    local_path: PathBuf,
+    baseline_body_hash: String,
+    last_observed_remote_timestamp: String,
+    local_file_identity: LocalFileIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_snapshot_hash: Option<String>,
+}
+
+impl TryFrom<StoredState> for TrackedNoteState {
+    type Error = &'static str;
+
+    fn try_from(stored: StoredState) -> Result<Self, Self::Error> {
+        if stored.local_file_identity.canonical_path != stored.local_path {
+            return Err("local_path and local_file_identity name different files");
+        }
+        Ok(Self {
+            internal_id: stored.internal_id,
+            workspace: stored.workspace,
+            local_path: stored.local_path,
+            baseline_body_hash: stored.baseline_body_hash,
+            last_observed_remote_timestamp: stored.last_observed_remote_timestamp,
+            remote_snapshot_hash: stored.remote_snapshot_hash,
+        })
+    }
+}
+
+impl From<TrackedNoteState> for StoredState {
+    fn from(state: TrackedNoteState) -> Self {
+        Self {
+            local_file_identity: LocalFileIdentity {
+                canonical_path: state.local_path.clone(),
+            },
+            internal_id: state.internal_id,
+            workspace: state.workspace,
+            local_path: state.local_path,
+            baseline_body_hash: state.baseline_body_hash,
+            last_observed_remote_timestamp: state.last_observed_remote_timestamp,
+            remote_snapshot_hash: state.remote_snapshot_hash,
+        }
+    }
 }
 
 impl TrackedNoteState {
@@ -43,10 +98,8 @@ impl TrackedNoteState {
         baseline_body: &str,
         remote_timestamp: Option<i64>,
     ) -> Result<Self, StateError> {
-        let local_file_identity = local_file_identity(local_path.as_ref())?;
         Ok(Self {
-            local_path: local_file_identity.canonical_path.clone(),
-            local_file_identity,
+            local_path: fs::canonicalize(local_path.as_ref())?,
             internal_id,
             workspace,
             baseline_body_hash: body_hash(baseline_body),
@@ -97,48 +150,14 @@ fn key_with(workspace: &Workspace, internal_id: &str, legacy: bool) -> String {
     }
 }
 
-/// The single hash format written to sidecars and reported by the sync tools.
-pub(crate) fn body_hash(body: &str) -> String {
-    body_hash_from_digest(&body_digest(body))
-}
-
-/// Whether `value` is in the one format `body_hash` writes: `sha256:` and 64
-/// lowercase hex digits. A caller-supplied hash in any other shape can never
-/// match, and is better refused as input than reported as a conflict.
-pub(crate) fn is_body_hash(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|hex| {
-        hex.len() == 64
-            && hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    })
-}
-
-pub(crate) fn body_hash_from_digest(digest: &[u8; 32]) -> String {
-    let mut hash = String::with_capacity(71);
-    hash.push_str("sha256:");
-    push_hex(&mut hash, digest);
-    hash
-}
-
-fn push_hex(out: &mut String, bytes: &[u8]) {
-    for byte in bytes {
-        write!(out, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-}
-
-pub(crate) fn body_digest(body: &str) -> [u8; 32] {
-    Sha256::digest(body.as_bytes()).into()
-}
-
-/// Stable identity captured for the local Markdown file.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+/// Where an older build looks for the tracked file's path in a sidecar.
+#[derive(Deserialize, Serialize)]
 ///
 /// Sidecars written by older builds also carry `device_id` and `file_id`.
 /// Nothing ever read them, and every atomic rename changes the inode anyway,
 /// so they are no longer written; loading simply ignores them.
-pub(crate) struct LocalFileIdentity {
-    pub(crate) canonical_path: PathBuf,
+struct LocalFileIdentity {
+    canonical_path: PathBuf,
 }
 
 /// Local state layout. Constructing it never touches the filesystem.
@@ -210,7 +229,7 @@ impl StateStore {
         crate::local::offload(|| {
             let key = state_key(&state.workspace, &state.internal_id);
             let paths = self.paths_for_key(&key);
-            let canonical = &state.local_file_identity.canonical_path;
+            let canonical = &state.local_path;
             let is_this_note = |record: &StoredRecord| {
                 record.state.workspace == state.workspace
                     && record.state.internal_id == state.internal_id
@@ -228,7 +247,7 @@ impl StateStore {
                 .max_by_key(|record| record.key == key);
             let mut state = state.clone();
             if let Some(existing) = existing {
-                if existing.state.local_file_identity.canonical_path == *canonical {
+                if existing.state.local_path == *canonical {
                     // Same note, same file: the conflict snapshot beside it is
                     // still the one this tool wrote, whoever captured this
                     // state.
@@ -238,10 +257,7 @@ impl StateStore {
                             .clone_from(&existing.state.remote_snapshot_hash);
                     }
                 } else {
-                    self.remove_hint_if_matches(
-                        &existing.state.local_file_identity.canonical_path,
-                        &existing.key,
-                    )?;
+                    self.remove_hint_if_matches(&existing.state.local_path, &existing.key)?;
                 }
             }
 
@@ -251,9 +267,7 @@ impl StateStore {
             // Removed first, so a crash below leaves the file untracked rather
             // than tracked by the wrong note.
             for other in &records {
-                if other.state.local_file_identity.canonical_path == *canonical
-                    && !is_this_note(other)
-                {
+                if other.state.local_path == *canonical && !is_this_note(other) {
                     remove_record(&other.paths)?;
                 }
             }
@@ -409,10 +423,7 @@ impl StateStore {
             let record = self
                 .resolve(workspace, internal_id)?
                 .ok_or(StateError::NotTracked)?;
-            self.remove_hint_if_matches(
-                &record.state.local_file_identity.canonical_path,
-                &record.key,
-            )?;
+            self.remove_hint_if_matches(&record.state.local_path, &record.key)?;
             remove_record(&record.paths)?;
             Ok(record.state)
         })
@@ -452,7 +463,7 @@ impl StateStore {
             return Ok(None);
         };
         let state: TrackedNoteState = serde_json::from_slice(&sidecar).map_err(|_| corrupt())?;
-        if state.local_file_identity.canonical_path != canonical {
+        if state.local_path != canonical {
             return Ok(None);
         }
         Ok(Some(StoredRecord {
@@ -469,7 +480,7 @@ impl StateStore {
         let mut matches = self
             .scan()?
             .into_iter()
-            .filter(|record| record.state.local_file_identity.canonical_path == canonical);
+            .filter(|record| record.state.local_path == canonical);
         let Some(found) = matches.next() else {
             return Ok(None);
         };
@@ -548,29 +559,6 @@ impl StateStore {
     }
 }
 
-pub(crate) fn write_local_atomic(path: &Path, contents: &[u8]) -> Result<(), StateError> {
-    let parent = path.parent().ok_or(StateError::InvalidStatePath)?;
-    let existing_permissions = fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    let mut temporary = NamedTempFile::new_in(parent)?;
-    if let Some(permissions) = existing_permissions {
-        temporary.as_file().set_permissions(permissions)?;
-    }
-    temporary.write_all(contents)?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist(path)
-        .map_err(|error| StateError::Io(error.error))?;
-    Ok(())
-}
-
-pub(crate) fn local_file_identity(path: &Path) -> Result<LocalFileIdentity, StateError> {
-    Ok(LocalFileIdentity {
-        canonical_path: fs::canonicalize(path)?,
-    })
-}
-
 struct StatePaths {
     sidecar: PathBuf,
     baseline: PathBuf,
@@ -632,13 +620,7 @@ fn valid_state_key(key: &str) -> bool {
 fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<(), StateError> {
     let parent = path.parent().ok_or(StateError::InvalidStatePath)?;
     create_private_dir_all(parent)?;
-    let mut temporary = NamedTempFile::new_in(parent)?;
-    set_private_permissions(temporary.as_file())?;
-    temporary.write_all(contents)?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist(path)
-        .map_err(|error| StateError::Io(error.error))?;
+    crate::local::replace_atomic(path, contents, set_private_permissions)?;
     Ok(())
 }
 
@@ -782,7 +764,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use super::{LocalFileIdentity, StateError, StateStore, TrackedNoteState};
+    use super::{StateError, StateStore, TrackedNoteState};
     use crate::models::Workspace;
 
     fn fixture_state(workspace: Workspace) -> TrackedNoteState {
@@ -792,9 +774,6 @@ mod tests {
             local_path: PathBuf::from("/tmp/note.md"),
             baseline_body_hash: "sha256:fixture".to_owned(),
             last_observed_remote_timestamp: "2026-08-29T00:00:00Z".to_owned(),
-            local_file_identity: LocalFileIdentity {
-                canonical_path: PathBuf::from("/tmp/note.md"),
-            },
             remote_snapshot_hash: None,
         }
     }
@@ -818,6 +797,24 @@ mod tests {
                 .expect("legacy sidecar should deserialize"),
             fixture_state(Workspace::Personal)
         );
+    }
+
+    /// The path is written twice so older builds still find it; a sidecar
+    /// whose copies disagree cannot say which file it tracks.
+    #[test]
+    fn the_path_is_written_twice_and_must_agree() {
+        let written = serde_json::to_value(fixture_state(Workspace::Personal))
+            .expect("state should serialize");
+        assert_eq!(written["local_path"], "/tmp/note.md");
+        assert_eq!(
+            written["local_file_identity"]["canonical_path"],
+            "/tmp/note.md"
+        );
+
+        let mut torn = written;
+        torn["local_file_identity"]["canonical_path"] = "/tmp/other.md".into();
+        let parsed = serde_json::from_value::<TrackedNoteState>(torn);
+        assert!(parsed.is_err(), "{parsed:?}");
     }
 
     #[test]
@@ -1389,21 +1386,5 @@ mod tests {
             Some("sha256:snapshot")
         );
         assert!(store.untrack(&Workspace::Personal, "note-id").is_ok());
-    }
-
-    #[test]
-    fn only_the_format_body_hash_writes_is_a_body_hash() {
-        assert!(super::is_body_hash(&super::body_hash("any body")));
-        for value in [
-            "",
-            "sha256:",
-            "sha256:x",
-            &format!("SHA256:{}", "0".repeat(64)),
-            &format!("sha256:{}", "A".repeat(64)),
-            &format!("sha256:{}", "0".repeat(63)),
-            &format!(" sha256:{}", "0".repeat(64)),
-        ] {
-            assert!(!super::is_body_hash(value), "{value:?}");
-        }
     }
 }

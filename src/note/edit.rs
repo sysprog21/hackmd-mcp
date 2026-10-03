@@ -65,7 +65,7 @@ pub(crate) fn ensure_unchanged(
     let Some(expected) = expected else {
         return Ok(());
     };
-    let actual = crate::local::offload(|| crate::sync::state::body_hash(body));
+    let actual = crate::local::offload(|| crate::hash::body_hash(body));
     if actual == expected {
         Ok(())
     } else {
@@ -206,7 +206,7 @@ mod tests {
         let mut stale = input(
             "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch",
         );
-        stale.expected_hash = Some(crate::sync::state::body_hash("old\n"));
+        stale.expected_hash = Some(crate::hash::body_hash("old\n"));
         let error = edit_note(&server.client(), stale)
             .await
             .expect_err("a changed body must not be written");
@@ -239,7 +239,7 @@ mod tests {
         let mut fresh = input(
             "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch",
         );
-        fresh.expected_hash = Some(crate::sync::state::body_hash("old\n"));
+        fresh.expected_hash = Some(crate::hash::body_hash("old\n"));
         let output = edit_note(&server.client(), fresh)
             .await
             .expect("an unchanged body should be patched")

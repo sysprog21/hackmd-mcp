@@ -6,10 +6,11 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
+    hash::body_hash,
     local::{Entry, LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
-    sync::state::{StateError, TrackedNoteState, body_hash},
+    sync::state::{StateError, TrackedNoteState},
     sync::{BODY_MAX_BYTES, BodySizeError, check_body_size},
 };
 

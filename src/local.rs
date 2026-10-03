@@ -222,6 +222,26 @@ fn is_agent_instruction_path(path: &Path) -> bool {
             .any(|component| listed(AGENT_CONFIG_DIRS, component.as_os_str()))
 }
 
+/// Replaces `path` with `contents` through a temporary file beside it,
+/// readied by `prepare` (its permissions) before anything is written and
+/// synced before the rename, so a reader sees the old file or the new one,
+/// never a torn mix.
+pub(crate) fn replace_atomic(
+    path: &Path,
+    contents: &[u8],
+    prepare: impl FnOnce(&fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    prepare(temporary.as_file())?;
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 impl LocalFiles {
     pub(crate) fn new(state_dir: PathBuf, root: Option<PathBuf>) -> Self {
         Self {
@@ -230,6 +250,24 @@ impl LocalFiles {
             root: root.map(WorkspaceRoot::open),
             sync: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// The local files `config` describes, the one way the server and the
+    /// self-check build them. A root from the working-directory `.env` is
+    /// honored but not trusted: that file may be someone else's, with a root
+    /// of `/`, so files agents load as instructions stay refused beneath it.
+    pub(crate) fn from_config(config: &crate::config::Config) -> Self {
+        let files = Self::new(
+            config.state_dir().to_path_buf(),
+            config.workspace_root().map(Path::to_path_buf),
+        );
+        if config.workspace_root().is_none() || config.workspace_root_trusted() {
+            return files;
+        }
+        tracing::warn!(
+            "HACKMD_MCP_WORKSPACE_ROOT comes from the working-directory .env, not the environment; files agents load as instructions stay refused beneath it"
+        );
+        files.guarding_instructions()
     }
 
     /// Keeps the instruction-file refusal on beneath the root, for a root that
@@ -436,8 +474,11 @@ impl LocalFiles {
                 if create_parent_dirs && let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                return crate::sync::state::write_local_atomic(path, contents)
-                    .map_err(|error| LocalAccessError::Io(io::Error::other(error)));
+                // The user's own file keeps whatever permissions it had.
+                let existing = fs::metadata(path).ok().map(|meta| meta.permissions());
+                return Ok(replace_atomic(path, contents, |file| {
+                    existing.map_or(Ok(()), |permissions| file.set_permissions(permissions))
+                })?);
             };
             let parent = relative.parent().ok_or_else(|| {
                 LocalAccessError::Io(io::Error::new(

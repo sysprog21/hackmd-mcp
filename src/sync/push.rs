@@ -10,10 +10,11 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
+    hash::{body_digest, body_hash, body_hash_from_digest},
     local::{LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
-    sync::state::{StateError, TrackedNoteState, body_digest, body_hash, body_hash_from_digest},
+    sync::state::{StateError, TrackedNoteState},
     sync::{BODY_MAX_BYTES, ChangeState, LocalBodyError, classify_changes, read_local_body},
 };
 
@@ -213,11 +214,7 @@ fn validate_and_read_local(
     files: &LocalFiles,
     input: &PushNoteInput,
 ) -> Result<String, PushNoteError> {
-    if input
-        .expected_remote_hash
-        .as_deref()
-        .is_some_and(|hash| !crate::sync::state::is_body_hash(hash))
-    {
+    if crate::hash::is_malformed(input.expected_remote_hash.as_deref()) {
         return Err(PushNoteError::MalformedExpectedHash);
     }
     if matches!(input.strategy, PushStrategy::Overwrite) && !input.confirm {
@@ -271,10 +268,9 @@ async fn push_resolved(
                 return Ok(Ok(output(&target, PushStatus::NothingToPush)));
             }
 
-            // Both sides changed to the same body, as after identical edits or
-            // a merge that settled on the remote: nothing to write, but the
-            // baseline moves there, or the next check reports a conflict.
-            ChangeState::Conflict if local_digest == remote_digest => {
+            // Nothing to write, but the baseline moves to the converged body,
+            // or the next check reports a conflict.
+            ChangeState::Converged => {
                 let result = output(&target, PushStatus::NothingToPush);
                 advance_state(files, tracked.state, &local, remote_timestamp)?;
                 return Ok(Ok(result));
@@ -460,7 +456,10 @@ impl BoundedWriter {
         if self.truncated {
             self.bytes.extend_from_slice("…".as_bytes());
         }
-        String::from_utf8(self.bytes).expect("diff formatter writes valid UTF-8")
+        // The formatter writes whole `str` pieces and the cut lands on a
+        // character boundary, so this is valid UTF-8; lossy costs nothing
+        // and leaves no panic behind if that ever changes.
+        String::from_utf8_lossy(&self.bytes).into_owned()
     }
 }
 
@@ -864,7 +863,7 @@ mod tests {
         let files =
             crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
         let mut stale = input(&local_path, PushStrategy::Safe, false);
-        stale.expected_remote_hash = Some(crate::sync::state::body_hash("remote edit"));
+        stale.expected_remote_hash = Some(crate::hash::body_hash("remote edit"));
 
         let output = push_note(&fixture.client(), &files, stale)
             .await
@@ -911,7 +910,7 @@ mod tests {
         let files =
             crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
         let mut merged = input(&local_path, PushStrategy::Safe, false);
-        merged.expected_remote_hash = Some(crate::sync::state::body_hash("remote edit"));
+        merged.expected_remote_hash = Some(crate::hash::body_hash("remote edit"));
 
         let output = push_note(&fixture.client(), &files, merged)
             .await
@@ -921,7 +920,7 @@ mod tests {
         assert_eq!(output.status, PushStatus::Conflict);
         assert_eq!(
             output.remote_body_hash,
-            Some(crate::sync::state::body_hash("baseline"))
+            Some(crate::hash::body_hash("baseline"))
         );
         assert_eq!(fixture.finish().len(), 1, "nothing may be written");
     }
