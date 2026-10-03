@@ -1,8 +1,5 @@
 use reqwest::{Method, StatusCode};
-use serde::{
-    Serialize,
-    de::{DeserializeOwned, IgnoredAny},
-};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -134,15 +131,9 @@ impl HackmdClient {
         self.get_required(&["trash"]).await
     }
 
-    /// Any response body is ignored: success is the status code.
     pub(crate) async fn restore_note(&self, note_id: &str) -> Result<(), HackmdError> {
-        self.request_json_idempotent::<IgnoredAny>(
-            Method::PUT,
-            &["trash", note_id, "restore"],
-            NO_BODY,
-        )
-        .await
-        .map(drop)
+        self.write_idempotent(Method::PUT, &["trash", note_id, "restore"], NO_BODY)
+            .await
     }
 
     /// Lists a workspace's notes, from cache when one is still fresh.
@@ -203,9 +194,9 @@ impl HackmdClient {
         workspace: &Workspace,
         note_id: &str,
         payload: &UpdateNoteRequest,
-    ) -> Result<Option<NoteResponse>, HackmdError> {
+    ) -> Result<(), HackmdError> {
         let segments = workspace_route(workspace, &["notes", note_id]);
-        self.request_json_idempotent(Method::PATCH, &segments, Some(payload))
+        self.write_idempotent(Method::PATCH, &segments, Some(payload))
             .await
     }
 
@@ -271,14 +262,14 @@ impl HackmdClient {
         workspace: &Workspace,
         note_id: &str,
         content: &str,
-    ) -> Result<Option<Value>, HackmdError> {
+    ) -> Result<(), HackmdError> {
         #[derive(Serialize)]
         struct ContentUpdate<'a> {
             content: &'a str,
         }
 
         let segments = workspace_route(workspace, &["notes", note_id]);
-        self.request_json_idempotent(Method::PATCH, &segments, Some(&ContentUpdate { content }))
+        self.write_idempotent(Method::PATCH, &segments, Some(&ContentUpdate { content }))
             .await
     }
 
@@ -288,9 +279,7 @@ impl HackmdClient {
         note_id: &str,
     ) -> Result<(), HackmdError> {
         let segments = workspace_route(workspace, &["notes", note_id]);
-        self.request_json::<IgnoredAny>(Method::DELETE, &segments, NO_BODY)
-            .await
-            .map(drop)
+        self.write(Method::DELETE, &segments, NO_BODY).await
     }
 
     pub(crate) async fn list_folders(
@@ -325,9 +314,9 @@ impl HackmdClient {
         workspace: &Workspace,
         folder_id: &str,
         payload: &UpdateFolderRequest,
-    ) -> Result<Option<FolderResponse>, HackmdError> {
+    ) -> Result<(), HackmdError> {
         let segments = workspace_route(workspace, &["folders", folder_id]);
-        self.request_json_idempotent(Method::PATCH, &segments, Some(payload))
+        self.write_idempotent(Method::PATCH, &segments, Some(payload))
             .await
     }
 
@@ -335,9 +324,9 @@ impl HackmdClient {
         &self,
         workspace: &Workspace,
         folder_id: &str,
-    ) -> Result<Option<Value>, HackmdError> {
+    ) -> Result<(), HackmdError> {
         let segments = workspace_route(workspace, &["folders", folder_id]);
-        self.request_json(Method::DELETE, &segments, NO_BODY).await
+        self.write(Method::DELETE, &segments, NO_BODY).await
     }
 
     pub(crate) async fn get_folder_order(
@@ -352,9 +341,9 @@ impl HackmdClient {
         &self,
         workspace: &Workspace,
         order: &BTreeMap<String, Vec<String>>,
-    ) -> Result<Option<Value>, HackmdError> {
+    ) -> Result<(), HackmdError> {
         let segments = workspace_route(workspace, &["folders", "folder-order"]);
-        self.request_json(Method::PUT, &segments, Some(&json!({"order": order})))
+        self.write(Method::PUT, &segments, Some(&json!({"order": order})))
             .await
     }
 
@@ -395,14 +384,15 @@ impl HackmdClient {
         if status == StatusCode::PAYLOAD_TOO_LARGE {
             return Err(HackmdError::ImageTooLarge { path });
         }
-        decode_response(
+        Reply::check(
             status,
             "POST".to_owned(),
             path.clone(),
-            &bytes,
+            bytes,
             token,
             rate_limit,
         )?
+        .json()?
         .ok_or(HackmdError::EmptyResponse {
             method: "POST".to_owned(),
             path,
@@ -441,23 +431,39 @@ impl HackmdClient {
         body: Option<&(impl Serialize + Sync)>,
     ) -> Result<Option<T>, HackmdError> {
         let retryable = method == Method::GET;
-        self.request_json_with_retry(method, path_segments, body, retryable)
-            .await
+        self.send(method, path_segments, body, retryable, true)
+            .await?
+            .json()
     }
 
-    /// Sends a request that may be retried because repeating it lands on the
-    /// same state: `HackMD`'s PATCH and PUT routes set fields to given values
-    /// rather than accumulating. A retry can still overwrite an edit made by
-    /// someone else in between, which is the same exposure the first attempt
-    /// already had.
-    async fn request_json_idempotent<T: DeserializeOwned>(
+    /// Sends a write whose reply nobody reads, without retrying it: success
+    /// is the status alone. The body is never parsed, because `HackMD`
+    /// answers some writes with `{}` or plain text, and a write that landed
+    /// must not come back as an error the agent would answer by repeating it.
+    async fn write(
         &self,
         method: Method,
         path_segments: &[&str],
         body: Option<&(impl Serialize + Sync)>,
-    ) -> Result<Option<T>, HackmdError> {
-        self.request_json_with_retry(method, path_segments, body, true)
+    ) -> Result<(), HackmdError> {
+        self.send(method, path_segments, body, false, false)
             .await
+            .map(drop)
+    }
+
+    /// `write`, retried because repeating it lands on the same state:
+    /// `HackMD`'s PATCH and PUT routes set fields to given values rather than
+    /// accumulating. A retry can still overwrite an edit made by someone else
+    /// in between, which is the same exposure the first attempt already had.
+    async fn write_idempotent(
+        &self,
+        method: Method,
+        path_segments: &[&str],
+        body: Option<&(impl Serialize + Sync)>,
+    ) -> Result<(), HackmdError> {
+        self.send(method, path_segments, body, true, false)
+            .await
+            .map(drop)
     }
 
     /// Drops every cached note list around a request that is not a read:
@@ -494,13 +500,14 @@ impl HackmdClient {
         Ok(readback)
     }
 
-    async fn request_json_with_retry<T: DeserializeOwned>(
+    async fn send(
         &self,
         method: Method,
         path_segments: &[&str],
         body: Option<&(impl Serialize + Sync)>,
         retryable: bool,
-    ) -> Result<Option<T>, HackmdError> {
+        read_success_body: bool,
+    ) -> Result<Reply, HackmdError> {
         let method_text = method.as_str().to_owned();
         let (url, path, token) = self.authorized(&method_text, path_segments)?;
         let retry = self.config.retry();
@@ -538,6 +545,12 @@ impl HackmdClient {
             let status = response.status();
             let retry_after = retry_after(response.headers());
             let rate_limit = RateLimitHeaders::from_headers(response.headers());
+            // A write whose reply nobody reads is done once its status says so.
+            // Reading on would let a body that breaks off turn a write that
+            // landed into a retry, or into an error.
+            if status.is_success() && !read_success_body {
+                break (status, Vec::new(), rate_limit);
+            }
             let bytes = match read_body_capped(response, RESPONSE_MAX_BYTES).await {
                 Ok(bytes) => bytes,
                 Err(BodyError::Transport(_)) if retryable && retries < retry.max_retries => {
@@ -545,6 +558,9 @@ impl HackmdClient {
                     retries += 1;
                     continue;
                 }
+                // The status already says what happened; a body that broke
+                // off loses only its detail, not the verdict.
+                Err(_) if !status.is_success() => Vec::new(),
                 Err(error) => return Err(error.into_hackmd(&method_text, &path)),
             };
 
@@ -578,7 +594,7 @@ impl HackmdClient {
             "HackMD request completed"
         );
 
-        decode_response(status, method_text, path, &bytes, token, rate_limit)
+        Reply::check(status, method_text, path, bytes, token, rate_limit)
     }
 
     /// What every request starts from: its URL, the path its logs and errors
@@ -728,31 +744,51 @@ async fn read_body_capped(
     Ok(body)
 }
 
-/// Turns a finished response into the caller's result: an error named by its
-/// status, `None` for `HackMD`'s empty success bodies, or the decoded JSON.
-fn decode_response<T: DeserializeOwned>(
-    status: StatusCode,
+/// A response whose status was a success, its body not yet decoded.
+struct Reply {
     method: String,
     path: String,
-    bytes: &[u8],
-    token: &str,
-    rate_limit: RateLimitHeaders,
-) -> Result<Option<T>, HackmdError> {
-    if !status.is_success() {
-        return Err(map_status_error(
-            status, method, path, bytes, token, rate_limit,
-        ));
-    }
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    serde_json::from_slice(bytes)
-        .map(Some)
-        .map_err(|_| HackmdError::InvalidJson {
+    status: StatusCode,
+    bytes: Vec<u8>,
+}
+
+impl Reply {
+    /// Turns a failure status into the error named by it, and anything else
+    /// into a `Reply`.
+    fn check(
+        status: StatusCode,
+        method: String,
+        path: String,
+        bytes: Vec<u8>,
+        token: &str,
+        rate_limit: RateLimitHeaders,
+    ) -> Result<Self, HackmdError> {
+        if !status.is_success() {
+            return Err(map_status_error(
+                status, method, path, &bytes, token, rate_limit,
+            ));
+        }
+        Ok(Self {
             method,
             path,
             status,
+            bytes,
         })
+    }
+
+    /// `None` for `HackMD`'s empty success bodies, otherwise the decoded JSON.
+    fn json<T: DeserializeOwned>(self) -> Result<Option<T>, HackmdError> {
+        if self.bytes.is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_slice(&self.bytes)
+            .map(Some)
+            .map_err(|_| HackmdError::InvalidJson {
+                method: self.method,
+                path: self.path,
+                status: self.status,
+            })
+    }
 }
 
 /// Names the absent body at the many call sites that have none: `None` alone
@@ -1079,6 +1115,39 @@ mod tests {
         server.finish();
     }
 
+    /// A write that landed is a success whatever its body says: `HackMD`
+    /// answers PATCH with `202 {}`, and an error here would invite a retry.
+    #[tokio::test]
+    async fn a_write_succeeds_on_status_alone() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("PATCH", "/v1/notes/id", 202, "{}"),
+            Scenario::new("PATCH", "/v1/teams/team/folders/folder", 200, "OK"),
+        ]);
+        let client = server.client();
+        client
+            .update_note(
+                &Workspace::Personal,
+                "id",
+                &UpdateNoteRequest {
+                    title: Some("Renamed".to_owned()),
+                    ..UpdateNoteRequest::default()
+                },
+            )
+            .await
+            .expect("a 202 with an empty object should succeed");
+        client
+            .update_folder(
+                &Workspace::Team {
+                    team_path: "team".to_owned(),
+                },
+                "folder",
+                &crate::dto::UpdateFolderRequest::default(),
+            )
+            .await
+            .expect("a 200 with a non-JSON body should succeed");
+        server.finish();
+    }
+
     #[tokio::test]
     async fn omitted_optional_fields_remain_omitted_on_the_wire() {
         let server = SequenceServer::spawn_scenarios([Scenario::new("POST", "/v1/notes", 204, "")
@@ -1153,7 +1222,7 @@ mod tests {
             body == r#"{"parentFolderId":null}"#
         })]);
         let update_client = update_server.client();
-        let response = update_client
+        update_client
             .update_note(
                 &Workspace::Personal,
                 "note/id",
@@ -1164,7 +1233,6 @@ mod tests {
             )
             .await
             .expect("personal note update should be accepted");
-        assert_eq!(response, None);
         update_server.finish();
 
         let delete_server = SequenceServer::spawn_scenarios([Scenario::new(
@@ -1335,6 +1403,60 @@ mod tests {
             Err(HackmdError::Timeout { .. })
         ));
         server.finish();
+    }
+
+    /// A write that timed out may have landed: the caller is told to look,
+    /// never to retry, since a second POST would create a second note.
+    #[tokio::test]
+    async fn a_write_that_timed_out_is_unconfirmed_not_retryable() {
+        let server = SequenceServer::spawn_scenarios([Scenario::new(
+            "POST",
+            "/v1/notes",
+            201,
+            r#"{"id":"late"}"#,
+        )
+        .delay(Duration::from_millis(100))]);
+        let client = HackmdClient::new(Config::for_loopback_test_with_timeout(
+            &server.api_url,
+            "fixture-token",
+            Duration::from_millis(20),
+        ))
+        .expect("timeout fixture client should build");
+        let error = client
+            .request_json::<Value>(Method::POST, &["notes"], Some(&json!({})))
+            .await
+            .expect_err("a timed-out POST should fail");
+        assert_eq!(
+            error.to_string(),
+            "POST /v1/notes: the write timed out; it may still have landed, so check whether it did before sending it again"
+        );
+        assert_eq!(
+            crate::reply::ToolError::kind(&error),
+            crate::reply::ErrorKind::Readback
+        );
+        server.finish();
+    }
+
+    /// A write that never connected never reached `HackMD`: that one is safe
+    /// to retry, and is reported as a network failure, not as unconfirmed.
+    #[tokio::test]
+    async fn a_write_that_never_connected_is_a_network_error() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("port should bind")
+            .local_addr()
+            .expect("address should resolve")
+            .port();
+        let client = HackmdClient::new(Config::for_loopback_test_no_retry(
+            &format!("http://127.0.0.1:{port}/v1"),
+            "fixture-token",
+        ))
+        .expect("client should build");
+        assert!(matches!(
+            client
+                .request_json::<Value>(Method::POST, &["notes"], Some(&json!({})))
+                .await,
+            Err(HackmdError::Network { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1511,7 +1633,7 @@ mod tests {
         ))
         .expect("retry client should build");
         patch_client
-            .request_json_idempotent::<Value>(
+            .write_idempotent(
                 Method::PATCH,
                 &["notes", "id"],
                 Some(&json!({"title": "same replacement"})),
@@ -1538,7 +1660,7 @@ mod tests {
             post_client
                 .request_json::<Value>(Method::POST, &["notes"], Some(&json!({})))
                 .await,
-            Err(HackmdError::Upstream { .. })
+            Err(HackmdError::WriteUnconfirmed { .. })
         ));
         post_server.finish();
     }

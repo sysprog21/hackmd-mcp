@@ -5,10 +5,32 @@ use reqwest::StatusCode;
 use thiserror::Error;
 
 pub(super) fn request_error(error: &reqwest::Error, method: String, path: String) -> HackmdError {
-    if error.is_timeout() {
-        HackmdError::Timeout { method, path }
-    } else {
-        HackmdError::Network { method, path }
+    transport_error(error.is_timeout(), error.is_connect(), method, path)
+}
+
+/// A request that got no usable answer. A read can always be asked again. A
+/// write that failed after connecting may already have reached `HackMD`, and
+/// repeating a POST would create a second note: the caller is told to look
+/// before sending it again.
+pub(super) fn transport_error(
+    timed_out: bool,
+    before_connecting: bool,
+    method: String,
+    path: String,
+) -> HackmdError {
+    match (method != "GET" && !before_connecting, timed_out) {
+        (true, timed_out) => HackmdError::WriteUnconfirmed {
+            method,
+            path,
+            cause: if timed_out {
+                "timed out"
+            } else {
+                "lost its connection"
+            }
+            .to_owned(),
+        },
+        (false, true) => HackmdError::Timeout { method, path },
+        (false, false) => HackmdError::Network { method, path },
     }
 }
 
@@ -68,11 +90,27 @@ pub(super) fn map_status_error(
         StatusCode::UNAUTHORIZED => HackmdError::Unauthorized { method, path },
         StatusCode::FORBIDDEN => HackmdError::Forbidden { method, path },
         StatusCode::NOT_FOUND => HackmdError::NotFound { method, path },
-        StatusCode::CONFLICT => HackmdError::Conflict { method, path },
+        // Only a note's permalink is known to clash; elsewhere HackMD's own
+        // words are the best hint there is.
+        StatusCode::CONFLICT => HackmdError::Conflict {
+            detail: if is_note_route(&path) {
+                "the requested permalink may already be in use".to_owned()
+            } else {
+                nonempty_detail(body_detail)
+            },
+            method,
+            path,
+        },
         StatusCode::TOO_MANY_REQUESTS => HackmdError::RateLimited {
             method,
             path,
             detail: combine_details(rate_limit.detail(), &body_detail),
+        },
+        // A gateway can fail a write HackMD already applied.
+        status if status.is_server_error() && method != "GET" => HackmdError::WriteUnconfirmed {
+            method,
+            path,
+            cause: format!("HackMD answered {status}: {}", nonempty_detail(body_detail)),
         },
         status if status.is_server_error() => HackmdError::Upstream {
             method,
@@ -87,6 +125,24 @@ pub(super) fn map_status_error(
             detail: nonempty_detail(body_detail),
         },
     }
+}
+
+/// Whether `path` names a note route, personal or team: the resource after
+/// any `teams/{team_path}` prefix, so a team whose path is `notes` does not
+/// count.
+fn is_note_route(path: &str) -> bool {
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    while let Some(segment) = segments.next() {
+        match segment {
+            "teams" => {
+                segments.next();
+            }
+            "notes" => return true,
+            "folders" | "trash" | "history" | "me" => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn combine_details(mut primary: String, secondary: &str) -> String {
@@ -166,10 +222,22 @@ pub(crate) enum HackmdError {
     UnknownTeam { team_path: String },
     #[error("{method} {path}: request timed out; check network connectivity and retry")]
     Timeout { method: String, path: String },
-    #[error("HackMD write read-back exceeded its bounded verification window")]
+    #[error(
+        "HackMD accepted the write, but reading it back did not finish in time; read it again and compare before writing again"
+    )]
     ReadbackTimeout,
-    #[error("HackMD accepted the update for note {note_id}, but read-back content did not match")]
+    #[error(
+        "HackMD accepted the update for note {note_id}, but read-back content did not match; call hackmd_get_note and compare before writing again"
+    )]
     ReadbackMismatch { note_id: String },
+    #[error(
+        "{method} {path}: the write {cause}; it may still have landed, so check whether it did before sending it again"
+    )]
+    WriteUnconfirmed {
+        method: String,
+        path: String,
+        cause: String,
+    },
     #[error("remote note {note_id} has no Markdown content")]
     MissingContent { note_id: String },
     #[error("{method} {path}: network request failed; check connectivity and HACKMD_API_URL")]
@@ -182,8 +250,12 @@ pub(crate) enum HackmdError {
     Forbidden { method: String, path: String },
     #[error("{method} {path}: 404 not found; verify the note ID and workspace team_path")]
     NotFound { method: String, path: String },
-    #[error("{method} {path}: 409 conflict; the requested permalink may already be in use")]
-    Conflict { method: String, path: String },
+    #[error("{method} {path}: 409 conflict; {detail}")]
+    Conflict {
+        method: String,
+        path: String,
+        detail: String,
+    },
     #[error("{method} {path}: 429 rate limited ({detail}); wait before retrying")]
     RateLimited {
         method: String,
@@ -229,13 +301,15 @@ impl crate::reply::ToolError for HackmdError {
                 ErrorKind::Upstream
             }
             Self::Api { .. } => ErrorKind::Api,
-            Self::ReadbackTimeout | Self::ReadbackMismatch { .. } => ErrorKind::Readback,
+            Self::ReadbackTimeout
+            | Self::ReadbackMismatch { .. }
+            | Self::WriteUnconfirmed { .. } => ErrorKind::Readback,
             Self::MissingContent { .. } => ErrorKind::Upstream,
             Self::ResponseTooLarge { .. } | Self::ImageTooLarge { .. } => ErrorKind::TooLarge,
-            Self::InvalidPayload | Self::EmptyPathSegment | Self::DotPathSegment => {
-                ErrorKind::InvalidInput
-            }
-            Self::ClientBuild | Self::InvalidBaseUrl => ErrorKind::Internal,
+            Self::EmptyPathSegment | Self::DotPathSegment => ErrorKind::InvalidInput,
+            // Serializing a payload this server validated cannot fail on
+            // anything the caller sent.
+            Self::ClientBuild | Self::InvalidBaseUrl | Self::InvalidPayload => ErrorKind::Internal,
         }
     }
 }
@@ -281,6 +355,177 @@ mod tests {
             HackmdError::ReadbackMismatch { note_id }.kind(),
             ErrorKind::Readback
         );
+    }
+
+    /// Kind names are a contract: this pins every variant's kind, so a change
+    /// to the mapping is a visible decision rather than a side effect.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one row per variant is the point: the table is the contract"
+    )]
+    fn every_variant_keeps_its_kind() {
+        use crate::reply::{ErrorKind, ToolError};
+        use reqwest::StatusCode;
+
+        let m = || "GET".to_owned();
+        let p = || "/v1/x".to_owned();
+        let d = || "detail".to_owned();
+        let cases = [
+            (
+                HackmdError::MissingToken {
+                    method: m(),
+                    path: p(),
+                },
+                ErrorKind::Auth,
+            ),
+            (HackmdError::ClientBuild, ErrorKind::Internal),
+            (HackmdError::InvalidPayload, ErrorKind::Internal),
+            (HackmdError::InvalidBaseUrl, ErrorKind::Internal),
+            (HackmdError::EmptyPathSegment, ErrorKind::InvalidInput),
+            (HackmdError::DotPathSegment, ErrorKind::InvalidInput),
+            (
+                HackmdError::ResponseTooLarge {
+                    method: m(),
+                    path: p(),
+                    limit_mib: 1,
+                },
+                ErrorKind::TooLarge,
+            ),
+            (
+                HackmdError::ImageTooLarge { path: p() },
+                ErrorKind::TooLarge,
+            ),
+            (
+                HackmdError::UnknownTeam { team_path: d() },
+                ErrorKind::NotFound,
+            ),
+            (
+                HackmdError::Timeout {
+                    method: m(),
+                    path: p(),
+                },
+                ErrorKind::Network,
+            ),
+            (HackmdError::ReadbackTimeout, ErrorKind::Readback),
+            (
+                HackmdError::ReadbackMismatch { note_id: d() },
+                ErrorKind::Readback,
+            ),
+            (
+                HackmdError::WriteUnconfirmed {
+                    method: m(),
+                    path: p(),
+                    cause: d(),
+                },
+                ErrorKind::Readback,
+            ),
+            (
+                HackmdError::MissingContent { note_id: d() },
+                ErrorKind::Upstream,
+            ),
+            (
+                HackmdError::Network {
+                    method: m(),
+                    path: p(),
+                },
+                ErrorKind::Network,
+            ),
+            (
+                HackmdError::Unauthorized {
+                    method: m(),
+                    path: p(),
+                },
+                ErrorKind::Auth,
+            ),
+            (
+                HackmdError::Forbidden {
+                    method: m(),
+                    path: p(),
+                },
+                ErrorKind::Forbidden,
+            ),
+            (
+                HackmdError::NotFound {
+                    method: m(),
+                    path: p(),
+                },
+                ErrorKind::NotFound,
+            ),
+            (
+                HackmdError::Conflict {
+                    method: m(),
+                    path: p(),
+                    detail: d(),
+                },
+                ErrorKind::Conflict,
+            ),
+            (
+                HackmdError::RateLimited {
+                    method: m(),
+                    path: p(),
+                    detail: d(),
+                },
+                ErrorKind::RateLimited,
+            ),
+            (
+                HackmdError::Upstream {
+                    method: m(),
+                    path: p(),
+                    status: StatusCode::BAD_GATEWAY,
+                    detail: d(),
+                },
+                ErrorKind::Upstream,
+            ),
+            (
+                HackmdError::Api {
+                    method: m(),
+                    path: p(),
+                    status: StatusCode::BAD_REQUEST,
+                    detail: d(),
+                },
+                ErrorKind::Api,
+            ),
+            (
+                HackmdError::InvalidJson {
+                    method: m(),
+                    path: p(),
+                    status: StatusCode::OK,
+                },
+                ErrorKind::Upstream,
+            ),
+            (
+                HackmdError::EmptyResponse {
+                    method: m(),
+                    path: p(),
+                },
+                ErrorKind::Upstream,
+            ),
+        ];
+        for (error, kind) in cases {
+            assert_eq!(error.kind(), kind, "{error}");
+        }
+    }
+
+    #[test]
+    fn a_409_names_the_permalink_only_on_note_routes() {
+        let conflict = |path: &str| {
+            super::map_status_error(
+                reqwest::StatusCode::CONFLICT,
+                "PATCH".to_owned(),
+                path.to_owned(),
+                b"folder name taken",
+                "token",
+                super::RateLimitHeaders::default(),
+            )
+            .to_string()
+        };
+        assert!(
+            conflict("/v1/teams/t/notes/n")
+                .ends_with("the requested permalink may already be in use")
+        );
+        assert!(conflict("/v1/teams/t/folders/f").ends_with("folder name taken"));
+        assert!(conflict("/v1/teams/notes/folders/f").ends_with("folder name taken"));
     }
 
     #[test]

@@ -81,7 +81,9 @@ pub(crate) enum ErrorKind {
     Forbidden,
     /// The note, folder, or team does not exist for this account.
     NotFound,
-    /// `HackMD` refused the change as conflicting, such as a permalink in use.
+    /// The change conflicts with the current state: `HackMD` refused it, such
+    /// as a permalink in use, or the body changed since the caller read it.
+    /// Re-read before trying again.
     Conflict,
     /// Out of quota; wait for the reset before retrying.
     RateLimited,

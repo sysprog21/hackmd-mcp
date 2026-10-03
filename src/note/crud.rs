@@ -649,6 +649,28 @@ mod tests {
         server.finish();
     }
 
+    /// A body that never shows up is an error naming the recovery, not a
+    /// success, and not a prompt to send the body again blind.
+    #[tokio::test]
+    async fn a_content_write_that_never_shows_up_names_the_recovery() {
+        let fixture = SequenceServer::spawn_repeating([
+            (202, ""),
+            (200, r#"{"id":"note-id","title":"T","content":"old"}"#),
+        ]);
+        let input = serde_json::from_value(json!({
+            "note_ref": "note-id",
+            "content": "new"
+        }))
+        .expect("update input should deserialize");
+        let error = update_note(&fixture.client(), input)
+            .await
+            .expect_err("an unconfirmed write should fail");
+        assert_eq!(
+            error.to_string(),
+            "HackMD accepted the update for note note-id, but read-back content did not match; call hackmd_get_note and compare before writing again"
+        );
+    }
+
     #[tokio::test]
     async fn invalid_payloads_fail_before_resolution_or_network() {
         let client = HackmdClient::new(Config::for_tests()).expect("client should build");
