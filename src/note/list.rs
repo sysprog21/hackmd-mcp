@@ -134,6 +134,8 @@ pub(crate) enum ListNotesError {
     AccountWideSource(&'static str),
     #[error("source tracked lists local sync records; tags, sort, and refresh do not apply")]
     TrackedFilters,
+    #[error("source {0} is always fetched fresh; refresh only applies to source workspace")]
+    UncachedRefresh(&'static str),
     #[error(transparent)]
     Tracking(#[from] TrackingError),
     #[error(transparent)]
@@ -145,9 +147,10 @@ impl crate::reply::ToolError for ListNotesError {
         use crate::reply::ErrorKind;
 
         match self {
-            Self::Limit(..) | Self::AccountWideSource(..) | Self::TrackedFilters => {
-                ErrorKind::InvalidInput
-            }
+            Self::Limit(..)
+            | Self::AccountWideSource(..)
+            | Self::TrackedFilters
+            | Self::UncachedRefresh(..) => ErrorKind::InvalidInput,
             Self::Tracking(error) => error.kind(),
             Self::Api(error) => error.kind(),
         }
@@ -224,11 +227,14 @@ async fn list_remote(
     input: ListNotesInput,
 ) -> Result<ListNotesOutput, ListNotesError> {
     validate_limit(input.limit)?;
+    // History and trash are account-wide and never cached.
     let account_wide = |name| {
-        if input.workspace == Workspace::Personal {
-            Ok(())
-        } else {
+        if input.workspace != Workspace::Personal {
             Err(ListNotesError::AccountWideSource(name))
+        } else if input.refresh {
+            Err(ListNotesError::UncachedRefresh(name))
+        } else {
+            Ok(())
         }
     };
 
@@ -650,6 +656,15 @@ mod tests {
             assert!(matches!(
                 remote(&client, invalid).await,
                 Err(ListNotesError::AccountWideSource(_))
+            ));
+
+            // Neither is cached, so there is nothing for refresh to bypass.
+            let mut refreshed = input();
+            refreshed.source = source;
+            refreshed.refresh = true;
+            assert!(matches!(
+                remote(&client, refreshed).await,
+                Err(ListNotesError::UncachedRefresh(_))
             ));
         }
     }

@@ -108,6 +108,10 @@ pub(crate) enum PushNoteError {
     LocalBody(#[from] LocalBodyError),
     #[error("overwrite strategy requires confirm: true")]
     OverwriteConfirmationRequired,
+    #[error(
+        "expected_remote_hash guards a safe push; strategy: overwrite ignores the remote, so pass one or the other"
+    )]
+    OverwriteWithExpectedHash,
     #[error("note_ref resolves to a different note than the one local_path was pulled from")]
     TrackingMismatch,
     #[error(
@@ -142,7 +146,9 @@ impl crate::reply::ToolError for PushNoteError {
         match self {
             Self::Access(error) => error.kind(),
             Self::LocalBody(error) => error.kind(),
-            Self::TrackingMismatch | Self::MalformedExpectedHash => ErrorKind::InvalidInput,
+            Self::TrackingMismatch
+            | Self::MalformedExpectedHash
+            | Self::OverwriteWithExpectedHash => ErrorKind::InvalidInput,
             Self::OverwriteConfirmationRequired => ErrorKind::ConfirmationRequired,
             Self::StatePersistenceAfterWrite { .. } => ErrorKind::PartialWrite,
             Self::SnapshotNotOurs { .. } => ErrorKind::LocalAccess,
@@ -172,8 +178,10 @@ pub(crate) async fn push_note(
         // workspace: the cross-check is about which note, and omitting
         // team_path should not make a team note look like a different one.
         let workspace = match input.workspace {
-            Workspace::Personal => note.workspace.clone(),
-            team @ Workspace::Team { .. } => team,
+            Workspace::Personal if !crate::note::reference::is_slug_url(note_ref) => {
+                note.workspace.clone()
+            }
+            other => other,
         };
         let resolution =
             crate::note::reference::resolve_note_ref(client, workspace, note_ref, input.refresh)
@@ -217,8 +225,15 @@ fn validate_and_read_local(
     if crate::hash::is_malformed(input.expected_remote_hash.as_deref()) {
         return Err(PushNoteError::MalformedExpectedHash);
     }
-    if matches!(input.strategy, PushStrategy::Overwrite) && !input.confirm {
-        return Err(PushNoteError::OverwriteConfirmationRequired);
+    if matches!(input.strategy, PushStrategy::Overwrite) {
+        if !input.confirm {
+            return Err(PushNoteError::OverwriteConfirmationRequired);
+        }
+        // An overwrite replaces whatever the remote holds, so a hash naming
+        // the remote a merge was built against would guard nothing.
+        if input.expected_remote_hash.is_some() {
+            return Err(PushNoteError::OverwriteWithExpectedHash);
+        }
     }
     Ok(read_local_body(
         files,
@@ -1077,6 +1092,14 @@ mod tests {
             )
             .await,
             Err(PushNoteError::OverwriteConfirmationRequired)
+        ));
+
+        // A merge hash with an overwrite would guard nothing.
+        let mut with_hash = input(&local_path, PushStrategy::Overwrite, true);
+        with_hash.expected_remote_hash = Some(format!("sha256:{}", "0".repeat(64)));
+        assert!(matches!(
+            push_note(&client, &files, with_hash).await,
+            Err(PushNoteError::OverwriteWithExpectedHash)
         ));
     }
 
