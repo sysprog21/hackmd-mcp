@@ -113,10 +113,14 @@ pub(crate) fn is_body_hash(value: &str) -> bool {
 pub(crate) fn body_hash_from_digest(digest: &[u8; 32]) -> String {
     let mut hash = String::with_capacity(71);
     hash.push_str("sha256:");
-    for byte in digest {
-        write!(hash, "{byte:02x}").expect("writing to a String cannot fail");
-    }
+    push_hex(&mut hash, digest);
     hash
+}
+
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    for byte in bytes {
+        write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+    }
 }
 
 pub(crate) fn body_digest(body: &str) -> [u8; 32] {
@@ -182,7 +186,9 @@ impl StateStore {
     /// is a hash so any path, however long or oddly encoded, maps to one file.
     fn index_path(&self, canonical: &Path) -> PathBuf {
         let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
-        self.root.join("by-path").join(format!("{digest:x}"))
+        let mut name = String::with_capacity(64);
+        push_hex(&mut name, &digest);
+        self.root.join("by-path").join(name)
     }
 
     /// Persists sync state atomically per file. Only pull/push handlers should
