@@ -39,6 +39,11 @@ take precedence over `.env`. The server reads only these keys:
 - `HACKMD_MCP_STATE_DIR` — optional private sync-state directory. Honored only from
   the inherited environment, never from `.env`: the directory holds full note bodies,
   and a `.env` in someone else's repository must not be able to redirect them.
+  On Unix the server refuses a state directory, or the record directories inside it,
+  owned by another account or carrying group or other write bits, since a record planted
+  there could send a pushed file to someone else's note. ACLs are not inspected, and
+  other platforms do not check this at all, so keep it in your own profile. No tool accepts a
+  local path inside it as a destination.
 - `HACKMD_MCP_WORKSPACE_ROOT` — optional tree that `hackmd_pull_note`,
   `hackmd_push_note`, `hackmd_get_note` with a `local_path`, and
   `hackmd_upload_note_image` are confined to. It must be absolute. Set it and a note

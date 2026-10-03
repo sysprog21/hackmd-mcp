@@ -179,7 +179,37 @@ impl StateStore {
         Self { root }
     }
 
+    /// Runs `work` off the async runtime once the store is known to be
+    /// trustworthy. Every public method goes through here, so none can read
+    /// a record someone else planted.
+    fn guarded<T>(&self, work: impl FnOnce() -> Result<T, StateError>) -> Result<T, StateError> {
+        crate::local::offload(|| {
+            self.check_trusted()?;
+            work()
+        })
+    }
+
+    /// Refuses an untrustworthy store before a caller touches anything else.
+    pub(crate) fn trusted(&self) -> Result<(), StateError> {
+        self.guarded(|| Ok(()))
+    }
+
+    /// Refuses a state directory another account could have written into:
+    /// a sidecar planted there maps a local file to a note of the planter's
+    /// choosing, and the next push sends that file there. A directory not
+    /// yet created is fine, since this server creates it owner-only.
+    fn check_trusted(&self) -> Result<(), StateError> {
+        match untrusted_reason(&self.root) {
+            Some(reason) => Err(StateError::UntrustedStateDir {
+                path: self.root.clone(),
+                reason,
+            }),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn probe_writable(&self) -> Result<(), StateError> {
+        self.check_trusted()?;
         create_private_dir_all(&self.root)?;
         let temporary = NamedTempFile::new_in(&self.root)?;
         set_private_permissions(temporary.as_file())?;
@@ -225,7 +255,7 @@ impl StateStore {
         state: &TrackedNoteState,
         baseline_body: &str,
     ) -> Result<(), StateError> {
-        crate::local::offload(|| {
+        self.guarded(|| {
             let key = state_key(&state.workspace, &state.internal_id);
             let paths = self.paths_for_key(&key);
             let canonical = &state.local_path;
@@ -299,7 +329,7 @@ impl StateStore {
     /// and its hash are untouched, so the pair stays consistent, and a body of
     /// up to 50 MiB is not rewritten to change one field.
     pub(crate) fn update_sidecar(&self, state: &TrackedNoteState) -> Result<(), StateError> {
-        crate::local::offload(|| {
+        self.guarded(|| {
             let paths = self
                 .resolve(&state.workspace, &state.internal_id)?
                 .ok_or(StateError::NotTracked)?
@@ -349,7 +379,7 @@ impl StateStore {
         &self,
         local_path: &Path,
     ) -> Result<Option<TrackedNoteState>, StateError> {
-        crate::local::offload(|| {
+        self.guarded(|| {
             let canonical = match fs::canonicalize(local_path) {
                 Ok(canonical) => canonical,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -363,7 +393,7 @@ impl StateStore {
     /// baseline files. Callers use this for state discovery, not sync safety;
     /// an individual sync still verifies its baseline before comparison.
     pub(crate) fn list_tracked(&self) -> Result<Vec<TrackedNoteState>, StateError> {
-        crate::local::offload(|| {
+        self.guarded(|| {
             Ok(self
                 .scan()?
                 .into_iter()
@@ -384,7 +414,13 @@ impl StateStore {
         };
         let mut records = Vec::new();
         for entry in entries {
-            let path = entry?.path();
+            let entry = entry?;
+            // This server writes only regular files here; anything else, a
+            // FIFO above all, would only hang the read below.
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = entry.path();
             let Some(key) = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -418,7 +454,7 @@ impl StateStore {
         workspace: &Workspace,
         internal_id: &str,
     ) -> Result<TrackedNoteState, StateError> {
-        crate::local::offload(|| {
+        self.guarded(|| {
             let record = self
                 .resolve(workspace, internal_id)?
                 .ok_or(StateError::NotTracked)?;
@@ -514,7 +550,7 @@ impl StateStore {
         &self,
         local_path: &Path,
     ) -> Result<LoadedTrackedState, StateError> {
-        crate::local::offload(|| {
+        self.guarded(|| {
             let canonical = fs::canonicalize(local_path)?;
             let record = self.find(&canonical)?.ok_or(StateError::NotTracked)?;
             Self::load_verified(record.state, record.paths)
@@ -669,12 +705,17 @@ fn set_private_permissions(_file: &fs::File) -> io::Result<()> {
 pub(crate) enum StateError {
     #[error("local Markdown file is not tracked; pull it before sync operations")]
     NotTracked,
-    #[error("invalid local state path")]
+    #[error("local sync state path has no parent directory; check HACKMD_MCP_STATE_DIR")]
     InvalidStatePath,
-    #[error("local state I/O failed")]
+    #[error("local sync state I/O failed: {0}; check that HACKMD_MCP_STATE_DIR is writable")]
     Io(#[from] io::Error),
-    #[error("local state serialization failed")]
+    #[error("local sync state could not be encoded: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error(
+        "HACKMD_MCP_STATE_DIR {} {reason}; point it at a directory only this account can write",
+        path.display()
+    )]
+    UntrustedStateDir { path: PathBuf, reason: &'static str },
     #[error(
         "tracked sidecar {} for {} is corrupt; re-pull the note or untrack this record",
         sidecar_path.display(),
@@ -684,7 +725,9 @@ pub(crate) enum StateError {
         sidecar_path: PathBuf,
         local_path: PathBuf,
     },
-    #[error("tracked sidecar identity does not match its filename")]
+    #[error(
+        "tracked sidecar identity does not match its filename; untrack this record and re-pull the note"
+    )]
     StateIdentityMismatch,
     #[error(
         "more than one tracked note records {}; untrack the stale ones with hackmd_untrack_note, then re-pull",
@@ -722,6 +765,7 @@ impl crate::reply::ToolError for StateError {
         match self {
             Self::NotTracked => ErrorKind::NotTracked,
             Self::InvalidStatePath | Self::Io(_) | Self::Serialize(_) => ErrorKind::LocalIo,
+            Self::UntrustedStateDir { .. } => ErrorKind::LocalAccess,
             Self::CorruptTrackedState { .. }
             | Self::StateIdentityMismatch
             | Self::AmbiguousTrackedState { .. }
@@ -737,6 +781,69 @@ impl crate::reply::ToolError for StateError {
 fn remove_record(paths: &StatePaths) -> Result<(), StateError> {
     remove_if_present(&paths.baseline)?;
     remove_if_present(&paths.sidecar)
+}
+
+#[cfg(unix)]
+fn untrusted_reason(root: &Path) -> Option<&'static str> {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::OnceLock;
+
+    // The account this server runs as, read off a file it just created:
+    // asking the OS directly takes `unsafe`, which this crate forbids. Only
+    // an answer is cached; a failed probe is tried again next time.
+    static OWN_UID: OnceLock<u32> = OnceLock::new();
+
+    // A missing directory is fine: this server creates it owner-only. Any
+    // other failure to look is a failure to vouch for it.
+    let metadata = match fs::metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(_) => return Some("could not be checked: its metadata could not be read"),
+    };
+    // The probe goes to the system temporary directory, never into the
+    // directory under judgment, and a failed probe fails closed.
+    let own = if let Some(uid) = OWN_UID.get() {
+        *uid
+    } else {
+        let Ok(uid) = tempfile::tempfile()
+            .and_then(|file| file.metadata())
+            .map(|metadata| metadata.uid())
+        else {
+            return Some("could not be checked: no temporary file could be created");
+        };
+        *OWN_UID.get_or_init(|| uid)
+    };
+
+    // The root and the directories records live in are held to one rule:
+    // owned by this account, and not writable by its group or anyone else,
+    // since a group member could plant records as readily as a stranger.
+    // The record directories must also be real directories, since a symlink
+    // could lead anywhere.
+    let mut directories = vec![metadata];
+    for name in ["tracked", "by-path"] {
+        match fs::symlink_metadata(root.join(name)) {
+            Ok(inner) if inner.is_dir() => directories.push(inner),
+            Ok(_) => return Some("holds a record directory that is not a plain directory"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Some("could not be checked: a record directory could not be read"),
+        }
+    }
+    for directory in &directories {
+        if directory.uid() != own {
+            return Some("is owned by another account, or holds a directory that is");
+        }
+        if directory.mode() & 0o022 != 0 {
+            return Some(
+                "is writable by other accounts, or holds a directory that is; chmod -R go-w it",
+            );
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn untrusted_reason(_root: &Path) -> Option<&'static str> {
+    None
 }
 
 /// A file's bytes, or `None` if it is not there.
@@ -1047,6 +1154,99 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// Anyone could have planted a sidecar in a world-writable directory, so
+    /// nothing is read from one.
+    #[cfg(unix)]
+    #[test]
+    fn a_world_writable_state_directory_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let root = directory.path().join("state");
+        fs::create_dir(&root).expect("state directory should create");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777))
+            .expect("permissions should set");
+        let store = StateStore::new(root.clone());
+        assert!(matches!(
+            store.list_tracked(),
+            Err(StateError::UntrustedStateDir {
+                reason: "is writable by other accounts, or holds a directory that is; chmod -R go-w it",
+                ..
+            })
+        ));
+
+        // A private root does not vouch for an open directory inside it.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("permissions should set");
+        fs::create_dir(root.join("tracked")).expect("tracked directory should create");
+        fs::set_permissions(root.join("tracked"), fs::Permissions::from_mode(0o777))
+            .expect("permissions should set");
+        assert!(matches!(
+            store.list_tracked(),
+            Err(StateError::UntrustedStateDir { .. })
+        ));
+    }
+
+    /// Kind names are a contract, so every variant's kind is pinned here.
+    #[test]
+    fn every_variant_keeps_its_kind() {
+        use crate::reply::{ErrorKind, ToolError};
+
+        let path = || PathBuf::from("/x");
+        let cases = [
+            (StateError::NotTracked, ErrorKind::NotTracked),
+            (StateError::InvalidStatePath, ErrorKind::LocalIo),
+            (
+                StateError::Io(std::io::Error::other("x")),
+                ErrorKind::LocalIo,
+            ),
+            (
+                StateError::Serialize(serde_json::from_str::<u8>("x").expect_err("not JSON")),
+                ErrorKind::LocalIo,
+            ),
+            (
+                StateError::UntrustedStateDir {
+                    path: path(),
+                    reason: "r",
+                },
+                ErrorKind::LocalAccess,
+            ),
+            (
+                StateError::CorruptTrackedState {
+                    sidecar_path: path(),
+                    local_path: path(),
+                },
+                ErrorKind::SyncState,
+            ),
+            (StateError::StateIdentityMismatch, ErrorKind::SyncState),
+            (
+                StateError::AmbiguousTrackedState { local_path: path() },
+                ErrorKind::SyncState,
+            ),
+            (
+                StateError::MissingBaseline {
+                    baseline_path: path(),
+                    note_id: "n".to_owned(),
+                    workspace: Workspace::Personal,
+                    local_path: path(),
+                },
+                ErrorKind::SyncState,
+            ),
+            (
+                StateError::BaselineMismatch {
+                    baseline_path: path(),
+                    note_id: "n".to_owned(),
+                    workspace: Workspace::Personal,
+                    local_path: path(),
+                },
+                ErrorKind::SyncState,
+            ),
+        ];
+        for (error, kind) in cases {
+            assert_eq!(error.kind(), kind, "{error}");
+        }
     }
 
     #[test]
