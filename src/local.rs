@@ -167,7 +167,10 @@ const AGENT_INSTRUCTION_FILES: &[&str] = &[
     "agents.md",
     "claude.md",
     "claude.local.md",
+    "conventions.md",
+    "crush.md",
     "gemini.md",
+    "qwen.md",
     "skill.md",
 ];
 
@@ -175,20 +178,40 @@ const AGENT_INSTRUCTION_FILES: &[&str] = &[
 /// or instructions.
 const AGENT_CONFIG_DIRS: &[&str] = &[
     ".agents",
+    ".amazonq",
     ".claude",
+    ".clinerules",
     ".codex",
     ".continue",
     ".cursor",
     ".gemini",
     ".github",
+    ".junie",
+    ".kiro",
+    ".opencode",
+    ".roo",
     ".windsurf",
 ];
+
+/// A name as a case-insensitive filesystem compares it, so a listed name
+/// cannot be spelled past the check. Win32 drops trailing dots and spaces and
+/// opens `name:stream` as `name`; APFS and NTFS fold case beyond ASCII, so
+/// `agentſ.md` (long s) opens as `AGENTS.md` and a Kelvin sign as `k`.
+/// Upper- then lowercasing folds both the way the filesystem does.
+fn fold_name(name: &str) -> String {
+    let name = name.split_once(':').map_or(name, |(stem, _)| stem);
+    name.trim_end_matches(['.', ' '])
+        .chars()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
 
 /// Whether writing `path` could plant instructions an agent later follows.
 fn is_agent_instruction_path(path: &Path) -> bool {
     let listed = |list: &[&str], name: &std::ffi::OsStr| {
         name.to_str()
-            .is_some_and(|name| list.iter().any(|entry| name.eq_ignore_ascii_case(entry)))
+            .is_some_and(|name| list.contains(&fold_name(name).as_str()))
     };
     path.file_name()
         .is_some_and(|name| listed(AGENT_INSTRUCTION_FILES, name))
@@ -570,6 +593,16 @@ mod tests {
             "home/u/.claude/skills/x/SKILL.md",
             "repo/.github/copilot-instructions.md",
             "repo/.cursor/rules/note.md",
+            "repo/.clinerules/note.md",
+            "repo/CRUSH.md",
+            // Spellings a case-insensitive or Win32 filesystem opens as a
+            // listed name.
+            "repo/agent\u{17f}.md",
+            "repo/\u{17f}kill.md",
+            "repo/.\u{212a}iro/note.md",
+            "repo/.claude./agents/note.md",
+            "repo/.claude /agents/note.md",
+            "repo/.claude::$INDEX_ALLOCATION/agents/note.md",
         ]
         .map(abs)
         {
