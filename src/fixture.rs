@@ -495,7 +495,7 @@ pub(crate) fn tracked_files_in(
             &TrackedNoteState::capture(
                 note_id.to_owned(),
                 workspace,
-                local_path.to_path_buf(),
+                local_path,
                 baseline,
                 Some(1),
             )

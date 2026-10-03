@@ -123,7 +123,7 @@ pub(crate) fn list_tracked_notes(
     Ok(ListTrackedNotesOutput { meta, notes })
 }
 
-pub(crate) fn untrack_note(
+pub(crate) async fn untrack_note(
     files: &LocalFiles,
     input: &UntrackNoteInput,
 ) -> Result<UntrackNoteOutput, TrackingError> {
@@ -133,6 +133,8 @@ pub(crate) fn untrack_note(
     if !input.confirm {
         return Err(TrackingError::ConfirmationRequired);
     }
+    // A push in flight would otherwise write the record straight back.
+    let _sync = files.sync_lock().await;
     let state = files.state().untrack(&input.workspace, &input.note_id)?;
     Ok(UntrackNoteOutput {
         workspace: state.workspace,
@@ -154,6 +156,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory should create");
         let local_path = directory.path().join("note.md");
         fs::write(&local_path, "baseline").expect("working Markdown should write");
+        // As the record keeps it, which is what the tools report.
+        let local_path = local_path.canonicalize().expect("note path should resolve");
         let files =
             crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
         (directory, files, local_path)
@@ -182,8 +186,8 @@ mod tests {
         assert_eq!(output.notes[0].last_observed_remote_timestamp, "1");
     }
 
-    #[test]
-    fn untrack_requires_confirmation_and_preserves_the_markdown_file() {
+    #[tokio::test]
+    async fn untrack_requires_confirmation_and_preserves_the_markdown_file() {
         let (directory, files, local_path) = tracked_files();
         let refused = untrack_note(
             &files,
@@ -192,7 +196,8 @@ mod tests {
                 note_id: "note-id".to_owned(),
                 confirm: false,
             },
-        );
+        )
+        .await;
         assert!(matches!(refused, Err(TrackingError::ConfirmationRequired)));
 
         let output = untrack_note(
@@ -203,6 +208,7 @@ mod tests {
                 confirm: true,
             },
         )
+        .await
         .expect("confirmed untrack should succeed");
         assert_eq!(output.local_path, local_path);
         assert_eq!(
@@ -227,8 +233,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stale_state_can_be_untracked_after_the_markdown_was_deleted() {
+    #[tokio::test]
+    async fn stale_state_can_be_untracked_after_the_markdown_was_deleted() {
         let (_directory, files, local_path) = tracked_files();
         fs::remove_file(local_path).expect("working Markdown should be removable");
 
@@ -240,12 +246,13 @@ mod tests {
                 confirm: true,
             },
         )
+        .await
         .expect("stale state should remain removable");
         assert_eq!(output.note_id, "note-id");
     }
 
-    #[test]
-    fn invalid_inputs_do_not_change_state() {
+    #[tokio::test]
+    async fn invalid_inputs_do_not_change_state() {
         let (_directory, files, _local_path) = tracked_files();
         assert!(matches!(
             list_tracked_notes(
@@ -267,7 +274,8 @@ mod tests {
                     note_id: " ".to_owned(),
                     confirm: true,
                 }
-            ),
+            )
+            .await,
             Err(TrackingError::EmptyNoteId)
         ));
         assert_eq!(

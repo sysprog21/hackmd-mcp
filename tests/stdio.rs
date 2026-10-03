@@ -105,7 +105,7 @@ fn self_check_prints_json_and_exits_before_transport_startup() {
         .output()
         .expect("self-check should run");
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("self-check output should be JSON");
     assert_eq!(report["ok"], true);
@@ -125,7 +125,7 @@ fn api_probe_requires_self_check_mode() {
         .output()
         .expect("invalid CLI invocation should exit");
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
 }
 
 #[test]

@@ -174,16 +174,7 @@ impl NotesCache {
                 );
                 return CacheLookup::Hit(notes);
             }
-            if remove_cache_entry(&mut state, workspace) {
-                state.evictions = state.evictions.saturating_add(1);
-                tracing::debug!(
-                    cache_event = "eviction",
-                    reason = "expired",
-                    evictions = state.evictions,
-                    cached_bytes = state.total_bytes,
-                    "HackMD note-list cache"
-                );
-            }
+            evict(&mut state, workspace, "expired");
         }
         state.misses = state.misses.saturating_add(1);
         if let Some(flight) = state.flights.get(workspace) {
@@ -224,105 +215,86 @@ impl NotesCache {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut accepted = false;
-        if state
+        let current = state
             .flights
             .get(workspace)
-            .is_some_and(|current| Arc::ptr_eq(current, flight))
-        {
+            .is_some_and(|current| Arc::ptr_eq(current, flight));
+        if current {
             state.flights.remove(workspace);
-            if state.generation == generation
-                && let Some(notes) = notes
-            {
-                accepted = true;
-                let size_bytes = cached_note_bytes(workspace, notes);
-                if remove_cache_entry(&mut state, workspace) {
-                    state.evictions = state.evictions.saturating_add(1);
-                    tracing::debug!(
-                        cache_event = "eviction",
-                        reason = "replacement",
-                        evictions = state.evictions,
-                        cached_bytes = state.total_bytes,
-                        "HackMD note-list cache"
-                    );
-                }
-                if !self.ttl.is_zero() && self.max_entries > 0 && size_bytes <= self.max_bytes {
-                    let now = tokio::time::Instant::now();
-                    let expired = state
-                        .entries
-                        .iter()
-                        .filter(|&(_key, cached)| cached.stored.elapsed() >= self.ttl)
-                        .map(|(key, _cached)| key.clone())
-                        .collect::<Vec<_>>();
-                    for key in expired {
-                        remove_cache_entry(&mut state, &key);
-                        state.evictions = state.evictions.saturating_add(1);
-                        tracing::debug!(
-                            cache_event = "eviction",
-                            reason = "expired",
-                            evictions = state.evictions,
-                            cached_bytes = state.total_bytes,
-                            "HackMD note-list cache"
-                        );
-                    }
-                    while (!state.entries.is_empty())
-                        && (state.entries.len() >= self.max_entries
-                            || state.total_bytes.saturating_add(size_bytes) > self.max_bytes)
-                    {
-                        let Some(lru) = state
-                            .entries
-                            .iter()
-                            .min_by_key(|(_, cached)| cached.last_access)
-                            .map(|(key, _)| key.clone())
-                        else {
-                            break;
-                        };
-                        remove_cache_entry(&mut state, &lru);
-                        state.evictions = state.evictions.saturating_add(1);
-                        tracing::debug!(
-                            cache_event = "eviction",
-                            reason = "capacity",
-                            evictions = state.evictions,
-                            cached_bytes = state.total_bytes,
-                            "HackMD note-list cache"
-                        );
-                    }
-                    state.access_clock = state.access_clock.wrapping_add(1);
-                    let access = state.access_clock;
-                    state.entries.insert(
-                        workspace.clone(),
-                        CachedNotes {
-                            stored: now,
-                            last_access: access,
-                            size_bytes,
-                            notes: Arc::clone(notes),
-                        },
-                    );
-                    state.total_bytes = state.total_bytes.saturating_add(size_bytes);
-                    tracing::debug!(
-                        cache_event = "fill",
-                        cached_bytes = state.total_bytes,
-                        max_cached_bytes = self.max_bytes,
-                        "HackMD note-list cache"
-                    );
-                } else if !self.ttl.is_zero() {
-                    tracing::debug!(
-                        cache_event = "skip",
-                        reason = "byte_capacity",
-                        entry_bytes = size_bytes,
-                        max_cached_bytes = self.max_bytes,
-                        "HackMD note-list cache"
-                    );
-                }
-            }
+        }
+        // A list fetched across a write is stale before it lands.
+        let fresh = current && state.generation == generation;
+        let accepted = fresh && notes.is_some();
+        if fresh && let Some(notes) = notes {
+            self.store(&mut state, workspace, notes);
         }
         flight.finish();
         accepted
     }
 
-    /// Called after any write. Clearing every workspace rather than one is
-    /// deliberate: a note can move between workspaces, and the map holds at
-    /// most a handful of entries.
+    /// Replaces the workspace's entry, making room by expiry and then LRU.
+    fn store(
+        &self,
+        state: &mut NotesCacheState,
+        workspace: &Workspace,
+        notes: &Arc<[NoteResponse]>,
+    ) {
+        let size_bytes = cached_note_bytes(workspace, notes);
+        evict(state, workspace, "replacement");
+        if self.ttl.is_zero() {
+            return;
+        }
+        if self.max_entries == 0 || size_bytes > self.max_bytes {
+            tracing::debug!(
+                cache_event = "skip",
+                reason = "byte_capacity",
+                entry_bytes = size_bytes,
+                max_cached_bytes = self.max_bytes,
+                "HackMD note-list cache"
+            );
+            return;
+        }
+        let expired = state
+            .entries
+            .iter()
+            .filter(|&(_key, cached)| cached.stored.elapsed() >= self.ttl)
+            .map(|(key, _cached)| key.clone())
+            .collect::<Vec<_>>();
+        for key in expired {
+            evict(state, &key, "expired");
+        }
+        while state.entries.len() >= self.max_entries
+            || state.total_bytes.saturating_add(size_bytes) > self.max_bytes
+        {
+            let Some(lru) = state
+                .entries
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_access)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            evict(state, &lru, "capacity");
+        }
+        state.access_clock = state.access_clock.wrapping_add(1);
+        state.entries.insert(
+            workspace.clone(),
+            CachedNotes {
+                stored: tokio::time::Instant::now(),
+                last_access: state.access_clock,
+                size_bytes,
+                notes: Arc::clone(notes),
+            },
+        );
+        state.total_bytes = state.total_bytes.saturating_add(size_bytes);
+        tracing::debug!(
+            cache_event = "fill",
+            cached_bytes = state.total_bytes,
+            max_cached_bytes = self.max_bytes,
+            "HackMD note-list cache"
+        );
+    }
+
     /// Hits, misses, and bytes held, for the benchmark that reports them.
     #[cfg(test)]
     pub(super) fn stats(&self) -> (u64, u64, usize) {
@@ -333,6 +305,9 @@ impl NotesCache {
         (state.hits, state.misses, state.total_bytes)
     }
 
+    /// Called after any write. Clearing every workspace rather than one is
+    /// deliberate: a note can move between workspaces, and the map holds at
+    /// most a handful of entries.
     pub(super) fn invalidate(&self) {
         let mut state = self
             .state
@@ -356,12 +331,18 @@ impl NotesCache {
     }
 }
 
-fn remove_cache_entry(state: &mut NotesCacheState, workspace: &Workspace) -> bool {
+/// Drops the workspace's entry, if any, and counts and logs why.
+fn evict(state: &mut NotesCacheState, workspace: &Workspace, reason: &'static str) {
     if let Some(removed) = state.entries.remove(workspace) {
         state.total_bytes = state.total_bytes.saturating_sub(removed.size_bytes);
-        true
-    } else {
-        false
+        state.evictions = state.evictions.saturating_add(1);
+        tracing::debug!(
+            cache_event = "eviction",
+            reason,
+            evictions = state.evictions,
+            cached_bytes = state.total_bytes,
+            "HackMD note-list cache"
+        );
     }
 }
 

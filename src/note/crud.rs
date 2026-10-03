@@ -318,14 +318,12 @@ pub(crate) async fn create_note(
     // Judged from the note being returned, so the flag can never disagree with
     // the folder_ids the caller reads out of it.
     let folder_placement_confirmed = folder.as_ref().is_some_and(|id| placed_in(&note, id));
+    let reference = ResolvedNoteRef {
+        workspace: input.workspace,
+        note_id,
+    };
     Ok(CreateNoteOutput {
-        note: without_content(
-            ResolvedNoteRef {
-                workspace: input.workspace,
-                note_id,
-            },
-            note,
-        ),
+        note: crate::local::offload(|| without_content(reference, note)),
         folder_placement_requested: folder.is_some(),
         folder_placement_confirmed,
         compatibility_patch_applied,
@@ -705,7 +703,7 @@ mod tests {
         assert!(output.folder_placement_requested);
         assert!(!output.folder_placement_confirmed);
         assert!(output.compatibility_patch_applied);
-        assert!(output.note.folder_ids.is_empty());
+        assert_eq!(output.note.folder_ids, Vec::<String>::new());
     }
 
     #[tokio::test]

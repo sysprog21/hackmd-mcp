@@ -86,11 +86,17 @@ pub(crate) fn apply_note_patch(
         });
     }
 
+    // A byte-order mark is not part of the first line, which a patch names
+    // without it.
+    let (bom, content) = match content.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", content),
+    };
     let (mut lines, endings) = split_lines(content);
     for hunk in file_patch.hunks {
         apply_hunk(&mut lines, hunk)?;
     }
-    Ok(join_lines(&lines, endings))
+    Ok(format!("{bom}{}", join_lines(&lines, endings)))
 }
 
 /// Line endings of the body being patched. A body that uses one style keeps it.
@@ -387,6 +393,36 @@ mod tests {
 
     fn envelope(body: &str) -> String {
         format!("*** Begin Patch\n*** Update File: {TARGET}\n{body}\n*** End Patch")
+    }
+
+    #[test]
+    fn hunks_are_judged_on_the_whole_body_whatever_their_order() {
+        // Each hunk must match once in the body as earlier hunks left it: hunk
+        // order says nothing about where a repeated line is meant.
+        let patch = envelope("@@\n-x\n+X\n@@\n-b\n+c");
+        assert_eq!(
+            apply_note_patch("b\nx\nb", &patch, TARGET),
+            Err(PatchError::AmbiguousContext)
+        );
+        let patch = envelope("@@\n-b\n+2\n@@\n-a\n+1");
+        assert_eq!(
+            apply_note_patch("a\nb", &patch, TARGET),
+            Ok("1\n2".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_kept_and_not_part_of_the_first_line() {
+        let patch = envelope("@@ # Title\n-old\n+new");
+        assert_eq!(
+            apply_note_patch("\u{feff}# Title\nold\n", &patch, TARGET),
+            Ok("\u{feff}# Title\nnew\n".to_owned())
+        );
+        let patch = envelope("@@\n-# Title\n+# Renamed");
+        assert_eq!(
+            apply_note_patch("\u{feff}# Title\n", &patch, TARGET),
+            Ok("\u{feff}# Renamed\n".to_owned())
+        );
     }
 
     #[test]

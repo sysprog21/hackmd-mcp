@@ -374,16 +374,7 @@ impl HackmdClient {
         image: tokio::fs::File,
         size_bytes: u64,
     ) -> Result<ImageUploadResponse, HackmdError> {
-        let segments = ["notes", note_id, "images"];
-        let url = self.url_for_segments(&segments)?;
-        let path = url.path().to_owned();
-        let token = self
-            .config
-            .api_token()
-            .ok_or_else(|| HackmdError::MissingToken {
-                method: "POST".to_owned(),
-                path: path.clone(),
-            })?;
+        let (url, path, token) = self.authorized("POST", &["notes", note_id, "images"])?;
         let form = reqwest::multipart::Form::new().part(
             "image",
             reqwest::multipart::Part::stream_with_length(image, size_bytes)
@@ -519,16 +510,8 @@ impl HackmdClient {
         body: Option<&(impl Serialize + Sync)>,
         retryable: bool,
     ) -> Result<Option<T>, HackmdError> {
-        let url = self.url_for_segments(path_segments)?;
-        let path = url.path().to_owned();
         let method_text = method.as_str().to_owned();
-        let token = self
-            .config
-            .api_token()
-            .ok_or_else(|| HackmdError::MissingToken {
-                method: method_text.clone(),
-                path: path.clone(),
-            })?;
+        let (url, path, token) = self.authorized(&method_text, path_segments)?;
         let retry = self.config.retry();
         let mut retries = 0_u8;
 
@@ -605,6 +588,25 @@ impl HackmdClient {
         );
 
         decode_response(status, method_text, path, &bytes, token, rate_limit)
+    }
+
+    /// What every request starts from: its URL, the path its logs and errors
+    /// name, and the token, whose absence fails before anything is sent.
+    fn authorized(
+        &self,
+        method: &str,
+        path_segments: &[&str],
+    ) -> Result<(Url, String, &str), HackmdError> {
+        let url = self.url_for_segments(path_segments)?;
+        let path = url.path().to_owned();
+        let token = self
+            .config
+            .api_token()
+            .ok_or_else(|| HackmdError::MissingToken {
+                method: method.to_owned(),
+                path: path.clone(),
+            })?;
+        Ok((url, path, token))
     }
 
     fn url_for_segments(&self, path_segments: &[&str]) -> Result<Url, HackmdError> {

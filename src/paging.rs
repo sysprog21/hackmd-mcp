@@ -84,7 +84,7 @@ mod tests {
 
         // An offset past the end is a legal empty page, not an error.
         let (items, meta) = paginate((0..5).collect::<Vec<u8>>(), 99, 10);
-        assert!(items.is_empty());
+        assert_eq!(items, Vec::<u8>::new());
         assert!(!meta.has_more);
     }
 }

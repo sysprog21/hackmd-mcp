@@ -158,6 +158,8 @@ pub(crate) async fn push_note(
     input: PushNoteInput,
 ) -> Result<Result<PushNoteOutput, NoteResolution>, PushNoteError> {
     files.allow(&input.local_path)?;
+    // From reading the file and its record until the record is saved.
+    let _sync = files.sync_lock().await;
     let local = validate_and_read_local(files, &input)?;
     let tracked = files.state().load_for_local_path(&input.local_path)?;
     let note = crate::note::reference::ResolvedNoteRef {
@@ -491,7 +493,7 @@ fn advance_state(
     body: &str,
     remote_timestamp: Option<i64>,
 ) -> Result<(), StateError> {
-    let state = state.advance(body, remote_timestamp)?;
+    let state = crate::local::offload(|| state.advance(body, remote_timestamp))?;
     files.state().persist_from_sync(&state, body)
 }
 
@@ -713,7 +715,12 @@ mod tests {
         const REMOTE: &str = r#"{"id":"note-id","title":"Note","content":"remote edit"}"#;
         const NEWER: &str = r#"{"id":"note-id","title":"Note","content":"newer remote"}"#;
         let directory = tempfile::tempdir().expect("temp directory should create");
-        let local_path = directory.path().join("note.md");
+        // Canonical, as the record keeps it and the results report it.
+        let local_path = directory
+            .path()
+            .canonicalize()
+            .expect("temp directory should resolve")
+            .join("note.md");
         let snapshot = local_path.with_extension("remote.md");
         fs::write(&local_path, "local edit").expect("local fixture should write");
         fs::write(&snapshot, "user notes").expect("unrelated file should write");

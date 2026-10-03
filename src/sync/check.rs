@@ -69,7 +69,12 @@ pub(crate) async fn check_note_sync(
         .await?;
     let (local_digest, remote_digest) =
         crate::local::offload(|| (body_digest(&local), body_digest(&remote)));
+
+    // Both sides changed to the same body, as a push whose write landed but
+    // whose state was not saved leaves them: in sync, as push agrees, and the
+    // next push moves the baseline there.
     let status = match classify_changes(&tracked.baseline_digest, &local_digest, &remote_digest) {
+        ChangeState::Conflict if local_digest == remote_digest => SyncStatus::InSync,
         ChangeState::InSync => SyncStatus::InSync,
         ChangeState::LocalOnly => SyncStatus::LocalChanged,
         ChangeState::RemoteOnly => SyncStatus::RemoteChanged,
@@ -124,6 +129,12 @@ mod tests {
                 200,
                 r#"{"id":"id","title":"Note","content":"remote","lastChangedAt":2}"#,
             ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"remote","lastChangedAt":2}"#,
+            ),
         ]);
         let client = fixture.client();
         let files = crate::fixture::tracked_files(directory.path(), "id", &local_path, "baseline");
@@ -134,6 +145,8 @@ mod tests {
             ("baseline", SyncStatus::RemoteChanged),
             ("local", SyncStatus::LocalChanged),
             ("local", SyncStatus::Conflict),
+            // Both moved off the baseline, to the same body.
+            ("remote", SyncStatus::InSync),
         ] {
             fs::write(&local_path, local).expect("local fixture should update");
             let output = check_note_sync(&client, &files, &local_path)
@@ -143,11 +156,11 @@ mod tests {
             assert!(output.remote_body_hash.starts_with("sha256:"));
             statuses.push(output.status);
         }
-        assert_eq!(statuses.len(), 4);
+        assert_eq!(statuses.len(), 5);
         fixture.finish();
         assert_eq!(
             fs::read_to_string(&local_path).expect("local should remain readable"),
-            "local"
+            "remote"
         );
     }
 
