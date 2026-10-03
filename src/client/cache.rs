@@ -4,16 +4,17 @@
 //! note, and `HackMD` allows only 100 requests per five minutes.
 
 use std::collections::HashMap;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use super::HackmdError;
 use crate::{
     dto::{NoteResponse, TeamResponse},
     models::Workspace,
 };
+
+/// What one list request produced, shared with every caller that waited on it.
+pub(super) type ListOutcome = Result<Arc<[NoteResponse]>, HackmdError>;
 
 /// The account's `userPath` and team list, kept for the note-list TTL.
 /// Resolving an `@owner/slug` reference needs both before it can pick a
@@ -100,30 +101,37 @@ struct NotesCacheState {
 
 #[derive(Debug)]
 pub(super) struct CacheFlight {
-    done: AtomicBool,
     notify: tokio::sync::Notify,
+    /// Set once, when the fill ends: with its outcome when waiters may use
+    /// it, `None` when they must look again.
+    finished: OnceLock<Option<ListOutcome>>,
 }
 
 impl CacheFlight {
     fn new() -> Self {
         Self {
-            done: AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
+            finished: OnceLock::new(),
         }
     }
 
-    pub(super) async fn wait(&self) {
+    /// Waits for the fill, and returns what it fetched when that is usable
+    /// as is: a list no write overtook, or an error. Waiters then share the
+    /// one request, even when the list is too large to cache or the fetch
+    /// failed, rather than each repeating it. `None` sends the caller back
+    /// to look again.
+    pub(super) async fn wait(&self) -> Option<ListOutcome> {
         loop {
             let notified = self.notify.notified();
-            if self.done.load(Ordering::Acquire) {
-                return;
+            if let Some(finished) = self.finished.get() {
+                return finished.clone();
             }
             notified.await;
         }
     }
 
-    fn finish(&self) {
-        self.done.store(true, Ordering::Release);
+    fn finish(&self, outcome: Option<ListOutcome>) {
+        let _ = self.finished.set(outcome);
         self.notify.notify_waiters();
     }
 }
@@ -209,7 +217,7 @@ impl NotesCache {
         workspace: &Workspace,
         generation: u64,
         flight: &Arc<CacheFlight>,
-        notes: Option<&Arc<[NoteResponse]>>,
+        outcome: Option<&ListOutcome>,
     ) -> bool {
         let mut state = lock(&self.state);
         let current = state
@@ -219,14 +227,15 @@ impl NotesCache {
         if current {
             state.flights.remove(workspace);
         }
-        // A list fetched across a write is stale before it lands.
+        // A list fetched across a write is stale before it lands; an error is
+        // not, and is shared either way.
         let fresh = current && state.generation == generation;
-        let accepted = fresh && notes.is_some();
-        if fresh && let Some(notes) = notes {
+        if fresh && let Some(Ok(notes)) = outcome {
             self.store(&mut state, workspace, notes);
         }
-        flight.finish();
-        accepted
+        let shared = outcome.filter(|outcome| fresh || outcome.is_err());
+        flight.finish(shared.cloned());
+        fresh && outcome.is_some()
     }
 
     /// Replaces the workspace's entry, making room by expiry and then LRU.
@@ -299,7 +308,7 @@ impl NotesCache {
         (state.hits, state.misses, state.total_bytes)
     }
 
-    /// Called after any write. Clearing every workspace rather than one is
+    /// Called after any note write. Clearing every workspace rather than one is
     /// deliberate: a note can move between workspaces, and the map holds at
     /// most a handful of entries.
     pub(super) fn invalidate(&self) {
@@ -407,10 +416,14 @@ impl<'a> CacheFill<'a> {
         }
     }
 
-    pub(super) fn complete(mut self, notes: &Arc<[NoteResponse]>) -> bool {
-        let accepted =
-            self.cache
-                .finish(&self.workspace, self.generation, &self.flight, Some(notes));
+    /// Publishes the fill's outcome; true when no write overtook it.
+    pub(super) fn complete(mut self, outcome: &ListOutcome) -> bool {
+        let accepted = self.cache.finish(
+            &self.workspace,
+            self.generation,
+            &self.flight,
+            Some(outcome),
+        );
         self.completed = true;
         accepted
     }
@@ -430,6 +443,17 @@ impl Drop for CacheFill<'_> {
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    /// Completes a fill with `notes`; true when it was stored.
+    fn fill(
+        cache: &NotesCache,
+        workspace: &Workspace,
+        generation: u64,
+        flight: &Arc<super::CacheFlight>,
+        notes: &Arc<[crate::dto::NoteResponse]>,
+    ) -> bool {
+        cache.finish(workspace, generation, flight, Some(&Ok(Arc::clone(notes))))
+    }
+
     use super::{CacheFill, CacheLookup, MAX_CACHED_WORKSPACES, NotesCache, cached_note_bytes};
     use crate::models::Workspace;
 
@@ -443,7 +467,13 @@ mod tests {
         cache.invalidate();
         let notes: Arc<[crate::dto::NoteResponse]> = Vec::new().into();
 
-        assert!(!cache.finish(&Workspace::Personal, generation, &flight, Some(&notes)));
+        assert!(!fill(
+            &cache,
+            &Workspace::Personal,
+            generation,
+            &flight,
+            &notes
+        ));
         let CacheLookup::Fill { generation, flight } = cache.begin(&Workspace::Personal, false)
         else {
             panic!("stale fill must not repopulate the cache");
@@ -477,7 +507,7 @@ mod tests {
             let CacheLookup::Fill { generation, flight } = cache.begin(&workspace, false) else {
                 panic!("new workspace should miss");
             };
-            assert!(cache.finish(&workspace, generation, &flight, Some(&notes)));
+            assert!(fill(&cache, &workspace, generation, &flight, &notes));
         }
         let recently_used = Workspace::Team {
             team_path: "team-0".to_owned(),
@@ -492,7 +522,7 @@ mod tests {
         let CacheLookup::Fill { generation, flight } = cache.begin(&newest, false) else {
             panic!("new workspace should miss");
         };
-        assert!(cache.finish(&newest, generation, &flight, Some(&notes)));
+        assert!(fill(&cache, &newest, generation, &flight, &notes));
 
         assert_eq!(
             cache
@@ -547,7 +577,7 @@ mod tests {
             let CacheLookup::Fill { generation, flight } = cache.begin(workspace, false) else {
                 panic!("new workspace should miss");
             };
-            assert!(cache.finish(workspace, generation, &flight, Some(notes)));
+            assert!(fill(&cache, workspace, generation, &flight, notes));
         }
         assert!(matches!(
             cache.begin(&second_workspace, false),
@@ -578,7 +608,7 @@ mod tests {
             let CacheLookup::Fill { generation, flight } = cache.begin(&workspace, false) else {
                 panic!("empty cache should miss");
             };
-            assert!(cache.finish(&workspace, generation, &flight, Some(&notes)));
+            assert!(fill(&cache, &workspace, generation, &flight, &notes));
             assert!(cache.state.lock().expect("cache mutex").entries.is_empty());
             assert!(matches!(
                 cache.begin(&workspace, false),
@@ -600,7 +630,7 @@ mod tests {
         let CacheLookup::Fill { generation, flight } = cache.begin(&workspace, false) else {
             panic!("empty cache should miss");
         };
-        assert!(cache.finish(&workspace, generation, &flight, Some(&original)));
+        assert!(fill(&cache, &workspace, generation, &flight, &original));
 
         let mut oversized_note: crate::dto::NoteResponse =
             serde_json::from_str(r#"{"id":"id","title":"Changed"}"#)
@@ -610,7 +640,7 @@ mod tests {
         let CacheLookup::Fill { generation, flight } = cache.begin(&workspace, true) else {
             panic!("refresh should begin a fill");
         };
-        assert!(cache.finish(&workspace, generation, &flight, Some(&oversized)));
+        assert!(fill(&cache, &workspace, generation, &flight, &oversized));
 
         let state = cache.state.lock().expect("cache mutex should lock");
         assert!(state.entries.is_empty());
@@ -629,7 +659,7 @@ mod tests {
             let CacheLookup::Fill { generation, flight } = cache.begin(&workspace, false) else {
                 panic!("new workspace should miss");
             };
-            assert!(cache.finish(&workspace, generation, &flight, Some(&notes)));
+            assert!(fill(&cache, &workspace, generation, &flight, &notes));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -637,7 +667,7 @@ mod tests {
         let CacheLookup::Fill { generation, flight } = cache.begin(&current, false) else {
             panic!("new workspace should miss");
         };
-        assert!(cache.finish(&current, generation, &flight, Some(&notes)));
+        assert!(fill(&cache, &current, generation, &flight, &notes));
         let state = cache.state.lock().expect("cache mutex should lock");
         assert_eq!(state.entries.len(), 1);
         assert!(state.entries.contains_key(&Workspace::Personal));

@@ -157,17 +157,21 @@ impl HackmdClient {
             match self.notes.begin(workspace, bypass_cache) {
                 CacheLookup::Hit(notes) => return Ok(notes),
                 CacheLookup::Wait(flight) => {
-                    flight.wait().await;
+                    if let Some(outcome) = flight.wait().await {
+                        return outcome;
+                    }
                     bypass_cache = false;
                 }
                 CacheLookup::Fill { generation, flight } => {
                     let fill = CacheFill::new(&self.notes, workspace.clone(), generation, flight);
-                    let notes: Arc<[NoteResponse]> = self
+                    let outcome = self
                         .get_required::<Vec<NoteResponse>>(&workspace_route(workspace, &["notes"]))
-                        .await?
-                        .into();
-                    if fill.complete(&notes) {
-                        return Ok(notes);
+                        .await
+                        .map(Arc::from);
+                    // A list a write overtook is fetched again: it may lack
+                    // the note just written.
+                    if fill.complete(&outcome) || outcome.is_err() {
+                        return outcome;
                     }
                     bypass_cache = false;
                 }
@@ -485,8 +489,12 @@ impl HackmdClient {
     /// second covers a concurrent list that refilled the cache while the
     /// write was in flight. Both live here rather than at each write site,
     /// where the next endpoint added would be free to forget.
-    fn invalidate_list_cache_on_write(&self, method: &Method) -> Option<InvalidateOnDrop<'_>> {
-        (method != Method::GET).then(|| {
+    fn invalidate_list_cache_on_write(
+        &self,
+        method: &Method,
+        path_segments: &[&str],
+    ) -> Option<InvalidateOnDrop<'_>> {
+        (method != Method::GET && changes_note_lists(method, path_segments)).then(|| {
             self.notes.invalidate();
             InvalidateOnDrop(&self.notes)
         })
@@ -556,7 +564,7 @@ impl HackmdClient {
                 .body(body);
         }
 
-        let _invalidate = self.invalidate_list_cache_on_write(&method);
+        let _invalidate = self.invalidate_list_cache_on_write(&method, path_segments);
         tracing::debug!(method = %method_text, path = %path, "HackMD request started");
         let (status, bytes, rate_limit) = loop {
             let request = request.try_clone().ok_or(HackmdError::InvalidPayload)?;
@@ -890,6 +898,21 @@ fn includes_team(teams: &[TeamResponse], team_path: &str) -> bool {
     teams.iter().any(|team| team.path == team_path)
 }
 
+/// Whether a write to this route can change a note list. A folder rename or
+/// reorder cannot: a listed note carries no folder fields. A folder DELETE
+/// still counts, since what it does to the notes inside is not verified.
+fn changes_note_lists(method: &Method, path_segments: &[&str]) -> bool {
+    if method == Method::DELETE {
+        return true;
+    }
+    let resource = if let ["teams", _, rest @ ..] = path_segments {
+        rest
+    } else {
+        path_segments
+    };
+    resource.first() != Some(&"folders")
+}
+
 /// Builds the path segments for a workspace-scoped route. Personal routes start
 /// at the resource; the same resource for a team nests under its team path.
 fn workspace_route<'a>(workspace: &'a Workspace, resource: &[&'a str]) -> Vec<&'a str> {
@@ -1022,6 +1045,77 @@ mod tests {
         assert_eq!(first.expect("first list should succeed").len(), 1);
         assert_eq!(second.expect("second list should succeed").len(), 1);
         server.finish();
+    }
+
+    /// A failed fill is shared too: waiters must not each repeat a request
+    /// that just hit a rate limit or an outage.
+    #[tokio::test]
+    async fn concurrent_callers_share_a_failed_list_request() {
+        let server = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes",
+            503,
+            r#"{"error":"down"}"#,
+        )
+        .delay(Duration::from_millis(100))]);
+        let client = server.client_without_retry("fixture-token");
+
+        let (first, second) = tokio::join!(
+            client.list_notes(&Workspace::Personal, false),
+            client.list_notes(&Workspace::Personal, false)
+        );
+
+        assert!(matches!(first, Err(HackmdError::Upstream { .. })));
+        assert!(matches!(second, Err(HackmdError::Upstream { .. })));
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    /// A note list carries no folder fields, so a folder write leaves it.
+    #[tokio::test]
+    async fn a_folder_write_keeps_cached_note_lists() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/notes", 200, NOTES),
+            Scenario::new("PUT", "/v1/folders/folder-order", 200, ""),
+        ]);
+        let client = server.client_with_cache();
+        client
+            .list_notes(&Workspace::Personal, false)
+            .await
+            .expect("first list should fetch");
+        client
+            .set_folder_order(&Workspace::Personal, &std::collections::BTreeMap::new())
+            .await
+            .expect("folder order should save");
+        client
+            .list_notes(&Workspace::Personal, false)
+            .await
+            .expect("second list should come from cache");
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    /// What a folder DELETE does to the notes inside is unverified, so it
+    /// still clears cached note lists.
+    #[tokio::test]
+    async fn a_folder_delete_clears_cached_note_lists() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/notes", 200, NOTES),
+            Scenario::new("DELETE", "/v1/folders/f", 204, ""),
+            Scenario::new("GET", "/v1/notes", 200, NOTES),
+        ]);
+        let client = server.client_with_cache();
+        client
+            .list_notes(&Workspace::Personal, false)
+            .await
+            .expect("first list should fetch");
+        client
+            .delete_folder(&Workspace::Personal, "f")
+            .await
+            .expect("folder delete should succeed");
+        client
+            .list_notes(&Workspace::Personal, false)
+            .await
+            .expect("list after the delete should fetch again");
+        assert_eq!(server.finish().len(), 3);
     }
 
     /// Manual, threshold-free baseline for the list hot path. Run with:

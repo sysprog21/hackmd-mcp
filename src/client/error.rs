@@ -192,7 +192,7 @@ fn bounded_body(body: &[u8], token: &str) -> String {
     bounded
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub(crate) enum HackmdError {
     #[error(
         "{method} {path}: HACKMD_API_TOKEN is not configured; set it in the server environment and restart the MCP server"
