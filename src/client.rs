@@ -351,6 +351,7 @@ impl HackmdClient {
         &self,
         note_id: &str,
         file_name: &str,
+        mime: &str,
         image: tokio::fs::File,
         size_bytes: u64,
     ) -> Result<ImageUploadResponse, HackmdError> {
@@ -358,7 +359,9 @@ impl HackmdClient {
         let form = reqwest::multipart::Form::new().part(
             "image",
             reqwest::multipart::Part::stream_with_length(image, size_bytes)
-                .file_name(file_name.to_owned()),
+                .file_name(file_name.to_owned())
+                .mime_str(mime)
+                .map_err(|_| HackmdError::InvalidPayload)?,
         );
         tracing::debug!(method = "POST", path = %path, "HackMD request started");
         let response = self
