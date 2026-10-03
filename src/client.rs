@@ -22,9 +22,9 @@ mod readback;
 
 use cache::{AccountCache, CacheFill, CacheLookup, NotesCache, fresh, store};
 pub(crate) use error::HackmdError;
-use error::{RateLimitHeaders, map_status_error, request_error};
+use error::{RateLimitHeaders, map_status_error, request_error, transport_error};
 pub(crate) use readback::Readback;
-use readback::poll_readback_sized;
+use readback::{poll_readback_sized, transfer_allowance};
 
 /// HTTP client shared by all `HackMD` tool handlers.
 #[derive(Debug)]
@@ -38,10 +38,11 @@ pub(crate) struct HackmdClient {
 impl HackmdClient {
     pub(crate) fn new(config: Config) -> Result<Self, HackmdError> {
         // Redirects are refused: the API never sends one, and following a
-        // 307 would replay a note body to whatever origin it named.
+        // 307 would replay a note body to whatever origin it named. Timeouts
+        // are per request, in `send`: reqwest's own read timeout is armed
+        // once per request, so it would cut a long upload short.
         let http = reqwest::Client::builder()
             .connect_timeout(config.connect_timeout())
-            .timeout(config.request_timeout())
             .redirect(reqwest::redirect::Policy::none())
             .https_only(config.api_url().scheme() == "https")
             .build()
@@ -368,17 +369,21 @@ impl HackmdClient {
                 .map_err(|_| HackmdError::InvalidPayload)?,
         );
         tracing::debug!(method = "POST", path = %path, "HackMD request started");
-        let response = self
+        let size = usize::try_from(size_bytes).unwrap_or(usize::MAX);
+        let request = self
             .http
             .post(url)
+            .timeout(self.ceiling(size))
             .bearer_auth(token)
-            .multipart(form)
-            .send()
+            .multipart(form);
+        let response = self
+            .until_headers(request, size)
             .await
-            .map_err(|error| request_error(&error, "POST".to_owned(), path.clone()))?;
+            .map_err(|error| error.into_hackmd("POST", &path))?;
         let status = response.status();
         let rate_limit = RateLimitHeaders::from_headers(response.headers());
-        let bytes = read_body_capped(response, RESPONSE_MAX_BYTES)
+        let bytes = self
+            .read_body(response)
             .await
             .map_err(|error| error.into_hackmd("POST", &path))?;
         tracing::debug!(
@@ -500,7 +505,13 @@ impl HackmdClient {
     where
         Fut: std::future::Future<Output = Result<T, HackmdError>>,
     {
-        let readback = poll_readback_sized(written_bytes, fetch, accepted).await?;
+        let readback = poll_readback_sized(
+            written_bytes,
+            self.config.request_timeout(),
+            fetch,
+            accepted,
+        )
+        .await?;
         if readback.confirmed {
             self.notes.invalidate();
         }
@@ -527,7 +538,18 @@ impl HackmdClient {
             .transpose()
             .map_err(|_| HackmdError::InvalidPayload)?;
 
-        let mut request = self.http.request(method.clone(), url).bearer_auth(token);
+        // Repeating a large write after a transport failure re-uploads the
+        // whole body for an outcome the caller has to check anyway.
+        let retry_transport = retryable
+            && body
+                .as_ref()
+                .is_none_or(|body| body.len() <= RETRY_BODY_MAX_BYTES);
+        let body_len = body.as_ref().map_or(0, Vec::len);
+        let mut request = self
+            .http
+            .request(method.clone(), url)
+            .timeout(self.ceiling(body_len))
+            .bearer_auth(token);
         if let Some(body) = body {
             request = request
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -538,16 +560,14 @@ impl HackmdClient {
         tracing::debug!(method = %method_text, path = %path, "HackMD request started");
         let (status, bytes, rate_limit) = loop {
             let request = request.try_clone().ok_or(HackmdError::InvalidPayload)?;
-            let response = match request.send().await {
+            let response = match self.until_headers(request, body_len).await {
                 Ok(response) => response,
-                Err(_) if retryable && retries < retry.max_retries => {
+                Err(_) if retry_transport && retries < retry.max_retries => {
                     sleep_before_retry(retries, None, retry, false).await;
                     retries += 1;
                     continue;
                 }
-                Err(error) => {
-                    return Err(request_error(&error, method_text.clone(), path.clone()));
-                }
+                Err(error) => return Err(error.into_hackmd(&method_text, &path)),
             };
             let status = response.status();
             let retry_after = retry_after(response.headers());
@@ -558,9 +578,11 @@ impl HackmdClient {
             if status.is_success() && !read_success_body {
                 break (status, Vec::new(), rate_limit);
             }
-            let bytes = match read_body_capped(response, RESPONSE_MAX_BYTES).await {
+            let bytes = match self.read_body(response).await {
                 Ok(bytes) => bytes,
-                Err(BodyError::Transport(_)) if retryable && retries < retry.max_retries => {
+                Err(BodyError::Transport(_) | BodyError::Stalled)
+                    if retry_transport && retries < retry.max_retries =>
+                {
                     sleep_before_retry(retries, None, retry, false).await;
                     retries += 1;
                     continue;
@@ -602,6 +624,36 @@ impl HackmdClient {
         );
 
         Reply::check(status, method_text, path, bytes, token, rate_limit)
+    }
+
+    /// Sends `request` and waits for its response headers: the request
+    /// timeout, plus the upload of `body_len` bytes at the slowest rate still
+    /// accepted, since headers come only after the body is sent.
+    async fn until_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+        body_len: usize,
+    ) -> Result<reqwest::Response, BodyError> {
+        let budget = self.config.request_timeout() + transfer_allowance(body_len);
+        match tokio::time::timeout(budget, request.send()).await {
+            Ok(result) => result.map_err(BodyError::Transport),
+            Err(_) => Err(BodyError::Stalled),
+        }
+    }
+
+    /// Reads a response body, refusing it past the response cap and giving
+    /// up when no data arrives for the request timeout: a stall ends a read,
+    /// a slow but steady transfer does not.
+    async fn read_body(&self, response: reqwest::Response) -> Result<Vec<u8>, BodyError> {
+        read_body_capped(response, RESPONSE_MAX_BYTES, self.config.request_timeout()).await
+    }
+
+    /// The outer bound on a whole request carrying `body_len` bytes, should
+    /// a server drip data just fast enough to never stall: both transfers at
+    /// the slowest rate still accepted.
+    fn ceiling(&self, body_len: usize) -> Duration {
+        self.config.request_timeout()
+            + transfer_allowance(body_len.saturating_add(RESPONSE_MAX_BYTES))
     }
 
     /// What every request starts from: its URL, the path its logs and errors
@@ -719,6 +771,9 @@ async fn sleep_before_retry(
 /// it; anything larger is refused before it is buffered, not after.
 const RESPONSE_MAX_BYTES: usize = 2 * crate::sync::BODY_MAX_BYTES + 1024 * 1024;
 
+/// The largest request body retried after a transport failure.
+const RETRY_BODY_MAX_BYTES: usize = 1024 * 1024;
+
 /// Clears the note-list cache when dropped, on whichever path leaves the
 /// request.
 struct InvalidateOnDrop<'a>(&'a NotesCache);
@@ -731,6 +786,8 @@ impl Drop for InvalidateOnDrop<'_> {
 
 enum BodyError {
     Transport(reqwest::Error),
+    /// No response, or no further data, within the request timeout.
+    Stalled,
     TooLarge,
 }
 
@@ -738,6 +795,7 @@ impl BodyError {
     fn into_hackmd(self, method: &str, path: &str) -> HackmdError {
         match self {
             Self::Transport(error) => request_error(&error, method.to_owned(), path.to_owned()),
+            Self::Stalled => transport_error(true, false, method.to_owned(), path.to_owned()),
             Self::TooLarge => HackmdError::ResponseTooLarge {
                 method: method.to_owned(),
                 path: path.to_owned(),
@@ -753,6 +811,7 @@ impl BodyError {
 async fn read_body_capped(
     mut response: reqwest::Response,
     cap: usize,
+    stall: Duration,
 ) -> Result<Vec<u8>, BodyError> {
     let declared = response
         .content_length()
@@ -761,7 +820,13 @@ async fn read_body_capped(
         return Err(BodyError::TooLarge);
     }
     let mut body = Vec::with_capacity(declared.unwrap_or(0));
-    while let Some(chunk) = response.chunk().await.map_err(BodyError::Transport)? {
+    loop {
+        let next = tokio::time::timeout(stall, response.chunk())
+            .await
+            .map_err(|_| BodyError::Stalled)?;
+        let Some(chunk) = next.map_err(BodyError::Transport)? else {
+            break;
+        };
         if body.len() + chunk.len() > cap {
             return Err(BodyError::TooLarge);
         }
@@ -1574,12 +1639,12 @@ mod tests {
         let url = format!("{}/big", server.api_url);
         let response = reqwest::get(&url).await.expect("fixture should answer");
         assert!(matches!(
-            super::read_body_capped(response, 4).await,
+            super::read_body_capped(response, 4, Duration::from_secs(5)).await,
             Err(super::BodyError::TooLarge)
         ));
         let response = reqwest::get(&url).await.expect("fixture should answer");
         assert!(matches!(
-            super::read_body_capped(response, 10).await,
+            super::read_body_capped(response, 10, Duration::from_secs(5)).await,
             Ok(body) if body == b"0123456789"
         ));
         server.finish();
