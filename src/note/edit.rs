@@ -105,8 +105,15 @@ pub(crate) async fn edit_note(
     let (_, content) = client.get_note_body(&note.workspace, &note.note_id).await?;
     ensure_unchanged(&note.note_id, &content, input.expected_hash.as_deref())?;
     let patch_path = crate::note::patch::patch_path(&note.workspace, &note.note_id);
-    let updated = crate::note::patch::apply_note_patch(&content, &input.patch, &patch_path)?;
-    let changed = updated != content;
+    // Matching hunks against a large body is CPU work, kept off the runtime.
+    let (updated, changed) = crate::local::offload(|| {
+        let updated = crate::note::patch::apply_note_patch(&content, &input.patch, &patch_path)?;
+        let changed = updated != content;
+        Ok::<_, PatchError>((updated, changed))
+    })?;
+    // The old body is not needed past here; a large note is held once less
+    // through the write and its read-back.
+    drop(content);
     if changed {
         client
             .write_note_body(&note.workspace, &note.note_id, &updated)

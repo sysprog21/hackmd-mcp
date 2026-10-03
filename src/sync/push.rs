@@ -324,6 +324,11 @@ async fn push_resolved(
         advance_state(files, tracked.state, &local, remote_timestamp)?;
         return Ok(Ok(result));
     }
+    // Only the local body is needed from here on. Holding the remote and the
+    // baseline through the write and its read-back would keep three copies
+    // of a large note alive at once.
+    drop(remote);
+    drop(tracked.baseline_body);
     let written = client
         .write_note_body(&note.workspace, &note.note_id, &local)
         .await?;
