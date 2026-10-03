@@ -208,6 +208,10 @@ pub(crate) enum HackmdError {
     EmptyPathSegment,
     #[error("HackMD API path segments such as note IDs and team paths must not be . or ..")]
     DotPathSegment,
+    #[error(
+        "HackMD API path segments such as note IDs and team paths must not contain control characters"
+    )]
+    ControlInPathSegment,
     #[error("{method} {path}: HackMD response is larger than {limit_mib} MiB and was not read")]
     ResponseTooLarge {
         method: String,
@@ -306,7 +310,9 @@ impl crate::reply::ToolError for HackmdError {
             | Self::WriteUnconfirmed { .. } => ErrorKind::Readback,
             Self::MissingContent { .. } => ErrorKind::Upstream,
             Self::ResponseTooLarge { .. } | Self::ImageTooLarge { .. } => ErrorKind::TooLarge,
-            Self::EmptyPathSegment | Self::DotPathSegment => ErrorKind::InvalidInput,
+            Self::EmptyPathSegment | Self::DotPathSegment | Self::ControlInPathSegment => {
+                ErrorKind::InvalidInput
+            }
             // Serializing a payload this server validated cannot fail on
             // anything the caller sent.
             Self::ClientBuild | Self::InvalidBaseUrl | Self::InvalidPayload => ErrorKind::Internal,
@@ -384,6 +390,7 @@ mod tests {
             (HackmdError::InvalidBaseUrl, ErrorKind::Internal),
             (HackmdError::EmptyPathSegment, ErrorKind::InvalidInput),
             (HackmdError::DotPathSegment, ErrorKind::InvalidInput),
+            (HackmdError::ControlInPathSegment, ErrorKind::InvalidInput),
             (
                 HackmdError::ResponseTooLarge {
                     method: m(),

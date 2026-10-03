@@ -37,9 +37,13 @@ pub(crate) struct HackmdClient {
 
 impl HackmdClient {
     pub(crate) fn new(config: Config) -> Result<Self, HackmdError> {
+        // Redirects are refused: the API never sends one, and following a
+        // 307 would replay a note body to whatever origin it named.
         let http = reqwest::Client::builder()
             .connect_timeout(config.connect_timeout())
             .timeout(config.request_timeout())
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(config.api_url().scheme() == "https")
             .build()
             .map_err(|_| HackmdError::ClientBuild)?;
         let notes = NotesCache::new(config.list_cache_ttl());
@@ -636,6 +640,15 @@ impl HackmdClient {
         {
             return Err(HackmdError::DotPathSegment);
         }
+        // The URL library also drops tabs and newlines inside a segment
+        // before judging dots, so `.\t.` would become `..` after the check
+        // above.
+        if path_segments
+            .iter()
+            .any(|segment| segment.chars().any(char::is_control))
+        {
+            return Err(HackmdError::ControlInPathSegment);
+        }
         let mut url = self.config.api_url().clone();
         let mut segments = url
             .path_segments_mut()
@@ -643,6 +656,16 @@ impl HackmdClient {
         segments.pop_if_empty();
         segments.extend(path_segments);
         drop(segments);
+        // Whatever else the library might normalize, one segment in must be
+        // one segment out, or the request names another route.
+        let count = |url: &Url| {
+            url.path_segments().map_or(0, |segments| {
+                segments.filter(|segment| !segment.is_empty()).count()
+            })
+        };
+        if count(&url) != count(self.config.api_url()) + path_segments.len() {
+            return Err(HackmdError::DotPathSegment);
+        }
         Ok(url)
     }
 }
@@ -1460,6 +1483,38 @@ mod tests {
                 .await,
             Err(HackmdError::Network { .. })
         ));
+    }
+
+    /// The URL library drops tabs and newlines inside a segment before it
+    /// resolves dots, so these would otherwise reach another route.
+    #[test]
+    fn control_characters_never_reach_a_path() {
+        let client = HackmdClient::new(Config::for_loopback_test(
+            "http://127.0.0.1:9/v1",
+            Some("fixture-token"),
+        ))
+        .expect("client should build");
+        for segments in [
+            &["teams", ".\t.", "notes", "ID"][..],
+            &["teams", "T", "notes", ".\r."],
+            &["folders", "\t.."],
+            &["notes", "a\nb"],
+        ] {
+            assert!(
+                matches!(
+                    client.url_for_segments(segments),
+                    Err(HackmdError::ControlInPathSegment)
+                ),
+                "{segments:?}"
+            );
+        }
+        assert_eq!(
+            client
+                .url_for_segments(&["teams", "t", "notes", "a/b"])
+                .expect("an encoded slash is one segment")
+                .path(),
+            "/v1/teams/t/notes/a%2Fb"
+        );
     }
 
     #[tokio::test]
