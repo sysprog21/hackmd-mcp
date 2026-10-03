@@ -158,6 +158,8 @@ pub(crate) async fn push_note(
     input: PushNoteInput,
 ) -> Result<Result<PushNoteOutput, NoteResolution>, PushNoteError> {
     files.allow(&input.local_path)?;
+    // From reading the file and its record until the record is saved.
+    let _sync = files.sync_lock().await;
     let local = validate_and_read_local(files, &input)?;
     let tracked = files.state().load_for_local_path(&input.local_path)?;
     let note = crate::note::reference::ResolvedNoteRef {

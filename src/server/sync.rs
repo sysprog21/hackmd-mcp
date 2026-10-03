@@ -26,7 +26,7 @@ impl HackmdServer {
         Parameters(input): Parameters<UntrackNoteInput>,
     ) -> rmcp::model::CallToolResult {
         reply::respond(
-            crate::sync::tracking::untrack_note(&self.files, &input),
+            crate::sync::tracking::untrack_note(&self.files, &input).await,
             |output| format!("Stopped tracking HackMD note {}", output.note_id),
         )
     }

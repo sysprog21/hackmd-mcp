@@ -122,6 +122,10 @@ pub(crate) async fn pull_note(
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
+
+    // Held from the fetch until the record is saved: a push finishing in
+    // between would otherwise be overwritten by this older body.
+    let _sync = files.sync_lock().await;
     let (remote, body) = client.get_note_body(&note.workspace, &note.note_id).await?;
     let size_bytes = body.len();
     check_body_size("remote body", size_bytes, input.confirm_large_file)?;

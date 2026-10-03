@@ -23,6 +23,8 @@ pub(crate) struct LocalFiles {
     /// Refuse to write files agents load as instructions. On without a root,
     /// and on beneath a root the user did not set in their own environment.
     guard_instructions: bool,
+    /// Serializes the tools that write sync state; see `sync_lock`.
+    sync: tokio::sync::Mutex<()>,
 }
 
 /// `HACKMD_MCP_WORKSPACE_ROOT`, resolved and opened once. Both the policy check
@@ -226,6 +228,7 @@ impl LocalFiles {
             state: StateStore::new(state_dir),
             guard_instructions: root.is_none(),
             root: root.map(WorkspaceRoot::open),
+            sync: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -238,6 +241,18 @@ impl LocalFiles {
 
     pub(crate) fn state(&self) -> &StateStore {
         &self.state
+    }
+
+    /// Serializes the tools that write sync state. Pull and push check a file
+    /// and its record, then write both; untrack removes a record, leaving the
+    /// file alone. Tool calls run concurrently, so two pulls of different
+    /// notes into one new file could otherwise each find no record, and leave
+    /// the file holding one note's body while its record names the other, so
+    /// the next push overwrites the wrong note; and a push in flight could
+    /// write back a record untrack just removed. One lock for every file keeps
+    /// that reasoning simple; sync is not a hot path.
+    pub(crate) async fn sync_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.sync.lock().await
     }
 
     pub(crate) fn probe_workspace_root(&self) -> Result<(), LocalAccessError> {
