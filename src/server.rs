@@ -142,7 +142,7 @@ mod tests {
         ("hackmd_delete_note", false, true, true),
         ("hackmd_list_folders", true, false, true),
         ("hackmd_create_folder", false, false, false),
-        ("hackmd_update_folder", false, false, true),
+        ("hackmd_update_folder", false, true, true),
         ("hackmd_delete_folder", false, true, true),
         ("hackmd_upload_note_image", false, true, false),
         ("hackmd_pull_note", false, true, false),
