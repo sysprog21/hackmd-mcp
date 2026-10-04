@@ -94,15 +94,15 @@ own profile.
 ## Self-check
 
 ```sh
-hackmd-mcp --self-check              # local checks only
-hackmd-mcp --self-check --probe-api  # plus one read-only GET /me
+hackmd-mcp --self-check
 ```
 
 Prints a JSON report and exits without starting the MCP transport. It covers the
 package version, whether a token is present, the API origin, whether the state
 directory is writable, and whether the workspace root is configured and
-accessible. The API probe reports only success or a bounded error, never profile
-data. A failed check exits nonzero and still prints valid JSON, so editor
+accessible. Adding `--probe-api` makes one read-only `GET /me`, which reports
+only success or a bounded error, never profile data; without it the checks stay
+local. A failed check exits nonzero and still prints valid JSON, so editor
 integrations can parse it.
 
 ## Logging

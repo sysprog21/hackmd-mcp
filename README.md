@@ -50,16 +50,17 @@ Pick the archive for your platform:
 | macOS Apple silicon | `hackmd-mcp-aarch64-apple-darwin.tar.gz` |
 | Windows x86_64 | `hackmd-mcp-x86_64-pc-windows-msvc.zip` |
 
-On Linux or macOS:
+On Linux or macOS, set `asset` to the archive from the table above (where
+`sha256sum` is missing, as on older macOS, use `shasum -a 256` in its place):
 
 ```sh
-asset=hackmd-mcp-x86_64-unknown-linux-gnu.tar.gz   # from the table above
+asset=hackmd-mcp-x86_64-unknown-linux-gnu.tar.gz
 base=https://github.com/sysprog21/hackmd-mcp/releases/download/latest
 curl -sSfLO "$base/$asset" -O "$base/SHA256SUMS"
-grep " $asset\$" SHA256SUMS | sha256sum -c   # macOS: shasum -a 256 -c
-tar xzf "$asset"
-mkdir -p ~/.local/bin
-install -m 755 hackmd-mcp ~/.local/bin/
+grep " $asset\$" SHA256SUMS | sha256sum -c - &&
+    tar xzf "$asset" &&
+    mkdir -p ~/.local/bin &&
+    install -m 755 hackmd-mcp ~/.local/bin/
 ```
 
 The checksum catches a corrupt download. To also confirm the archive was built

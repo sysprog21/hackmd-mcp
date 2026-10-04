@@ -2,22 +2,23 @@
 
 ## Build and test
 
-```sh
-make                 # release binary in target/release/hackmd-mcp
-make check           # cargo test --all-targets --all-features
-cargo clippy --all-targets --all-features -- -D warnings
-make indent          # rustfmt, plus commentflow and shfmt when installed
-make coverage        # line coverage, needs cargo-llvm-cov
-```
+| Command | Does |
+|---------|------|
+| `make` | release binary in `target/release/hackmd-mcp` |
+| `make check` | `cargo test --all-targets --all-features` |
+| `cargo clippy --all-targets --all-features -- -D warnings` | lint gate |
+| `make indent` | rustfmt, plus commentflow and shfmt when installed |
+| `make coverage` | line coverage, needs cargo-llvm-cov |
 
 `make check` and clippy are separate gates, and CI runs both. To install the
 current checkout and register it:
 
 ```sh
-make install         # into ~/.local/bin; override with BINDIR=...
+make install
 ```
 
-It then registers the binary with Claude Code when the `claude` CLI is on
+It installs into `~/.local/bin` (set `BINDIR=...` for another directory), then
+registers the binary with Claude Code when the `claude` CLI is on
 `PATH`, and with Codex when `~/.codex/config.toml` (or
 `$CODEX_HOME/config.toml`) exists, writing the entries
 [clients.md](clients.md) describes. An entry either client already has is left
