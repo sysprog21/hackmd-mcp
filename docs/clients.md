@@ -4,8 +4,9 @@ The client spawns `hackmd-mcp` and speaks MCP over its stdin and stdout, so
 there is nothing to start beforehand. Run the binary from a terminal and it
 simply waits on stdin.
 
-Point every client at a stable, absolute path to the binary (for example
-`~/.local/bin/hackmd-mcp`), not at a build directory.
+Point every client at a stable, absolute path to the binary, such as
+`/home/you/.local/bin/hackmd-mcp`, not at a build directory. Write it out in
+full in JSON and TOML configs: only a shell expands `~`.
 
 ## Environment inheritance
 

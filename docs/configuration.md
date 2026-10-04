@@ -53,9 +53,10 @@ only the keys listed above, and it treats the file as untrusted, because a
 `hackmd_upload_note_image`. It must be absolute. A path outside the tree is
 refused, whatever a note tells the agent, and the confinement holds even if a
 symlink inside the tree is swapped while an operation runs. The root is opened
-once at startup; if it is moved or replaced afterwards, operations are refused
-until the server restarts. The same holds for a root that does not exist yet
-when the server starts, so create the directory first.
+once at startup; on Unix, if it is moved or replaced afterwards, operations are
+refused until the server restarts (elsewhere they keep using the original
+tree). A root that does not exist yet when the server starts is refused until
+a restart on every platform, so create the directory first.
 
 Without a root, any absolute path is accepted. In that case, and under a root
 that came only from `.env` (which could be `/`), the server logs a warning at

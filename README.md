@@ -56,7 +56,7 @@ On Linux or macOS:
 asset=hackmd-mcp-x86_64-unknown-linux-gnu.tar.gz   # from the table above
 base=https://github.com/sysprog21/hackmd-mcp/releases/download/latest
 curl -sSfLO "$base/$asset" -O "$base/SHA256SUMS"
-shasum -a 256 -c --ignore-missing SHA256SUMS
+grep " $asset\$" SHA256SUMS | sha256sum -c   # macOS: shasum -a 256 -c
 tar xzf "$asset"
 mkdir -p ~/.local/bin
 install -m 755 hackmd-mcp ~/.local/bin/
