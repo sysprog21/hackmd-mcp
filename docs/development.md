@@ -11,11 +11,22 @@ make coverage        # line coverage, needs cargo-llvm-cov
 ```
 
 `make check` and clippy are separate gates, and CI runs both. To install the
-current checkout:
+current checkout and register it:
 
 ```sh
-cargo install --path . --locked
+make install         # into ~/.local/bin; override with BINDIR=...
 ```
+
+It then registers the binary with Claude Code when the `claude` CLI is on
+`PATH`, and with Codex when `~/.codex/config.toml` (or
+`$CODEX_HOME/config.toml`) exists, writing the entries
+[clients.md](clients.md) describes. An entry either client already has is left
+as is, since it may carry env or args you added, so update it yourself after
+changing `BINDIR`. The installer needs Python 3.9 or newer, and 3.11 once
+there is a Codex config to read; `PYTHON=...` picks the interpreter. `make
+register` repeats only the registration. `python3 tests/install.py` checks all
+of this against stubbed `cargo` and `claude`; the harness itself reads TOML,
+so it needs Python 3.11 or newer.
 
 The `otel` feature adds an OTLP span exporter, switched on at runtime with
 `HACKMD_MCP_OTEL=1`. Release binaries are built without it.
