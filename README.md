@@ -62,6 +62,15 @@ mkdir -p ~/.local/bin
 install -m 755 hackmd-mcp ~/.local/bin/
 ```
 
+The checksum catches a corrupt download. To also confirm the archive was built
+by this repository's CI from a commit on `main`, run:
+
+```sh
+gh attestation verify "$asset" --repo sysprog21/hackmd-mcp \
+    --source-ref refs/heads/main \
+    --signer-workflow sysprog21/hackmd-mcp/.github/workflows/ci.yml
+```
+
 On Windows, download the zip from the release page and extract
 `hackmd-mcp.exe`. Other platforms build from source with Rust 1.88 or newer:
 

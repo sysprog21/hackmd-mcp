@@ -68,4 +68,4 @@ done
 gh release create latest "${assets[@]}" \
     --target "$GITHUB_SHA" \
     --title "latest" \
-    --notes "Automated build of ${GITHUB_SHA:0:7} on $(date -u +%Y-%m-%d). Verify a download against SHA256SUMS."
+    --notes "Automated build of ${GITHUB_SHA:0:7} on $(date -u +%Y-%m-%d). Check a download against SHA256SUMS, and its provenance as the README shows (gh attestation verify)."
