@@ -17,10 +17,26 @@ LLVM_COV := $(shell command -v cargo-llvm-cov 2>/dev/null)
 # stdin and hang), and paths containing spaces survive.
 FIND_SHELL := find . -path ./target -prune -o -path ./.git -prune -o -name '*.sh'
 
-.PHONY: all clean check coverage indent
+BINDIR ?= $(HOME)/.local/bin
+PYTHON ?= python3
+RELEASE_BUILD = $(CARGO) build --release $(BUILD_FEATURES)
+
+# Through the environment, not the command line: a path may hold quotes or
+# spaces that no recipe quoting survives.
+export BINDIR
+
+.PHONY: all clean check coverage indent install register
 
 all:
-	$(CARGO) build --release $(BUILD_FEATURES)
+	$(RELEASE_BUILD)
+
+# Builds, installs into BINDIR, then registers. scripts/install.py holds the
+# why of each step.
+install:
+	$(PYTHON) scripts/install.py install $(RELEASE_BUILD)
+
+register:
+	$(PYTHON) scripts/install.py register
 
 clean:
 	$(CARGO) clean

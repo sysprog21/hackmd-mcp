@@ -41,6 +41,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets --all-features --locked
+      # make install is a Unix path; macOS matters most, for its GNU Make 3.81
+      # and codesign. The suite stubs cargo and claude itself.
+      - if: runner.os != 'Windows'
+        run: python3 tests/install.py
 
   lint:
     # Pinned: clippy pedantic under -D warnings would otherwise let any new
