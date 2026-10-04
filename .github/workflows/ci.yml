@@ -12,9 +12,14 @@ on:
 permissions:
   contents: read
 
+# A newer run cancels an older one, except on main, where a run may be holding
+# the release window below open with the previous release already deleted, and
+# cancelling it would leave no release at all. A newer pending run still replaces an older pending one, so
+# only the newest push waiting on main survives. The event is in the key so
+# the weekly scheduled run, which never releases, cannot be what replaces it.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -75,3 +80,135 @@ jobs:
         with:
           tool: cargo-audit@0.22.2
       - run: cargo audit
+
+  # Prebuilt binaries, one per platform the test matrix above runs on. A binary
+  # for a platform whose suite never ran there is a promise nobody checked, so
+  # widen that matrix before adding a row here.
+  #
+  # Not on the weekly schedule: that run exists for the audit and never
+  # releases, so binaries built there would go nowhere.
+  build:
+    name: Binary ${{ matrix.target }}
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # A plain build links against the runner's glibc (2.39) and refuses
+          # to start on anything older, which is most servers still in use.
+          # zig links against 2.17 headers instead, the oldest it carries, so
+          # the binary runs on any glibc distribution from RHEL 7 on.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            glibc: "2.17"
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      BIN: target/${{ matrix.target }}/release
+      ASSET: hackmd-mcp-${{ matrix.target }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # Saved from main only: a pull request's release cache is never read
+      # again and would evict main's from the repository's cache quota.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # A venv because the runner's Python refuses system-wide pip installs.
+      # Pinned by hash, not only by version: zig is the linker of the shipped
+      # binary, and a version number does not stop a replaced wheel. Bumping
+      # either means taking the manylinux x86_64 wheel's sha256 from PyPI.
+      - name: Install cargo-zigbuild
+        if: matrix.glibc
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig"
+          cat > "$RUNNER_TEMP/zig.txt" << 'EOF'
+          cargo-zigbuild==0.23.4 --hash=sha256:0a149a2a07b9513d422efa9cc23e1add9741f08abe86845fa418eaeb4cca7931
+          ziglang==0.16.0 --hash=sha256:9fcda73f62b851dd72a54b710ad40a209896db14cfb13649e62191243556342b
+          EOF
+          "$RUNNER_TEMP/zig/bin/pip" install --require-hashes -r "$RUNNER_TEMP/zig.txt"
+          echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: |
+          if [ -n "${{ matrix.glibc }}" ]; then
+              cargo zigbuild --release --locked --target ${{ matrix.target }}.${{ matrix.glibc }}
+          else
+              cargo build --release --locked --target ${{ matrix.target }}
+          fi
+      # The smoke run below happens on a newer glibc and cannot see a symbol
+      # versioned past the floor, so read the floor off the binary instead.
+      - name: Check the glibc floor
+        if: matrix.glibc
+        run: |
+          newest=$(objdump -T "$BIN/hackmd-mcp" |
+              grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "newest glibc symbol: $newest"
+          [ "$(printf '%s\n' "$newest" "${{ matrix.glibc }}" | sort -V | tail -1)" = "${{ matrix.glibc }}" ]
+      # --self-check loads the configuration and probes a state directory, so
+      # it exercises more than argument parsing, yet needs neither a token nor
+      # a network, which is all this job can offer.
+      - name: Smoke-run the binary this job ships
+        env:
+          HACKMD_MCP_STATE_DIR: ${{ runner.temp }}/state
+        run: '"$BIN/hackmd-mcp" --self-check'
+      # A tarball rather than a bare binary, because it carries the executable
+      # bit and HTTPS does not. Windows has no such bit and expects a zip.
+      - name: Package
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+              (cd "$BIN" && 7z a "$GITHUB_WORKSPACE/$ASSET.zip" hackmd-mcp.exe)
+          else
+              tar czf "$ASSET.tar.gz" -C "$BIN" hackmd-mcp
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}.*
+          if-no-files-found: error
+          # Already compressed; zipping it again only costs time.
+          compression-level: 0
+
+  # A rolling "latest" release, so the newest main build is one download away
+  # instead of behind a login wall with a 90-day expiry, which is all the
+  # artifacts above are. It needs every other job, not only "build": shipping a
+  # binary whose suite or audit went red is worse than shipping nothing.
+  release:
+    needs: [test, lint, msrv, audit, build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      # First, so that checkout's workspace clean cannot wipe the artifacts the
+      # next step downloads. No persisted credentials: this is the one job that
+      # can push, and nothing here uses git.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          # Without a pattern this collects every artifact in the run, so one
+          # added to another job later would silently ship as a release asset.
+          pattern: hackmd-mcp-*
+          path: dist
+          merge-multiple: true
+      - name: Stage assets
+        run: .ci/stage-release-assets.sh
+      # The token only where it is used, not on every step of the job.
+      - name: Replace the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: .ci/publish-latest-release.sh
