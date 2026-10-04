@@ -26,8 +26,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # The lint job and the shipped binaries build with this one version, so a
-  # new stable can neither fail main nor change a release without a commit.
+  # Tests, lint, and the shipped binaries all use this one version, so the
+  # suite runs on the compiler that builds a release, and a new stable can
+  # neither fail main nor change a release without a commit.
   PINNED_RUST: "1.99.0"
   # The live suite talks to the real API and stays ignored here.
   HACKMD_RUN_LIVE_TESTS: ""
@@ -46,7 +47,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.PINNED_RUST }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --all-targets --all-features --locked
       # make install is a Unix path; macOS matters most, for its GNU Make 3.81
