@@ -14,7 +14,7 @@ use crate::{
     local::{LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
-    sync::state::{StateError, TrackedNoteState},
+    sync::state::{StateError, TrackedNoteState, timestamp_text},
     sync::{BODY_MAX_BYTES, ChangeState, LocalBodyError, classify_changes, read_local_body},
 };
 
@@ -83,6 +83,19 @@ pub(crate) struct PushNoteOutput {
     pub(crate) note_id: String,
     pub(crate) local_path: PathBuf,
     pub(crate) baseline_path: PathBuf,
+    /// After a successful push or a no-op, the body hash the local baseline
+    /// and the remote last verified as shared, so the caller can confirm the
+    /// sync landed without a follow-up `hackmd_get_note` (a concurrent edit
+    /// can still move the remote afterwards). Absent on conflict or
+    /// `remote_changed`, where `remote_body_hash` is the relevant hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) body_hash: Option<String>,
+    /// The note's last-changed timestamp after this push, the same text form
+    /// `hackmd_get_note`'s sync state reports: `HackMD`'s millisecond value as
+    /// a string, empty when the API omitted it. Absent on conflict or
+    /// `remote_changed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_timestamp: Option<String>,
     /// On a conflict, the hash to pass back as `expected_remote_hash` once
     /// the snapshot has been merged.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -264,7 +277,7 @@ async fn push_resolved(
         local_path: &tracked.state.local_path,
         baseline_path: &tracked.baseline_path,
     };
-    if matches!(guard.strategy, PushStrategy::Safe) {
+    let write = if matches!(guard.strategy, PushStrategy::Safe) {
         let (local_digest, remote_digest) =
             crate::local::offload(|| (body_digest(&local), body_digest(&remote)));
         let remote_hash = body_hash_from_digest(&remote_digest);
@@ -280,27 +293,30 @@ async fn push_resolved(
         // change is never mistaken for a local one, whatever hash is supplied.
         match classify_changes(&tracked.baseline_digest, &local_digest, &remote_digest) {
             ChangeState::InSync => {
-                return Ok(Ok(output(&target, PushStatus::NothingToPush)));
+                return Ok(Ok(synced(
+                    &target,
+                    PushStatus::NothingToPush,
+                    tracked.state.baseline_body_hash.clone(),
+                    remote_timestamp,
+                )));
             }
 
             // Nothing to write, but the baseline moves to the converged body,
             // or the next check reports a conflict.
-            ChangeState::Converged => {
-                let result = output(&target, PushStatus::NothingToPush);
-                advance_state(files, tracked.state, &local, remote_timestamp)?;
-                return Ok(Ok(result));
-            }
+            ChangeState::Converged => false,
 
             // A merge built against exactly this remote body may replace it.
             // Anything newer on the remote is still a conflict below.
-            ChangeState::Conflict if guard.expected_remote_hash == Some(remote_hash.as_str()) => {}
+            ChangeState::Conflict if guard.expected_remote_hash == Some(remote_hash.as_str()) => {
+                true
+            }
             ChangeState::RemoteOnly => {
                 return Ok(Ok(PushNoteOutput {
                     instructions: Some(REMOTE_CHANGED_INSTRUCTIONS.to_owned()),
                     ..output(&target, PushStatus::RemoteChanged)
                 }));
             }
-            ChangeState::LocalOnly if !merged_against_other_remote => {}
+            ChangeState::LocalOnly if !merged_against_other_remote => true,
             ChangeState::Conflict | ChangeState::LocalOnly => {
                 // The conflict is the result; a snapshot that cannot be saved
                 // is reported beside it rather than replacing it with an error.
@@ -319,27 +335,36 @@ async fn push_resolved(
                 }));
             }
         }
-    } else if remote == local {
-        let result = output(&target, PushStatus::NothingToPush);
-        advance_state(files, tracked.state, &local, remote_timestamp)?;
-        return Ok(Ok(result));
-    }
+    } else {
+        remote != local
+    };
     // Only the local body is needed from here on. Holding the remote and the
-    // baseline through the write and its read-back would keep three copies
-    // of a large note alive at once.
+    // baseline through the write and its read-back would keep three copies of
+    // a large note alive at once.
     drop(remote);
     drop(tracked.baseline_body);
-    let written = client
-        .write_note_body(&note.workspace, &note.note_id, &local)
-        .await?;
-    let result = output(&target, PushStatus::Pushed);
-    advance_state(files, tracked.state, &local, written.last_changed_at).map_err(|source| {
-        PushNoteError::StatePersistenceAfterWrite {
-            note_id: note.note_id,
-            source: Box::new(source),
-        }
-    })?;
-    Ok(Ok(result))
+
+    let (status, timestamp) = if write {
+        let written = client
+            .write_note_body(&note.workspace, &note.note_id, &local)
+            .await?;
+        (PushStatus::Pushed, written.last_changed_at)
+    } else {
+        (PushStatus::NothingToPush, remote_timestamp)
+    };
+    // Written or not, the baseline moves to the body both sides now hold.
+    let hash =
+        advance_state(files, tracked.state.clone(), &local, timestamp).map_err(|source| {
+            if status == PushStatus::Pushed {
+                PushNoteError::StatePersistenceAfterWrite {
+                    note_id: note.note_id.clone(),
+                    source: Box::new(source),
+                }
+            } else {
+                source.into()
+            }
+        })?;
+    Ok(Ok(synced(&target, status, hash, timestamp)))
 }
 
 /// What a push may overwrite: the strategy, and for a safe push the remote
@@ -366,11 +391,29 @@ fn output(target: &Target<'_>, status: PushStatus) -> PushNoteOutput {
         note_id: target.note_id.to_owned(),
         local_path: target.local_path.to_path_buf(),
         baseline_path: target.baseline_path.to_path_buf(),
+        body_hash: None,
+        remote_timestamp: None,
         remote_body_hash: None,
         diff_summary: None,
         snapshot_path: None,
         snapshot_error: None,
         instructions: None,
+    }
+}
+
+/// A result for a converged or just-written note: baseline, local, and remote
+/// now hold the same body, so one hash and the new timestamp let the caller
+/// confirm the sync without re-reading the note (saving an API request).
+fn synced(
+    target: &Target<'_>,
+    status: PushStatus,
+    body_hash: String,
+    remote_timestamp: Option<i64>,
+) -> PushNoteOutput {
+    PushNoteOutput {
+        body_hash: Some(body_hash),
+        remote_timestamp: Some(timestamp_text(remote_timestamp)),
+        ..output(target, status)
     }
 }
 
@@ -511,9 +554,10 @@ fn advance_state(
     state: TrackedNoteState,
     body: &str,
     remote_timestamp: Option<i64>,
-) -> Result<(), StateError> {
+) -> Result<String, StateError> {
     let state = crate::local::offload(|| state.advance(body, remote_timestamp))?;
-    files.state().persist_from_sync(&state, body)
+    files.state().persist_from_sync(&state, body)?;
+    Ok(state.baseline_body_hash)
 }
 
 #[cfg(test)]
@@ -720,6 +764,10 @@ mod tests {
         .expect("safe push should succeed")
         .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::Pushed);
+        // The result carries the converged hash and the new timestamp, so a
+        // caller confirms the sync without a follow-up read.
+        assert_eq!(output.body_hash, Some(crate::hash::body_hash("local edit")));
+        assert_eq!(output.remote_timestamp.as_deref(), Some("2"));
         fixture.finish();
         let loaded = files
             .state()
@@ -766,6 +814,11 @@ mod tests {
             .expect("comparison should succeed")
             .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::Conflict);
+        // A conflict reports remote_body_hash, not the converged fields:
+        // being None, they are omitted from the serialized result.
+        assert!(output.body_hash.is_none());
+        assert!(output.remote_timestamp.is_none());
+        assert!(output.remote_body_hash.is_some());
         assert!(
             output
                 .baseline_path
@@ -967,6 +1020,8 @@ mod tests {
         .expect("comparison should succeed")
         .expect("tracked note should resolve");
         assert_eq!(output.status, PushStatus::NothingToPush);
+        assert_eq!(output.body_hash, Some(crate::hash::body_hash("same edit")));
+        assert_eq!(output.remote_timestamp.as_deref(), Some("5"));
         assert_eq!(
             files
                 .state()
@@ -1052,6 +1107,10 @@ mod tests {
         .expect("comparison should succeed")
         .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::NothingToPush);
+        // A no-op still reports the shared hash so the caller can confirm.
+        assert_eq!(output.body_hash, Some(crate::hash::body_hash("baseline")));
+        // The GET omitted lastChangedAt, so the timestamp is reported empty.
+        assert_eq!(output.remote_timestamp.as_deref(), Some(""));
         fixture.finish();
     }
 
@@ -1140,7 +1199,46 @@ mod tests {
         .expect("overwrite should succeed")
         .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::Pushed);
+        assert_eq!(
+            output.body_hash,
+            Some(crate::hash::body_hash("forced local"))
+        );
+        assert_eq!(output.remote_timestamp.as_deref(), Some("3"));
         fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn overwrite_matching_remote_writes_nothing_and_reports_the_hash() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "same body").expect("local fixture should write");
+        // Only the GET is scripted: a PATCH would find no scenario.
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/note-id",
+            200,
+            r#"{"id":"note-id","title":"Note","content":"same body","lastChangedAt":7}"#,
+        )]);
+        let client = fixture.client();
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        let output = push_note(
+            &client,
+            &files,
+            input(&local_path, PushStrategy::Overwrite, true),
+        )
+        .await
+        .expect("overwrite should succeed")
+        .expect("direct note should resolve");
+        assert_eq!(output.status, PushStatus::NothingToPush);
+        assert_eq!(output.body_hash, Some(crate::hash::body_hash("same body")));
+        assert_eq!(output.remote_timestamp.as_deref(), Some("7"));
+        fixture.finish();
+        let loaded = files
+            .state()
+            .load_for_local_path(&local_path)
+            .expect("advanced state should load");
+        assert_eq!(loaded.baseline_body, "same body");
     }
 
     #[tokio::test]

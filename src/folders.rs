@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::{
     client::{HackmdClient, HackmdError},
     dto::{
-        CreateFolderRequest, FolderResponse, PatchField, PayloadError, UpdateFolderRequest,
+        CreateFolderRequest, FolderResponse, PatchField, UpdateFolderRequest,
         deserialize_patch_field,
     },
     models::Workspace,
@@ -201,8 +201,6 @@ pub(crate) enum FolderError {
     #[error("folder moves are unsupported: HackMD accepts parent_folder_id but ignores it")]
     UnsupportedFolderMove,
     #[error(transparent)]
-    Payload(#[from] PayloadError),
-    #[error(transparent)]
     Api(#[from] HackmdError),
 }
 
@@ -224,7 +222,6 @@ impl crate::reply::ToolError for FolderError {
             Self::ReadbackMismatch { .. } | Self::OrderReadbackMismatch { .. } => {
                 ErrorKind::Readback
             }
-            Self::Payload(error) => error.kind(),
             Self::Api(error) => error.kind(),
         }
     }

@@ -7,19 +7,30 @@ use std::{
     time::Duration,
 };
 
-fn spawn_server(
-    token: Option<&str>,
-    current_dir: Option<&Path>,
-    state_dir: Option<&Path>,
-) -> Child {
+/// The binary with none of its settings inherited, run by default from a
+/// directory with no `.env`: it loads one from its working directory, and the
+/// package root may hold a developer's real one. A test that needs a `.env`
+/// sets its own `current_dir`.
+fn server() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hackmd-mcp"));
     command
+        .current_dir(env!("CARGO_TARGET_TMPDIR"))
         .env_remove("HACKMD_API_TOKEN")
         .env_remove("HACKMD_API_URL")
         .env_remove("HACKMD_MCP_STATE_DIR")
         .env_remove("HACKMD_MCP_WORKSPACE_ROOT")
         .env_remove("HACKMD_MCP_OTEL")
-        .env_remove("RUST_LOG")
+        .env_remove("RUST_LOG");
+    command
+}
+
+fn spawn_server(
+    token: Option<&str>,
+    current_dir: Option<&Path>,
+    state_dir: Option<&Path>,
+) -> Child {
+    let mut command = server();
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -69,10 +80,7 @@ fn assert_waiting_then_stop(mut child: Child) -> Output {
 
 #[test]
 fn help_and_version_exit_without_starting_the_transport() {
-    let help = Command::new(env!("CARGO_BIN_EXE_hackmd-mcp"))
-        .arg("--help")
-        .output()
-        .expect("help should run");
+    let help = server().arg("--help").output().expect("help should run");
     assert!(help.status.success());
     let help = String::from_utf8(help.stdout).expect("help should be UTF-8");
     assert!(help.contains("Local-first MCP server for the HackMD API"));
@@ -80,7 +88,7 @@ fn help_and_version_exit_without_starting_the_transport() {
     assert!(help.contains("--self-check"));
     assert!(help.contains("--probe-api"));
 
-    let version = Command::new(env!("CARGO_BIN_EXE_hackmd-mcp"))
+    let version = server()
         .arg("--version")
         .output()
         .expect("version should run");
@@ -96,11 +104,8 @@ fn help_and_version_exit_without_starting_the_transport() {
 #[test]
 fn self_check_prints_json_and_exits_before_transport_startup() {
     let directory = tempfile::tempdir().expect("temporary directory should create");
-    let output = Command::new(env!("CARGO_BIN_EXE_hackmd-mcp"))
+    let output = server()
         .arg("--self-check")
-        .env_remove("HACKMD_API_TOKEN")
-        .env_remove("HACKMD_API_URL")
-        .env_remove("HACKMD_MCP_WORKSPACE_ROOT")
         .env("HACKMD_MCP_STATE_DIR", directory.path().join("state"))
         .output()
         .expect("self-check should run");
@@ -120,7 +125,7 @@ fn self_check_prints_json_and_exits_before_transport_startup() {
 
 #[test]
 fn api_probe_requires_self_check_mode() {
-    let output = Command::new(env!("CARGO_BIN_EXE_hackmd-mcp"))
+    let output = server()
         .arg("--probe-api")
         .output()
         .expect("invalid CLI invocation should exit");
@@ -131,11 +136,8 @@ fn api_probe_requires_self_check_mode() {
 #[test]
 fn requested_api_probe_reports_missing_token_as_json_failure() {
     let directory = tempfile::tempdir().expect("temporary directory should create");
-    let output = Command::new(env!("CARGO_BIN_EXE_hackmd-mcp"))
+    let output = server()
         .args(["--self-check", "--probe-api"])
-        .env_remove("HACKMD_API_TOKEN")
-        .env_remove("HACKMD_API_URL")
-        .env_remove("HACKMD_MCP_WORKSPACE_ROOT")
         .env("HACKMD_MCP_STATE_DIR", directory.path().join("state"))
         .output()
         .expect("self-check probe should run");

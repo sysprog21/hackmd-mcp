@@ -22,7 +22,7 @@ mod readback;
 
 use cache::{AccountCache, CacheFill, CacheLookup, NotesCache, fresh, store};
 pub(crate) use error::HackmdError;
-use error::{RateLimitHeaders, map_status_error, request_error, transport_error};
+use error::{RateLimitHeaders, map_status_error, parse_header, request_error, transport_error};
 pub(crate) use readback::Readback;
 use readback::{poll_readback_sized, transfer_allowance};
 
@@ -746,11 +746,7 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
             return target.duration_since(SystemTime::now()).ok();
         }
     }
-    headers
-        .get("x-ratelimit-userreset")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs)
+    parse_header(headers, "x-ratelimit-userreset").map(Duration::from_secs)
 }
 
 async fn sleep_before_retry(

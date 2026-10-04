@@ -21,8 +21,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Every action is pinned to a commit, with its release in a comment for
+# Dependabot: a tag can be moved, and these jobs build the shipped binaries.
+
 env:
   CARGO_TERM_COLOR: always
+  # Tests, lint, and the shipped binaries all use this one version, so the
+  # suite runs on the compiler that builds a release, and a new stable can
+  # neither fail main nor change a release without a commit.
+  PINNED_RUST: "1.99.0"
   # The live suite talks to the real API and stays ignored here.
   HACKMD_RUN_LIVE_TESTS: ""
 
@@ -37,9 +44,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.PINNED_RUST }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --all-targets --all-features --locked
       # make install is a Unix path; macOS matters most, for its GNU Make 3.81
       # and codesign. The suite stubs cargo and claude itself.
@@ -47,16 +56,18 @@ jobs:
         run: python3 tests/install.py
 
   lint:
-    # Pinned: clippy pedantic under -D warnings would otherwise let any new
-    # stable release fail main with no code change. Bump it in its own commit.
+    # Pinned (PINNED_RUST above): clippy pedantic under -D warnings would
+    # otherwise let any new stable release fail main with no code change. Bump
+    # it in its own commit.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
+          toolchain: ${{ env.PINNED_RUST }}
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       # The default build compiles the non-otel observability path.
@@ -68,19 +79,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --all-features --locked
 
   audit:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # cargo audit itself rather than rustsec/audit-check, whose releases
       # still run on Node.js 20. Pinned like the lint toolchain.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
         with:
           tool: cargo-audit@0.22.2
       - run: cargo audit
@@ -118,15 +131,16 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
+          toolchain: ${{ env.PINNED_RUST }}
           targets: ${{ matrix.target }}
       # Saved from main only: a pull request's release cache is never read
       # again and would evict main's from the repository's cache quota.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # A venv because the runner's Python refuses system-wide pip installs.
@@ -175,7 +189,7 @@ jobs:
           else
               tar czf "$ASSET.tar.gz" -C "$BIN" hackmd-mcp
           fi
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.ASSET }}
           path: ${{ env.ASSET }}.*
@@ -194,14 +208,18 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      # Signing the provenance below: an OIDC token proves the identity of
+      # this workflow, and the attestation is stored with the repository.
+      id-token: write
+      attestations: write
     steps:
       # First, so that checkout's workspace clean cannot wipe the artifacts the
       # next step downloads. No persisted credentials: this is the one job that
       # can push, and nothing here uses git.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           # Without a pattern this collects every artifact in the run, so one
           # added to another job later would silently ship as a release asset.
@@ -210,6 +228,13 @@ jobs:
           merge-multiple: true
       - name: Stage assets
         run: .ci/stage-release-assets.sh
+      # SHA256SUMS sits in the same release as the binaries, so it catches a
+      # corrupt download but not a replaced release. A provenance attestation
+      # ties each digest to this workflow and commit, which gh attestation
+      # verify checks independently of the release page.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
       # The token only where it is used, not on every step of the job.
       - name: Replace the latest release
         env:

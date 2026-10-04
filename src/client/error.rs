@@ -63,7 +63,7 @@ impl RateLimitHeaders {
     }
 }
 
-fn parse_header<T>(headers: &reqwest::header::HeaderMap, name: &str) -> Option<T>
+pub(super) fn parse_header<T>(headers: &reqwest::header::HeaderMap, name: &str) -> Option<T>
 where
     T: std::str::FromStr,
 {
