@@ -1,151 +1,137 @@
 # hackmd-mcp
 
-`hackmd-mcp` is a local-first MCP server for HackMD. It communicates over
-stdio, writes protocol messages only to stdout, and keeps diagnostics on
-stderr.
+An [MCP](https://modelcontextprotocol.io/) server that lets an AI agent read,
+write, and organize your [HackMD](https://hackmd.io/) notes, and keep them in
+sync with Markdown files on your own disk.
 
-## Install and run
+## Why put an agent on HackMD
 
-Build the current checkout:
+HackMD is where meeting notes, lecture handouts, and team specs end up. Working
+on them with an agent usually means copying a note into a chat, copying the
+answer back, and hoping nobody edited the note in between. This server removes
+that loop and the risks that come with it:
 
-```sh
-cargo install --path . --locked
-hackmd-mcp --version
-hackmd-mcp --help
-```
+- Ask in plain language. "Summarize this week's meeting notes in the `ops`
+  team", "fix the broken links in https://hackmd.io/@me/syllabus", or "move the
+  action items into a new note under `Projects`". The agent finds notes by ID or
+  by the URL you paste, across your personal and team workspaces.
+- Edits touch only what they mean to. The agent changes a note with a
+  context-checked patch, not by rewriting the whole body, so a typo fix stays a
+  typo fix, and it can pass along the hash it read to refuse the write if the
+  note changed in between. See [patch editing](docs/tools.md#editing-a-note).
+- Notes become local files. Pull a note into a `.md` file, then edit it with
+  your editor, grep it, diff it, or commit it to git. Push sends it back, and if
+  the note also changed on HackMD the push stops and hands you both versions
+  instead of overwriting either. See
+  [sync](docs/tools.md#pull-edit-locally-push).
+- Edits are confirmed, not assumed. HackMD applies some writes
+  asynchronously, so body edits and folder changes are read back before they
+  are reported as done. A write whose outcome is unknown is reported as such
+  and never retried blindly, so you do not get duplicate notes.
+- Local file access can be fenced in. Set a workspace root and every local path
+  stays inside it; without one, a pull still refuses to write the files agents
+  load as instructions. Your API token never appears in any output. See
+  [configuration](docs/configuration.md#workspace-root).
 
-For a published release, pin the exact version you reviewed instead of
-installing from a mutable branch or tag:
+The server runs on your machine as a child process of your agent and talks to
+it over stdio. Nothing listens on a network port.
 
-```sh
-cargo install hackmd-mcp --version 0.1.0 --locked
-```
+## Quick start
 
-Replace `0.1.0` with the exact release you intend to run.
+### 1. Install
 
-## Token security
+Every push to `main` that passes CI replaces a rolling [`latest`
+release](https://github.com/sysprog21/hackmd-mcp/releases/tag/latest).
+Pick the archive for your platform:
 
-Create a dedicated, least-privilege HackMD API token. Prefer passing it through
-the MCP client's inherited environment. Never commit a real token, paste one
-into chat or logs, or store one in a world-readable client configuration.
+| Platform | Archive |
+|----------|---------|
+| Linux x86_64, glibc 2.17 or newer | `hackmd-mcp-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple silicon | `hackmd-mcp-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `hackmd-mcp-x86_64-pc-windows-msvc.zip` |
 
-For local development only, copy `.env.example` to `.env` in the server's
-working directory and restrict its permissions. Inherited environment values
-take precedence over `.env`. The server reads only these keys:
-
-- `HACKMD_API_TOKEN` — required when a tool contacts HackMD.
-- `HACKMD_API_URL` — optional HTTPS HackMD Enterprise endpoint; defaults to
-  `https://api.hackmd.io/v1`.
-- `HACKMD_MCP_STATE_DIR` — optional private sync-state directory. Honored only from
-  the inherited environment, never from `.env`: the directory holds full note bodies,
-  and a `.env` in someone else's repository must not be able to redirect them.
-  On Unix the server refuses a state directory, or the record directories inside it,
-  owned by another account or carrying group or other write bits, since a record planted
-  there could send a pushed file to someone else's note. ACLs are not inspected, and
-  other platforms do not check this at all, so keep it in your own profile. No tool accepts a
-  local path inside it as a destination.
-- `HACKMD_MCP_WORKSPACE_ROOT` — optional tree that `hackmd_pull_note`,
-  `hackmd_push_note`, `hackmd_get_note` with a `local_path`, and
-  `hackmd_upload_note_image` are confined to. It must be absolute. Set it and a note
-  that tells an agent to access outside that tree is rejected; capability-relative
-  operations stay confined if a symlink is swapped concurrently. Unset, any absolute
-  path is accepted, except that a pull will not write a file coding agents load as
-  instructions (`CLAUDE.md`, `AGENTS.md`, `SKILL.md`, and the like, or anything under
-  `.claude/`, `.github/`, `.cursor/` and similar), and the server logs a warning at
-  startup. That list is best effort, not a boundary: `CLAUDE.md` can import any Markdown
-  file, so set the root if agents read the tree you pull into. A root set only in a
-  working-directory `.env` still confines, but since that file may belong to someone
-  else's repository (whose root could be `/`), the refusal to write agent instruction
-  files stays on beneath it too. `hackmd_upload_note_image` publishes the file at a
-  public link, so it requires a root set in the server's own environment (not only in
-  `.env`) and refuses every upload without one.
-
-A `.env` in the working directory may not redirect a token that came from the environment: if
-`HACKMD_API_TOKEN` is inherited and only that file sets `HACKMD_API_URL`, the server refuses to
-start. Otherwise a checked-out repository could point your token at a host of its author's
-choosing. A token inside the file does not change this, because an inherited value takes
-precedence over it. Set both keys in the same place.
-
-## Self-check
-
-Run `hackmd-mcp --self-check` to print a JSON report and exit without starting
-the MCP transport. It reports the package version, whether a token is present,
-the API origin, state-directory writability, and whether workspace-root
-confinement is configured and accessible. It never prints the token.
-
-Add `--probe-api` to perform one authenticated, read-only `GET /me` request. The
-report includes only probe success or a bounded error—not profile data. A failed
-local check or requested API probe produces a nonzero exit status while keeping
-stdout valid JSON for editor integrations.
-
-The token is loaded lazily, redacted from diagnostics, and never validated at
-startup. Local sync state can contain note content and must also remain private.
-
-## MCP client configuration
-
-Install a pinned binary first, then reference that stable executable. Use an
-absolute path when the client's executable search path is uncertain.
-
-Codex reads MCP server entries from `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.hackmd]
-command = "/absolute/path/to/hackmd-mcp"
-```
-
-Launch Codex from an environment containing `HACKMD_API_TOKEN`. See the
-[official Codex MCP configuration documentation](https://developers.openai.com/codex/mcp/)
-for the current configuration schema.
-
-Claude Desktop uses a JSON MCP server entry:
-
-```json
-{
-  "mcpServers": {
-    "hackmd": {
-      "command": "/absolute/path/to/hackmd-mcp",
-      "args": []
-    }
-  }
-}
-```
-
-If a desktop-launched client does not inherit your shell environment, use a
-private `.env` in the configured working directory or the client's supported
-secret-management mechanism. Avoid placing the token directly in JSON or TOML.
-
-## Transport scope
-
-This server intentionally supports stdio only. A remote HTTP deployment would
-need authentication, per-user token isolation, endpoint allowlisting, rate
-limits, and encrypted credential storage with secure rotation. GitHub sync is
-also excluded from the core server because it requires separate credentials,
-durable conflict state, and frontmatter policy. Both should remain opt-in,
-separately reviewed features if a concrete workflow eventually requires them.
-
-## Validation
+On Linux or macOS:
 
 ```sh
-make check
-cargo clippy --all-targets --all-features -- -D warnings
+asset=hackmd-mcp-x86_64-unknown-linux-gnu.tar.gz   # from the table above
+base=https://github.com/sysprog21/hackmd-mcp/releases/download/latest
+curl -sSfLO "$base/$asset" -O "$base/SHA256SUMS"
+grep " $asset\$" SHA256SUMS | sha256sum -c   # macOS: shasum -a 256 -c
+tar xzf "$asset"
+mkdir -p ~/.local/bin
+install -m 755 hackmd-mcp ~/.local/bin/
 ```
 
-`make check` is `cargo test --all-targets --all-features`. The Makefile also carries `make`
-(release build), `make clean`, and `make indent`, which formats the sources with rustfmt plus
-`commentflow` and `shfmt` when those are installed.
-
-Both live suites are ignored by default. The read-only validator probe mutates
-nothing and prints `ETag`/`Last-Modified` plus conditional response status:
+On Windows, download the zip from the release page and extract
+`hackmd-mcp.exe`. Other platforms build from source with Rust 1.88 or newer:
 
 ```sh
-HACKMD_RUN_LIVE_READONLY_TESTS=1 HACKMD_LIVE_TEST_TOKEN=... \
-    cargo test --test live-readonly -- --ignored --nocapture
+cargo install --git https://github.com/sysprog21/hackmd-mcp --locked
 ```
 
-The destructive suite requires a dedicated account and both explicit gates:
+### 2. Set up the environment
+
+Create an API token under HackMD's Settings, API, and pick a directory for
+notes you pull to disk. Put both in the environment your agent is launched
+from, such as your shell profile:
 
 ```sh
-HACKMD_RUN_LIVE_TESTS=1 HACKMD_CONFIRM_DESTRUCTIVE_LIVE_TESTS=YES \
-    HACKMD_LIVE_TEST_TOKEN=... \
-    cargo test --test live-destructive -- --ignored --nocapture
+export HACKMD_API_TOKEN=...
+export HACKMD_MCP_WORKSPACE_ROOT=$HOME/notes
+mkdir -p "$HACKMD_MCP_WORKSPACE_ROOT"
 ```
+
+The workspace root is optional but recommended: it confines every local file
+operation and enables image upload. The server reads both at startup, so
+restart your agent after changing them. Keep the token out of chat, logs, and
+shared config files; [docs/configuration.md](docs/configuration.md) has the
+details.
+
+### 3. Check the setup
+
+```sh
+~/.local/bin/hackmd-mcp --self-check --probe-api
+```
+
+It prints a JSON report and exits nonzero if anything is wrong, without ever
+printing the token.
+
+### 4. Connect your agent
+
+Claude Code:
+
+```sh
+claude mcp add --scope user hackmd -- ~/.local/bin/hackmd-mcp
+```
+
+Claude Desktop, Codex, and other clients need a few more lines, mostly to pass
+the environment through; see [docs/clients.md](docs/clients.md). Then ask your
+agent something like "list my recent HackMD notes".
+
+## What the agent can do
+
+Fourteen tools, kept few on purpose so they cost the agent little context:
+
+| Area | Tools |
+|------|-------|
+| Account | `hackmd_get_me` (profile and teams) |
+| Notes | `hackmd_list_notes`, `hackmd_get_note`, `hackmd_create_note`, `hackmd_update_note`, `hackmd_delete_note`, `hackmd_upload_note_image` |
+| Folders | `hackmd_list_folders`, `hackmd_create_folder`, `hackmd_update_folder`, `hackmd_delete_folder` |
+| Local sync | `hackmd_pull_note`, `hackmd_push_note`, `hackmd_untrack_note` |
+
+[docs/tools.md](docs/tools.md) walks through the editing and sync workflows.
+
+## Documentation
+
+- [docs/configuration.md](docs/configuration.md): environment variables, token
+  handling, state directory, workspace root, self-check, logging.
+- [docs/clients.md](docs/clients.md): wiring the server into Claude Code,
+  Claude Desktop, Codex, and other MCP clients.
+- [docs/tools.md](docs/tools.md): the tools, patch editing, and the
+  pull/edit/push cycle with conflict handling.
+- [docs/development.md](docs/development.md): building, testing, the live API
+  suites, and why the server is stdio only.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
