@@ -9,7 +9,7 @@ use crate::{
     dto::NoteResponse,
     local::LocalFiles,
     models::Workspace,
-    paging::{InvalidLimit, PageMeta, default_limit, paginate, validate_limit},
+    paging::{InvalidLimit, PageMeta, contains_folded, default_limit, paginate, validate_limit},
     sync::tracking::{
         ListTrackedNotesInput, ListTrackedNotesOutput, TrackingError, list_tracked_notes,
     },
@@ -134,6 +134,8 @@ pub(crate) enum ListNotesError {
     AccountWideSource(&'static str),
     #[error("source tracked lists local sync records; tags, sort, and refresh do not apply")]
     TrackedFilters,
+    #[error("source {0} is always fetched fresh; refresh only applies to source workspace")]
+    UncachedRefresh(&'static str),
     #[error(transparent)]
     Tracking(#[from] TrackingError),
     #[error(transparent)]
@@ -145,9 +147,10 @@ impl crate::reply::ToolError for ListNotesError {
         use crate::reply::ErrorKind;
 
         match self {
-            Self::Limit(..) | Self::AccountWideSource(..) | Self::TrackedFilters => {
-                ErrorKind::InvalidInput
-            }
+            Self::Limit(..)
+            | Self::AccountWideSource(..)
+            | Self::TrackedFilters
+            | Self::UncachedRefresh(..) => ErrorKind::InvalidInput,
             Self::Tracking(error) => error.kind(),
             Self::Api(error) => error.kind(),
         }
@@ -224,11 +227,14 @@ async fn list_remote(
     input: ListNotesInput,
 ) -> Result<ListNotesOutput, ListNotesError> {
     validate_limit(input.limit)?;
+    // History and trash are account-wide and never cached.
     let account_wide = |name| {
-        if input.workspace == Workspace::Personal {
-            Ok(())
-        } else {
+        if input.workspace != Workspace::Personal {
             Err(ListNotesError::AccountWideSource(name))
+        } else if input.refresh {
+            Err(ListNotesError::UncachedRefresh(name))
+        } else {
+            Ok(())
         }
     };
 
@@ -320,20 +326,6 @@ fn matches_query(note: &NoteResponse, query: &str) -> bool {
         || note.short_id.as_deref().is_some_and(contains)
         || note.description.as_deref().is_some_and(contains)
         || note.tags.iter().any(|tag| contains(tag))
-}
-
-/// Whether `value` contains `needle`, which is already lowercase. Every note
-/// field is searched on every query, so the common all-ASCII case compares in
-/// place; anything else takes Unicode lowercasing, which can change length.
-pub(crate) fn contains_folded(value: &str, needle: &str) -> bool {
-    if value.is_ascii() && needle.is_ascii() {
-        let (value, needle) = (value.as_bytes(), needle.as_bytes());
-        return needle.is_empty()
-            || value
-                .windows(needle.len())
-                .any(|window| window.eq_ignore_ascii_case(needle));
-    }
-    value.to_lowercase().contains(needle)
 }
 
 /// Whether `value` equals `lowered`, which is already lowercase, ignoring case.
@@ -496,7 +488,7 @@ mod tests {
         ] {
             let needle = needle.to_lowercase();
             assert_eq!(
-                super::contains_folded(value, &needle),
+                crate::paging::contains_folded(value, &needle),
                 value.to_lowercase().contains(&needle),
                 "{value} / {needle}"
             );
@@ -664,6 +656,15 @@ mod tests {
             assert!(matches!(
                 remote(&client, invalid).await,
                 Err(ListNotesError::AccountWideSource(_))
+            ));
+
+            // Neither is cached, so there is nothing for refresh to bypass.
+            let mut refreshed = input();
+            refreshed.source = source;
+            refreshed.refresh = true;
+            assert!(matches!(
+                remote(&client, refreshed).await,
+                Err(ListNotesError::UncachedRefresh(_))
             ));
         }
     }

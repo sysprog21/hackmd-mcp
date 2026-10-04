@@ -6,10 +6,11 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
+    hash::body_hash,
     local::{Entry, LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
-    sync::state::{StateError, TrackedNoteState, body_hash},
+    sync::state::{StateError, TrackedNoteState},
     sync::{BODY_MAX_BYTES, BodySizeError, check_body_size},
 };
 
@@ -111,6 +112,10 @@ pub(crate) async fn pull_note(
     input: PullNoteInput,
 ) -> Result<Result<PullNoteOutput, NoteResolution>, PullNoteError> {
     files.allow_write(&input.local_path)?;
+    // A store that must not be trusted is refused before the file is
+    // touched, discard or not: the record this pull saves would be read
+    // back from there.
+    files.state().trusted()?;
     validate_destination(files, &input)?;
     let resolution = crate::note::reference::resolve_note_ref(
         client,
@@ -203,13 +208,20 @@ fn has_unpushed_changes(
     // Two records naming the file are still tracking it, but there is no single
     // baseline to judge against: only a file already equal to the remote is
     // known to have nothing to lose.
+    // Only an absent or unusable record means there is nothing to lose; any
+    // other failure, now or added later, refuses rather than overwrite.
     let baseline_hash = match files.state().record_for(&input.local_path) {
         Ok(Some(record)) => Some(record.baseline_body_hash),
         Err(StateError::AmbiguousTrackedState { .. }) => None,
-        Err(error @ (StateError::Io(_) | StateError::InvalidStatePath)) => {
-            return Err(error.into());
-        }
-        Ok(None) | Err(_) => return Ok(false),
+        Ok(None)
+        | Err(
+            StateError::NotTracked
+            | StateError::CorruptTrackedState { .. }
+            | StateError::StateIdentityMismatch
+            | StateError::MissingBaseline { .. }
+            | StateError::BaselineMismatch { .. },
+        ) => return Ok(false),
+        Err(error) => return Err(error.into()),
     };
 
     // One byte past the maximum is enough to tell an oversized file apart, and
@@ -590,6 +602,54 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&local_path).expect("local should read"),
             "remote"
+        );
+    }
+
+    /// A store that must not be trusted cannot vouch that a file has no
+    /// unpushed edits, so the pull refuses rather than overwrite it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_untrusted_state_directory_never_lets_a_pull_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "unpushed edit").expect("local edit should write");
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        fs::set_permissions(
+            directory.path().join("state"),
+            fs::Permissions::from_mode(0o777),
+        )
+        .expect("permissions should set");
+
+        let fixture = crate::fixture::SequenceServer::spawn_scenarios([remote_note("remote")]);
+        assert!(matches!(
+            pull_note(
+                &fixture.client(),
+                &files,
+                overwrite_input(&local_path, false)
+            )
+            .await,
+            Err(PullNoteError::State(
+                crate::sync::state::StateError::UntrustedStateDir { .. }
+            ))
+        ));
+        // Not even when told to discard local changes.
+        assert!(matches!(
+            pull_note(
+                &fixture.client(),
+                &files,
+                overwrite_input(&local_path, true)
+            )
+            .await,
+            Err(PullNoteError::State(
+                crate::sync::state::StateError::UntrustedStateDir { .. }
+            ))
+        ));
+        assert_eq!(
+            fs::read_to_string(&local_path).expect("local should read"),
+            "unpushed edit"
         );
     }
 

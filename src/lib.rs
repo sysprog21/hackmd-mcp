@@ -1,9 +1,11 @@
 //! A local-first MCP server for the `HackMD` API.
 
+mod account;
 mod client;
 mod config;
 mod dto;
 mod folders;
+mod hash;
 mod health;
 mod local;
 mod models;

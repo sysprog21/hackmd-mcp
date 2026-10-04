@@ -291,7 +291,6 @@ pub(crate) async fn create_note(
                 parent_folder_id: Some(Some(folder_id.clone())),
                 ..UpdateNoteRequest::default()
             };
-            placement.validate()?;
             client
                 .update_note(&input.workspace, &note_id, &placement)
                 .await
@@ -334,11 +333,7 @@ pub(crate) async fn update_note(
     client: &HackmdClient,
     mut input: UpdateNoteInput,
 ) -> Result<Result<UpdateNoteOutput, NoteResolution>, CrudError> {
-    if input
-        .expected_hash
-        .as_deref()
-        .is_some_and(|hash| !crate::sync::state::is_body_hash(hash))
-    {
+    if crate::hash::is_malformed(input.expected_hash.as_deref()) {
         return Err(CrudError::MalformedExpectedHash);
     }
     if let Some(patch) = input.patch.take() {
@@ -513,7 +508,7 @@ mod tests {
                 update(json!({
                     "note_ref": "id",
                     "title": "T",
-                    "expected_hash": crate::sync::state::body_hash("")
+                    "expected_hash": crate::hash::body_hash("")
                 }))
             )
             .await,
@@ -559,7 +554,7 @@ mod tests {
         let input = serde_json::from_value(json!({
             "note_ref": "id",
             "content": "replacement",
-            "expected_hash": crate::sync::state::body_hash("as read")
+            "expected_hash": crate::hash::body_hash("as read")
         }))
         .expect("input should deserialize");
         assert!(matches!(
@@ -652,6 +647,28 @@ mod tests {
         assert_eq!(note.title, "Updated");
         assert_eq!(note.patch_path, "notes/note/id.md");
         server.finish();
+    }
+
+    /// A body that never shows up is an error naming the recovery, not a
+    /// success, and not a prompt to send the body again blind.
+    #[tokio::test]
+    async fn a_content_write_that_never_shows_up_names_the_recovery() {
+        let fixture = SequenceServer::spawn_repeating([
+            (202, ""),
+            (200, r#"{"id":"note-id","title":"T","content":"old"}"#),
+        ]);
+        let input = serde_json::from_value(json!({
+            "note_ref": "note-id",
+            "content": "new"
+        }))
+        .expect("update input should deserialize");
+        let error = update_note(&fixture.client(), input)
+            .await
+            .expect_err("an unconfirmed write should fail");
+        assert_eq!(
+            error.to_string(),
+            "HackMD accepted the update for note note-id, but read-back content did not match; call hackmd_get_note and compare before writing again"
+        );
     }
 
     #[tokio::test]

@@ -12,8 +12,12 @@ use serde::Serialize;
 /// The duplication costs bytes on the local stdio pipe, not model context: a
 /// client hands its model one form or the other. Dropping either would break
 /// the clients that read only that one, so both stay.
-pub(crate) fn structured<T: Serialize>(summary: impl Into<String>, output: &T) -> CallToolResult {
-    let structured = serde_json::to_value(output).expect("tool output should serialize");
+///
+/// `output` is taken by value and dropped once converted, so a note body is
+/// not held a third time while the text form is rendered.
+pub(crate) fn structured<T: Serialize>(summary: impl Into<String>, output: T) -> CallToolResult {
+    let structured = serde_json::to_value(&output).expect("tool output should serialize");
+    drop(output);
     let mut result = CallToolResult::success(vec![
         ContentBlock::text(summary),
         ContentBlock::text(structured.to_string()),
@@ -43,7 +47,7 @@ pub(crate) fn respond<T: Serialize, E: ToolError>(
     summary: impl FnOnce(&T) -> String,
 ) -> CallToolResult {
     match result {
-        Ok(output) => structured(summary(&output), &output),
+        Ok(output) => structured(summary(&output), output),
         Err(error) => self::error(&error),
     }
 }
@@ -55,7 +59,7 @@ pub(crate) fn respond_resolved<T: Serialize, E: ToolError>(
 ) -> CallToolResult {
     match result {
         Ok(Err(resolution)) => unresolved(&resolution),
-        Ok(Ok(output)) => structured(summary(&output), &output),
+        Ok(Ok(output)) => structured(summary(&output), output),
         Err(error) => self::error(&error),
     }
 }
@@ -81,7 +85,9 @@ pub(crate) enum ErrorKind {
     Forbidden,
     /// The note, folder, or team does not exist for this account.
     NotFound,
-    /// `HackMD` refused the change as conflicting, such as a permalink in use.
+    /// The change conflicts with the current state: `HackMD` refused it, such
+    /// as a permalink in use, or the body changed since the caller read it.
+    /// Re-read before trying again.
     Conflict,
     /// Out of quota; wait for the reset before retrying.
     RateLimited,

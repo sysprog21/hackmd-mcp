@@ -151,11 +151,12 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_upload_note_image",
-        description = "Upload a local image to a personal-workspace note and return only its HackMD CDN link. Files above 5 MiB require confirmation; files above 10 MiB are refused. For @owner/slug references, refresh=true bypasses the 60-second caches.",
+        description = "Upload a local image to a personal-workspace note and return only its HackMD CDN link, which anyone can open. The image must lie under HACKMD_MCP_WORKSPACE_ROOT; with no root configured, uploads are refused. Files above 5 MiB require confirmation; files above 10 MiB are refused. For @owner/slug references, refresh=true bypasses the 60-second caches.",
         annotations(
             title = "Upload HackMD Note Image",
             read_only_hint = false,
-            destructive_hint = false,
+            // Publishing a file at a public link cannot be taken back.
+            destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = true
         )

@@ -88,20 +88,24 @@ impl crate::reply::ToolError for UploadNoteImageError {
     }
 }
 
-/// Checks the file's magic bytes.
+/// Checks the file's magic bytes and names the type they show.
 ///
 /// The tool hands a local file to a remote CDN that answers with a public link,
 /// so the file has to be what the caller says it is. Without this, one confused
-/// or coerced tool call publishes a private key as readily as a screenshot.
-fn ensure_supported_image(header: &[u8]) -> Result<(), UploadNoteImageError> {
-    let supported = header.starts_with(b"\x89PNG\r\n\x1a\n")
-        || header.starts_with(b"\xff\xd8\xff")
-        || header.starts_with(b"GIF87a")
-        || header.starts_with(b"GIF89a")
-        || (header.len() == 12 && header.starts_with(b"RIFF") && &header[8..12] == b"WEBP");
-    supported
-        .then_some(())
-        .ok_or(UploadNoteImageError::UnsupportedFormat)
+/// or coerced tool call publishes a private key as readily as a screenshot. The
+/// type goes out on the upload's part: a part with none is read as text.
+fn image_mime(header: &[u8]) -> Result<&'static str, UploadNoteImageError> {
+    if header.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Ok("image/png")
+    } else if header.starts_with(b"\xff\xd8\xff") {
+        Ok("image/jpeg")
+    } else if header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a") {
+        Ok("image/gif")
+    } else if header.len() == 12 && header.starts_with(b"RIFF") && &header[8..12] == b"WEBP" {
+        Ok("image/webp")
+    } else {
+        Err(UploadNoteImageError::UnsupportedFormat)
+    }
 }
 
 /// Opens the image, checks its size and leading bytes, and rewinds it for
@@ -109,13 +113,15 @@ fn ensure_supported_image(header: &[u8]) -> Result<(), UploadNoteImageError> {
 fn open_image(
     files: &LocalFiles,
     input: &UploadNoteImageInput,
-) -> Result<(std::fs::File, u64), UploadNoteImageError> {
-    // A missing or special file is simply not an image to upload; a path the
-    // confinement refuses is reported as that, so it can be fixed.
+) -> Result<(std::fs::File, u64, &'static str), UploadNoteImageError> {
+    // A missing or special file is simply not an image to upload. Anything
+    // else, a permission error or a path the confinement refuses, is reported
+    // as itself, so it points at what needs fixing.
     let mut image = files
         .open_read(&input.image_path)
         .map_err(|error| match error {
-            LocalAccessError::NotRegular { .. } | LocalAccessError::Io(_) => {
+            LocalAccessError::NotRegular { .. } => UploadNoteImageError::InvalidFile,
+            LocalAccessError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
                 UploadNoteImageError::InvalidFile
             }
             other => UploadNoteImageError::Access(other),
@@ -138,11 +144,11 @@ fn open_image(
         .take(12)
         .read_to_end(&mut header)
         .map_err(|_| UploadNoteImageError::InvalidFile)?;
-    ensure_supported_image(&header)?;
+    let mime = image_mime(&header)?;
     image
         .seek(SeekFrom::Start(0))
         .map_err(|_| UploadNoteImageError::InvalidFile)?;
-    Ok((image, size_bytes))
+    Ok((image, size_bytes, mime))
 }
 
 pub(crate) async fn upload_note_image(
@@ -150,8 +156,8 @@ pub(crate) async fn upload_note_image(
     files: &LocalFiles,
     input: UploadNoteImageInput,
 ) -> Result<Result<UploadNoteImageOutput, NoteResolution>, UploadNoteImageError> {
-    files.allow(&input.image_path)?;
-    let (image, size_bytes) = crate::local::offload(|| open_image(files, &input))?;
+    files.allow_publish(&input.image_path)?;
+    let (image, size_bytes, mime) = crate::local::offload(|| open_image(files, &input))?;
     let resolution = crate::note::reference::resolve_note_ref(
         client,
         input.workspace,
@@ -174,6 +180,7 @@ pub(crate) async fn upload_note_image(
         .upload_note_image(
             &note.note_id,
             file_name,
+            mime,
             tokio::fs::File::from_std(image),
             size_bytes,
         )
@@ -194,9 +201,13 @@ mod tests {
         upload_note_image,
     };
 
-    /// Local access with no configured root, matching the default deployment.
+    /// Local access confined to the temporary directory the test images are
+    /// written in: an upload needs a root.
     fn files() -> crate::local::LocalFiles {
-        crate::fixture::scratch_files()
+        crate::local::LocalFiles::new(
+            std::env::temp_dir().join("hackmd-mcp-test"),
+            Some(std::env::temp_dir()),
+        )
     }
 
     /// A PNG signature followed by a marker the multipart assertions can find.
@@ -218,7 +229,9 @@ mod tests {
             r#"{"data":{"link":"https://hackmd.io/_uploads/image.png"}}"#,
         )
         .expect_body("multipart image bytes and field", |body| {
-            body.contains("name=\"image\"") && body.contains("fixture-image")
+            body.contains("name=\"image\"")
+                && body.contains("Content-Type: image/png")
+                && body.contains("fixture-image")
         })]);
         let client = fixture.client();
         let output = upload_note_image(
@@ -259,6 +272,27 @@ mod tests {
         assert!(matches!(
             upload_note_image(&client, &files(), input).await,
             Err(UploadNoteImageError::UnsupportedFormat)
+        ));
+    }
+
+    /// With no root, nothing marks which images the user meant to share.
+    #[tokio::test]
+    async fn refuses_to_upload_without_a_workspace_root() {
+        let mut image = tempfile::NamedTempFile::new().expect("temp image should create");
+        image.write_all(PNG_FIXTURE).expect("image should write");
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        let input = UploadNoteImageInput {
+            workspace: crate::models::Workspace::Personal,
+            note_ref: "note-id".to_owned(),
+            refresh: false,
+            image_path: image.path().to_path_buf(),
+            confirm_large_file: false,
+        };
+        assert!(matches!(
+            upload_note_image(&client, &crate::fixture::scratch_files(), input).await,
+            Err(UploadNoteImageError::Access(
+                crate::local::LocalAccessError::Unconfined { .. }
+            ))
         ));
     }
 

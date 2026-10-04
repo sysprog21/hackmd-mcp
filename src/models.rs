@@ -61,14 +61,24 @@ impl<'de> Deserialize<'de> for Workspace {
             Tagged(Tagged),
             Other(serde::de::IgnoredAny),
         }
-        match Option::<Arg>::deserialize(deserializer)? {
-            None => Ok(Self::Personal),
-            Some(Arg::Tagged(tagged)) => Ok(tagged.into()),
-            Some(Arg::Path(path)) if !path.trim().is_empty() => Ok(Self::Team {
-                team_path: path.trim().to_owned(),
-            }),
-            Some(Arg::Path(_) | Arg::Other(_)) => Err(serde::de::Error::custom(EXPECTED)),
+        let path = match Option::<Arg>::deserialize(deserializer)? {
+            None | Some(Arg::Tagged(Tagged::Personal)) => return Ok(Self::Personal),
+            Some(Arg::Path(path) | Arg::Tagged(Tagged::Team { team_path: path })) => path,
+            Some(Arg::Other(_)) => return Err(serde::de::Error::custom(EXPECTED)),
+        };
+        // Either spelling is judged once. A control character is no team's
+        // path, and the URL library drops tabs and newlines, so `.\t.` would
+        // reach it as `..`; the client refuses those too.
+        if path.chars().any(char::is_control) {
+            return Err(serde::de::Error::custom(EXPECTED));
         }
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(serde::de::Error::custom(EXPECTED));
+        }
+        Ok(Self::Team {
+            team_path: path.to_owned(),
+        })
     }
 }
 
@@ -158,6 +168,9 @@ mod tests {
             core
         );
         for invalid in [
+            serde_json::json!({"team_path": ".\t."}),
+            serde_json::json!({"team_path": "core\n"}),
+            serde_json::json!({"workspace": {"kind": "team", "team_path": ".\r."}}),
             serde_json::json!({"team_path": " "}),
             serde_json::json!({"team_path": 7}),
             serde_json::json!({"workspace": {"kind": "team"}}),

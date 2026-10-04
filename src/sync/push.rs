@@ -10,10 +10,11 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
+    hash::{body_digest, body_hash, body_hash_from_digest},
     local::{LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
-    sync::state::{StateError, TrackedNoteState, body_digest, body_hash, body_hash_from_digest},
+    sync::state::{StateError, TrackedNoteState},
     sync::{BODY_MAX_BYTES, ChangeState, LocalBodyError, classify_changes, read_local_body},
 };
 
@@ -107,6 +108,10 @@ pub(crate) enum PushNoteError {
     LocalBody(#[from] LocalBodyError),
     #[error("overwrite strategy requires confirm: true")]
     OverwriteConfirmationRequired,
+    #[error(
+        "expected_remote_hash guards a safe push; strategy: overwrite ignores the remote, so pass one or the other"
+    )]
+    OverwriteWithExpectedHash,
     #[error("note_ref resolves to a different note than the one local_path was pulled from")]
     TrackingMismatch,
     #[error(
@@ -141,7 +146,9 @@ impl crate::reply::ToolError for PushNoteError {
         match self {
             Self::Access(error) => error.kind(),
             Self::LocalBody(error) => error.kind(),
-            Self::TrackingMismatch | Self::MalformedExpectedHash => ErrorKind::InvalidInput,
+            Self::TrackingMismatch
+            | Self::MalformedExpectedHash
+            | Self::OverwriteWithExpectedHash => ErrorKind::InvalidInput,
             Self::OverwriteConfirmationRequired => ErrorKind::ConfirmationRequired,
             Self::StatePersistenceAfterWrite { .. } => ErrorKind::PartialWrite,
             Self::SnapshotNotOurs { .. } => ErrorKind::LocalAccess,
@@ -171,8 +178,10 @@ pub(crate) async fn push_note(
         // workspace: the cross-check is about which note, and omitting
         // team_path should not make a team note look like a different one.
         let workspace = match input.workspace {
-            Workspace::Personal => note.workspace.clone(),
-            team @ Workspace::Team { .. } => team,
+            Workspace::Personal if !crate::note::reference::is_slug_url(note_ref) => {
+                note.workspace.clone()
+            }
+            other => other,
         };
         let resolution =
             crate::note::reference::resolve_note_ref(client, workspace, note_ref, input.refresh)
@@ -213,15 +222,18 @@ fn validate_and_read_local(
     files: &LocalFiles,
     input: &PushNoteInput,
 ) -> Result<String, PushNoteError> {
-    if input
-        .expected_remote_hash
-        .as_deref()
-        .is_some_and(|hash| !crate::sync::state::is_body_hash(hash))
-    {
+    if crate::hash::is_malformed(input.expected_remote_hash.as_deref()) {
         return Err(PushNoteError::MalformedExpectedHash);
     }
-    if matches!(input.strategy, PushStrategy::Overwrite) && !input.confirm {
-        return Err(PushNoteError::OverwriteConfirmationRequired);
+    if matches!(input.strategy, PushStrategy::Overwrite) {
+        if !input.confirm {
+            return Err(PushNoteError::OverwriteConfirmationRequired);
+        }
+        // An overwrite replaces whatever the remote holds, so a hash naming
+        // the remote a merge was built against would guard nothing.
+        if input.expected_remote_hash.is_some() {
+            return Err(PushNoteError::OverwriteWithExpectedHash);
+        }
     }
     Ok(read_local_body(
         files,
@@ -271,10 +283,9 @@ async fn push_resolved(
                 return Ok(Ok(output(&target, PushStatus::NothingToPush)));
             }
 
-            // Both sides changed to the same body, as after identical edits or
-            // a merge that settled on the remote: nothing to write, but the
-            // baseline moves there, or the next check reports a conflict.
-            ChangeState::Conflict if local_digest == remote_digest => {
+            // Nothing to write, but the baseline moves to the converged body,
+            // or the next check reports a conflict.
+            ChangeState::Converged => {
                 let result = output(&target, PushStatus::NothingToPush);
                 advance_state(files, tracked.state, &local, remote_timestamp)?;
                 return Ok(Ok(result));
@@ -313,6 +324,11 @@ async fn push_resolved(
         advance_state(files, tracked.state, &local, remote_timestamp)?;
         return Ok(Ok(result));
     }
+    // Only the local body is needed from here on. Holding the remote and the
+    // baseline through the write and its read-back would keep three copies
+    // of a large note alive at once.
+    drop(remote);
+    drop(tracked.baseline_body);
     let written = client
         .write_note_body(&note.workspace, &note.note_id, &local)
         .await?;
@@ -460,7 +476,10 @@ impl BoundedWriter {
         if self.truncated {
             self.bytes.extend_from_slice("…".as_bytes());
         }
-        String::from_utf8(self.bytes).expect("diff formatter writes valid UTF-8")
+        // The formatter writes whole `str` pieces and the cut lands on a
+        // character boundary, so this is valid UTF-8; lossy costs nothing
+        // and leaves no panic behind if that ever changes.
+        String::from_utf8_lossy(&self.bytes).into_owned()
     }
 }
 
@@ -864,7 +883,7 @@ mod tests {
         let files =
             crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
         let mut stale = input(&local_path, PushStrategy::Safe, false);
-        stale.expected_remote_hash = Some(crate::sync::state::body_hash("remote edit"));
+        stale.expected_remote_hash = Some(crate::hash::body_hash("remote edit"));
 
         let output = push_note(&fixture.client(), &files, stale)
             .await
@@ -911,7 +930,7 @@ mod tests {
         let files =
             crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
         let mut merged = input(&local_path, PushStrategy::Safe, false);
-        merged.expected_remote_hash = Some(crate::sync::state::body_hash("remote edit"));
+        merged.expected_remote_hash = Some(crate::hash::body_hash("remote edit"));
 
         let output = push_note(&fixture.client(), &files, merged)
             .await
@@ -921,7 +940,7 @@ mod tests {
         assert_eq!(output.status, PushStatus::Conflict);
         assert_eq!(
             output.remote_body_hash,
-            Some(crate::sync::state::body_hash("baseline"))
+            Some(crate::hash::body_hash("baseline"))
         );
         assert_eq!(fixture.finish().len(), 1, "nothing may be written");
     }
@@ -1036,6 +1055,33 @@ mod tests {
         fixture.finish();
     }
 
+    /// A file that is not UTF-8 text, or not a file at all, is refused
+    /// before any record is read or request made.
+    #[tokio::test]
+    async fn a_body_that_is_not_text_or_not_a_file_is_refused_before_network() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        let files = crate::fixture::unconfined_files(directory.path().join("state"));
+
+        let binary = directory.path().join("binary.md");
+        fs::write(&binary, [0xff, 0xfe, 0x00]).expect("binary fixture should write");
+        assert!(matches!(
+            push_note(&client, &files, input(&binary, PushStrategy::Safe, false)).await,
+            Err(PushNoteError::LocalBody(
+                crate::sync::LocalBodyError::NotUtf8
+            ))
+        ));
+
+        let folder = directory.path().join("folder.md");
+        fs::create_dir(&folder).expect("directory fixture should create");
+        assert!(matches!(
+            push_note(&client, &files, input(&folder, PushStrategy::Safe, false)).await,
+            Err(PushNoteError::LocalBody(
+                crate::sync::LocalBodyError::NotAFile
+            ))
+        ));
+    }
+
     #[tokio::test]
     async fn overwrite_requires_confirmation_before_network() {
         let directory = tempfile::tempdir().expect("temp directory should create");
@@ -1051,6 +1097,14 @@ mod tests {
             )
             .await,
             Err(PushNoteError::OverwriteConfirmationRequired)
+        ));
+
+        // A merge hash with an overwrite would guard nothing.
+        let mut with_hash = input(&local_path, PushStrategy::Overwrite, true);
+        with_hash.expected_remote_hash = Some(format!("sha256:{}", "0".repeat(64)));
+        assert!(matches!(
+            push_note(&client, &files, with_hash).await,
+            Err(PushNoteError::OverwriteWithExpectedHash)
         ));
     }
 

@@ -46,6 +46,10 @@ pub(crate) enum NoteRefError {
     Empty,
     #[error("note_ref URL must use https://hackmd.io and contain an ID or @owner/slug path")]
     InvalidUrl,
+    #[error(
+        "team_path {team_path:?} does not match the URL's owner @{owner}; omit team_path, since the URL names the workspace"
+    )]
+    WorkspaceMismatch { team_path: String, owner: String },
     #[error(transparent)]
     Api(#[from] HackmdError),
 }
@@ -55,7 +59,9 @@ impl crate::reply::ToolError for NoteRefError {
         use crate::reply::ErrorKind;
 
         match self {
-            Self::Empty | Self::InvalidUrl => ErrorKind::InvalidInput,
+            Self::Empty | Self::InvalidUrl | Self::WorkspaceMismatch { .. } => {
+                ErrorKind::InvalidInput
+            }
             Self::Api(error) => error.kind(),
         }
     }
@@ -77,6 +83,13 @@ pub(crate) async fn resolve_note_ref(
             note: ResolvedNoteRef { workspace, note_id },
         }),
         ParsedNoteRef::Scoped { owner, slug } => {
+            // A URL names its own workspace. A team_path that names another
+            // is a mistake to report, not a hint to drop.
+            if let Workspace::Team { team_path } = workspace
+                && team_path != owner
+            {
+                return Err(NoteRefError::WorkspaceMismatch { team_path, owner });
+            }
             let workspace = if *owner == *client.user_path(refresh).await? {
                 Workspace::Personal
             } else if client.has_team(&owner, refresh).await? {
@@ -302,9 +315,7 @@ mod tests {
         let client = fixture.client();
         let result = resolve_note_ref(
             &client,
-            Workspace::Team {
-                team_path: "ignored".to_owned(),
-            },
+            Workspace::Personal,
             "https://hackmd.io/@alice/slug",
             false,
         )
@@ -314,6 +325,27 @@ mod tests {
             matches!(result, NoteResolution::Resolved { note } if note.workspace == Workspace::Personal && note.note_id == "personal-id")
         );
         fixture.finish();
+    }
+
+    /// A `team_path` that contradicts the URL is refused before any request.
+    #[tokio::test]
+    async fn a_team_path_contradicting_the_url_is_refused() {
+        let client = crate::client::HackmdClient::new(crate::config::Config::for_tests())
+            .expect("client should build");
+        let error = resolve_note_ref(
+            &client,
+            Workspace::Team {
+                team_path: "other".to_owned(),
+            },
+            "https://hackmd.io/@alice/slug",
+            false,
+        )
+        .await
+        .expect_err("a contradicting team_path should be refused");
+        assert_eq!(
+            error.to_string(),
+            "team_path \"other\" does not match the URL's owner @alice; omit team_path, since the URL names the workspace"
+        );
     }
 
     #[tokio::test]

@@ -63,7 +63,9 @@ impl HackmdServer {
         annotations(
             title = "Update HackMD Folder",
             read_only_hint = false,
-            destructive_hint = false,
+            // A null clears a field for good, and child_order replaces part of
+            // a map other clients share.
+            destructive_hint = true,
             idempotent_hint = true,
             open_world_hint = true
         )

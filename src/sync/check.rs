@@ -5,8 +5,9 @@ use thiserror::Error;
 
 use crate::{
     client::{HackmdClient, HackmdError},
+    hash::{body_digest, body_hash_from_digest},
     local::{LocalAccessError, LocalFiles},
-    sync::state::{StateError, body_digest, body_hash_from_digest, timestamp_text},
+    sync::state::{StateError, timestamp_text},
     sync::{ChangeState, LocalBodyError, classify_changes, read_local_body},
 };
 
@@ -70,12 +71,10 @@ pub(crate) async fn check_note_sync(
     let (local_digest, remote_digest) =
         crate::local::offload(|| (body_digest(&local), body_digest(&remote)));
 
-    // Both sides changed to the same body, as a push whose write landed but
-    // whose state was not saved leaves them: in sync, as push agrees, and the
-    // next push moves the baseline there.
+    // Converged sides are in sync, as push agrees, and the next push moves
+    // the baseline there.
     let status = match classify_changes(&tracked.baseline_digest, &local_digest, &remote_digest) {
-        ChangeState::Conflict if local_digest == remote_digest => SyncStatus::InSync,
-        ChangeState::InSync => SyncStatus::InSync,
+        ChangeState::InSync | ChangeState::Converged => SyncStatus::InSync,
         ChangeState::LocalOnly => SyncStatus::LocalChanged,
         ChangeState::RemoteOnly => SyncStatus::RemoteChanged,
         ChangeState::Conflict => SyncStatus::Conflict,

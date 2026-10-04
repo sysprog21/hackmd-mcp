@@ -126,6 +126,10 @@ pub(crate) enum ChangeState {
     InSync,
     LocalOnly,
     RemoteOnly,
+    /// Both sides changed, to the same body: what identical edits, a merge
+    /// that settled on the remote, or a push whose write landed but whose
+    /// state was not saved all leave behind.
+    Converged,
     Conflict,
 }
 
@@ -138,6 +142,7 @@ pub(crate) fn classify_changes(
         (false, false) => ChangeState::InSync,
         (true, false) => ChangeState::LocalOnly,
         (false, true) => ChangeState::RemoteOnly,
+        (true, true) if local == remote => ChangeState::Converged,
         (true, true) => ChangeState::Conflict,
     }
 }
@@ -173,6 +178,7 @@ mod tests {
             (&baseline, &baseline, ChangeState::InSync),
             (&local, &baseline, ChangeState::LocalOnly),
             (&baseline, &remote, ChangeState::RemoteOnly),
+            (&local, &local, ChangeState::Converged),
             (&local, &remote, ChangeState::Conflict),
         ] {
             assert_eq!(

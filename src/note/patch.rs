@@ -26,7 +26,24 @@ pub(crate) enum PatchError {
     AnchorNotFound(String),
     #[error("patch hunk anchor @@ {0} matches more than one line")]
     AmbiguousAnchor(String),
+    #[error(
+        "patch is larger than {} KiB; send the new body as content instead",
+        PATCH_MAX_BYTES / 1024
+    )]
+    PatchTooLarge,
+    #[error(
+        "patch has more than {PATCH_MAX_HUNKS} hunks or {PATCH_MAX_OLD_LINES} context and removed lines; split it into several calls, or send the new body as content"
+    )]
+    TooMuchMatching,
 }
+
+/// Bounds on what a patch may ask of the matcher. Each hunk scans the whole
+/// body, and its old lines are compared at every position, so the work is
+/// the body's length times the hunk count plus their old lines: both are
+/// bounded across the whole patch, not per hunk.
+const PATCH_MAX_BYTES: usize = 1024 * 1024;
+const PATCH_MAX_HUNKS: usize = 100;
+const PATCH_MAX_OLD_LINES: usize = 1_000;
 
 impl crate::reply::ToolError for PatchError {
     fn kind(&self) -> crate::reply::ErrorKind {
@@ -78,6 +95,9 @@ pub(crate) fn apply_note_patch(
     patch: &str,
     expected_target: &str,
 ) -> Result<String, PatchError> {
+    if patch.len() > PATCH_MAX_BYTES {
+        return Err(PatchError::PatchTooLarge);
+    }
     let file_patch = parse_patch(patch)?;
     if file_patch.target != expected_target {
         return Err(PatchError::WrongTarget {
@@ -96,7 +116,9 @@ pub(crate) fn apply_note_patch(
     for hunk in file_patch.hunks {
         apply_hunk(&mut lines, hunk)?;
     }
-    Ok(format!("{bom}{}", join_lines(&lines, endings)))
+    let mut body = join_lines(&lines, endings);
+    body.insert_str(0, bom);
+    Ok(body)
 }
 
 /// Line endings of the body being patched. A body that uses one style keeps it.
@@ -174,6 +196,7 @@ fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
     let (target, hunk_lines) = update_section(&lines)?;
 
     let mut hunks = Vec::new();
+    let mut old_lines = 0;
     let mut current: Option<Hunk> = None;
 
     // A bare empty line is an empty context line whose leading space was
@@ -188,7 +211,7 @@ fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
             .filter(|rest| rest.is_empty() || rest.starts_with(' '))
         {
             if let Some(hunk) = current.take() {
-                push_hunk(&mut hunks, hunk)?;
+                push_hunk(&mut hunks, &mut old_lines, hunk)?;
             }
             let anchor = anchor.trim();
             current = Some(Hunk {
@@ -212,7 +235,7 @@ fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
             match current.take() {
                 Some(mut hunk) if !hunk.lines.is_empty() => {
                     hunk.at_end = true;
-                    push_hunk(&mut hunks, hunk)?;
+                    push_hunk(&mut hunks, &mut old_lines, hunk)?;
                 }
                 _ => {
                     return Err(PatchError::MalformedHunk(
@@ -243,7 +266,7 @@ fn parse_patch(patch: &str) -> Result<FilePatch, PatchError> {
         }
     }
     if let Some(hunk) = current {
-        push_hunk(&mut hunks, hunk)?;
+        push_hunk(&mut hunks, &mut old_lines, hunk)?;
     }
     if hunks.is_empty() {
         return Err(PatchError::MissingHunk);
@@ -273,9 +296,20 @@ fn is_line_range(text: &str) -> bool {
     ) && parts.next().is_none_or(|rest| rest.starts_with("@@"))
 }
 
-fn push_hunk(hunks: &mut Vec<Hunk>, hunk: Hunk) -> Result<(), PatchError> {
+/// Adds a parsed hunk, holding the patch to its matching budget as it goes,
+/// so a patch over it is refused before the rest of it is built.
+fn push_hunk(hunks: &mut Vec<Hunk>, old_lines: &mut usize, hunk: Hunk) -> Result<(), PatchError> {
     if hunk.lines.is_empty() {
         return Err(PatchError::MalformedHunk("hunk cannot be empty"));
+    }
+    // Only the new hunk is counted; `old_lines` carries the earlier ones.
+    *old_lines += hunk
+        .lines
+        .iter()
+        .filter(|line| !matches!(line, HunkLine::Add(_)))
+        .count();
+    if hunks.len() == PATCH_MAX_HUNKS || *old_lines > PATCH_MAX_OLD_LINES {
+        return Err(PatchError::TooMuchMatching);
     }
     hunks.push(hunk);
     Ok(())
@@ -393,6 +427,24 @@ mod tests {
 
     fn envelope(body: &str) -> String {
         format!("*** Begin Patch\n*** Update File: {TARGET}\n{body}\n*** End Patch")
+    }
+
+    #[test]
+    fn oversized_patches_and_hunks_are_refused() {
+        // Old lines are counted across hunks, so splitting does not evade it.
+        let split = format!("@@\n{}", "-a\n".repeat(super::PATCH_MAX_OLD_LINES / 2 + 1)).repeat(2);
+        let many = "@@\n a\n".repeat(super::PATCH_MAX_HUNKS + 1);
+        for body in [split, many] {
+            assert_eq!(
+                apply_note_patch("a", &envelope(&body), TARGET),
+                Err(PatchError::TooMuchMatching)
+            );
+        }
+        let huge = envelope(&format!("@@\n+{}", "x".repeat(super::PATCH_MAX_BYTES)));
+        assert_eq!(
+            apply_note_patch("a", &huge, TARGET),
+            Err(PatchError::PatchTooLarge)
+        );
     }
 
     #[test]

@@ -147,7 +147,7 @@ pub(crate) fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> 
         id: note.id,
         short_id: note.short_id,
         title: note.title,
-        body_hash: note.content.as_deref().map(crate::sync::state::body_hash),
+        body_hash: note.content.as_deref().map(crate::hash::body_hash),
         content: note.content,
         description: note.description,
         tags: note.tags,
