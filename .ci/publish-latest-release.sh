@@ -58,8 +58,10 @@ fi
 
 # "gh release create" uploads into a draft and publishes it last, so a failed
 # upload leaves a draft named "latest" behind, invisible to the lookups above.
-for id in $(gh api "repos/$GH_REPO/releases" --paginate \
-    --jq '.[] | select(.draft and .tag_name == "latest") | .id'); do
+# Captured first: a failed lookup inside the for list would not stop set -e.
+drafts=$(gh api "repos/$GH_REPO/releases" --paginate \
+    --jq '.[] | select(.draft and .tag_name == "latest") | .id')
+for id in $drafts; do
     gh api -X DELETE "repos/$GH_REPO/releases/$id" > /dev/null
 done
 
