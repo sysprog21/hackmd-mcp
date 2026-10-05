@@ -70,9 +70,11 @@ leading H1, and only then the `title` field. A folder move is not waited on:
 the result's `folder_placement_confirmed` says whether the read-back already
 shows the note there (`null` when no folder was asked for).
 
-No note PATCH is retried, even after a rate limit: its body was read or
-checked just before, and resending it after a backoff would overwrite edits
-made in the meantime. The error goes back to the agent, which reads again.
+No note PATCH is retried, even after a rate limit. Most carry a body read or
+checked just before (a patch, a push, a metadata update, `content` with
+`expected_hash`), and even a plain `content` replacement, which reads nothing
+first, would land after the backoff over edits made in the meantime. The
+error goes back to the agent, which reads again.
 
 Body edits are read back until HackMD shows them, because some writes become
 visible only after a delay. Folder updates and a new note's folder placement
