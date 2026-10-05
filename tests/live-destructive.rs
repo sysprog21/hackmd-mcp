@@ -14,7 +14,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::FutureExt;
-use reqwest::{Method, StatusCode};
+use reqwest::Method;
 use serde_json::{Value, json};
 
 #[path = "support/liveapi.rs"]
@@ -25,6 +25,13 @@ use serde_json::{Value, json};
 mod liveapi;
 
 use liveapi::LiveApi;
+
+/// A valid 1x1 RGBA PNG (one red pixel), the smallest image `HackMD` accepts.
+const PNG_PROBE: [u8; 70] = [
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
+    0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 8, 215, 99, 248, 207, 192, 240, 31, 0, 5,
+    0, 1, 255, 114, 156, 82, 103, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
 
 #[derive(Default)]
 struct Fixtures {
@@ -318,7 +325,7 @@ async fn personal_crud_folder_order_trash_and_restore() {
 #[tokio::test]
 #[ignore = "requires explicit destructive HackMD live-test team environment"]
 #[allow(clippy::too_many_lines, reason = "one guarded team contract probe")]
-async fn team_folder_updates_and_image_route_are_measured() {
+async fn team_folder_updates_and_image_upload_are_measured() {
     let api = LiveApi::destructive_from_env();
     let team_path = std::env::var("HACKMD_LIVE_TEST_TEAM_PATH")
         .expect("set an isolated HACKMD_LIVE_TEST_TEAM_PATH for the team probe");
@@ -483,7 +490,9 @@ async fn team_folder_updates_and_image_route_are_measured() {
                 &["teams", &team_path, "notes"],
                 Some(&json!({
                     "title": format!("codex-live-team-image-{suffix}"),
-                    "content": "# image probe"
+                    "content": "# image probe",
+                    "readPermission": "owner",
+                    "writePermission": "owner"
                 })),
             )
             .await;
@@ -497,28 +506,42 @@ async fn team_folder_updates_and_image_route_are_measured() {
             suffix,
         )
         .await;
-        let part = reqwest::multipart::Part::bytes(vec![
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
-            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 8, 215, 99, 248, 207,
-            192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
-            96, 130,
-        ])
-        .file_name("probe.png")
-        .mime_str("image/png")
-        .expect("static MIME type should parse");
         let status = api
-            .http
-            .post(api.url(&["teams", &team_path, "notes", &created_note_id, "images"]))
-            .bearer_auth(&api.token)
-            .multipart(reqwest::multipart::Form::new().part("image", part))
+            .upload_png(
+                &["teams", &team_path, "notes", &created_note_id, "images"],
+                PNG_PROBE.to_vec(),
+            )
+            .await
+            .status;
+        eprintln!("measured (team): team-prefixed image route answers {status}");
+
+        // The route production uses for every note, team or personal.
+        let response = api
+            .upload_png(&["notes", &created_note_id, "images"], PNG_PROBE.to_vec())
+            .await;
+        let (status, body) = (response.status, response.value.unwrap_or_default());
+        assert!(
+            status.is_success(),
+            "plain image route refused a team note ({status}): {body}; \
+             hackmd_upload_note_image must refuse team notes again"
+        );
+        let link = body["data"]["link"]
+            .as_str()
+            .expect("upload reply should carry data.link");
+
+        // The note is readable only by its owner, so the image must not be. A
+        // fresh client carries no token and no cookie.
+        let anonymous = reqwest::Client::new()
+            .get(link)
             .send()
             .await
-            .expect("team upload probe should complete")
+            .expect("anonymous image fetch should complete")
             .status();
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "team image route unexpectedly exists; production support must be revisited"
+        eprintln!("measured (team): anonymous fetch of a private note's image answers {anonymous}");
+        assert!(
+            !anonymous.is_success(),
+            "an image on an owner-only team note is publicly readable ({anonymous}); \
+             the upload tool must not describe its links as private"
         );
     })
     .catch_unwind()

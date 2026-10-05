@@ -66,9 +66,9 @@ startup and a pull refuses to write files coding agents load as instructions:
 effort, not a boundary (`CLAUDE.md` can import any Markdown file), so set a
 root if an agent reads the tree you pull into.
 
-`hackmd_upload_note_image` publishes a local file at a public link, so it
-requires a root set in the server's own environment, not only in `.env`, and
-refuses every upload otherwise.
+`hackmd_upload_note_image` puts a local file behind a HackMD link, public
+whenever the note is guest-readable, so it requires a root set in the server's
+own environment, not only in `.env`, and refuses every upload otherwise.
 
 ## Sync state directory
 

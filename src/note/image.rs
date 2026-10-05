@@ -21,13 +21,13 @@ const IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 #[serde(deny_unknown_fields)]
 pub(crate) struct UploadNoteImageInput {
     /// Accepted, as on every other tool, so older callers are not rejected
-    /// outright; a team here is refused like any team note. Not advertised.
+    /// outright. Not advertised: the upload route is the same for every note,
+    /// so this only cross-checks the owner of an `@owner/slug` URL.
     #[serde(default, rename = "team_path", alias = "workspace")]
     #[schemars(skip)]
     pub(crate) workspace: Workspace,
-    /// Internal ID of a personal note, `hackmd.io/<id>`, or a
-    /// `hackmd.io/@owner/slug` URL. Only personal notes accept uploads, so a
-    /// URL that names a team note is refused.
+    /// Internal note ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
+    /// Personal and team notes both accept uploads.
     pub(crate) note_ref: String,
     /// Bypass the 60-second account and note-list caches when resolving an
     /// `@owner/slug` URL.
@@ -63,8 +63,6 @@ pub(crate) enum UploadNoteImageError {
         IMAGE_WARNING_BYTES / 1024 / 1024
     )]
     ConfirmationRequired { size_bytes: u64 },
-    #[error("team image upload is not documented by HackMD; use a personal-workspace note")]
-    TeamUnsupported,
     #[error(transparent)]
     Reference(#[from] NoteRefError),
     #[error(transparent)]
@@ -77,9 +75,7 @@ impl crate::reply::ToolError for UploadNoteImageError {
 
         match self {
             Self::Access(error) => error.kind(),
-            Self::InvalidFile | Self::UnsupportedFormat | Self::TeamUnsupported => {
-                ErrorKind::InvalidInput
-            }
+            Self::InvalidFile | Self::UnsupportedFormat => ErrorKind::InvalidInput,
             Self::TooLarge { .. } => ErrorKind::TooLarge,
             Self::ConfirmationRequired { .. } => ErrorKind::ConfirmationRequired,
             Self::Reference(error) => error.kind(),
@@ -168,9 +164,9 @@ pub(crate) async fn upload_note_image(
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
-    if matches!(note.workspace, Workspace::Team { .. }) {
-        return Err(UploadNoteImageError::TeamUnsupported);
-    }
+
+    // Both personal and team notes upload through the plain /notes/{id}/images
+    // route; image visibility then follows the note's own read permission.
     let file_name = input
         .image_path
         .file_name()
@@ -297,7 +293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_relative_team_and_oversize_inputs_before_upload() {
+    async fn rejects_relative_and_oversize_inputs_before_upload() {
         let client = HackmdClient::new(Config::for_tests()).expect("client should build");
         let relative = serde_json::from_value(json!({
             "note_ref": "id",
@@ -347,24 +343,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_older_team_workspace_argument_is_accepted_then_refused() {
+    async fn a_team_note_by_id_uploads_through_the_plain_route() {
         let mut image = tempfile::NamedTempFile::new().expect("temp image should create");
         image.write_all(PNG_FIXTURE).expect("image should write");
+
+        // A bare id resolves without a lookup, so the team_path is carried but
+        // not needed: the note uploads via the same route as a personal note.
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "POST",
+            "/v1/notes/team-note/images",
+            200,
+            r#"{"data":{"link":"https://hackmd.io/_uploads/team.png"}}"#,
+        )]);
         let input: UploadNoteImageInput = serde_json::from_value(serde_json::json!({
-            "workspace": {"kind": "team", "team_path": "core"},
-            "note_ref": "id",
+            "team_path": "core",
+            "note_ref": "team-note",
             "image_path": image.path()
         }))
-        .expect("the older workspace argument should still parse");
-        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
-        assert!(matches!(
-            upload_note_image(&client, &files(), input).await,
-            Err(UploadNoteImageError::TeamUnsupported)
-        ));
+        .expect("the team_path argument should parse");
+        let output = upload_note_image(&fixture.client(), &files(), input)
+            .await
+            .expect("a team note should upload")
+            .expect("a bare id resolves directly");
+        assert_eq!(output.link, "https://hackmd.io/_uploads/team.png");
+        fixture.finish();
     }
 
     #[tokio::test]
-    async fn a_url_naming_a_team_note_is_refused_before_upload() {
+    async fn a_url_naming_a_team_note_resolves_then_uploads() {
         let mut image = tempfile::NamedTempFile::new().expect("temp image should create");
         image.write_all(PNG_FIXTURE).expect("image should write");
         let fixture = SequenceServer::spawn_scenarios([
@@ -386,6 +392,12 @@ mod tests {
                 200,
                 r#"[{"id":"team-id","title":"Team","shortId":"slug"}]"#,
             ),
+            Scenario::new(
+                "POST",
+                "/v1/notes/team-id/images",
+                200,
+                r#"{"data":{"link":"https://hackmd.io/_uploads/url.png"}}"#,
+            ),
         ]);
         let input = UploadNoteImageInput {
             workspace: crate::models::Workspace::Personal,
@@ -394,10 +406,11 @@ mod tests {
             image_path: image.path().to_path_buf(),
             confirm_large_file: false,
         };
-        assert!(matches!(
-            upload_note_image(&fixture.client(), &files(), input).await,
-            Err(UploadNoteImageError::TeamUnsupported)
-        ));
+        let output = upload_note_image(&fixture.client(), &files(), input)
+            .await
+            .expect("a team note named by URL should upload")
+            .expect("the slug should resolve");
+        assert_eq!(output.link, "https://hackmd.io/_uploads/url.png");
         fixture.finish();
     }
 

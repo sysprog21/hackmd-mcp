@@ -132,10 +132,13 @@ file or the note.
   so check `folder_ids` from `hackmd_get_note` first if that matters.
 - `hackmd_delete_note` with `restore: true` brings a personal note back from
   trash. Team deletions cannot be restored.
-- `hackmd_upload_note_image` uploads a local image to a personal note and
-  returns its public CDN link. It needs a workspace root (see
-  [configuration.md](configuration.md#workspace-root)); files over 5 MiB need
-  `confirm_large_file: true` and files over 10 MiB are refused.
+- `hackmd_upload_note_image` uploads a local image to a personal or team note
+  and returns its CDN link. The link is public whenever the note is
+  guest-readable; an anonymous fetch of an image on an owner-only note was
+  refused when measured, but treat that as observed, not promised. It needs a
+  workspace root (see [configuration.md](configuration.md#workspace-root));
+  files over 5 MiB need `confirm_large_file: true` and files over 10 MiB are
+  refused.
 
 ## Errors
 
