@@ -44,9 +44,12 @@ pub(crate) struct CreateNoteInput {
     pub(crate) read_permission: Option<NotePermission>,
     /// Who may edit the note; omitted preserves the workspace default.
     pub(crate) write_permission: Option<NotePermission>,
-    /// Who may comment; omitted preserves the workspace default.
+    /// The `HackMD` API cannot set this; supplying it is refused with an
+    /// explanatory error. Change comment permission in the `HackMD` web UI.
     pub(crate) comment_permission: Option<CommentPermission>,
-    /// Who may suggest edits; omitted preserves the workspace default.
+    /// The `HackMD` API cannot set this; supplying it is refused with an
+    /// explanatory error. Change suggest-edit permission in the `HackMD` web
+    /// UI.
     pub(crate) suggest_edit_permission: Option<SuggestEditPermission>,
     /// Folder ID for placement. The server verifies POST placement and uses
     /// PATCH only as a compatibility fallback.
@@ -91,9 +94,12 @@ pub(crate) struct UpdateNoteInput {
     #[serde(default, deserialize_with = "deserialize_patch_field")]
     #[schemars(with = "Option<String>")]
     parent_folder_id: PatchField,
-    /// Unsupported on PATCH; supplying this produces an explanatory tool error.
+    /// The `HackMD` API cannot set this; supplying it is refused with an
+    /// explanatory error. Change comment permission in the `HackMD` web UI.
     pub(crate) comment_permission: Option<CommentPermission>,
-    /// Unsupported on PATCH; supplying this produces an explanatory tool error.
+    /// The `HackMD` API cannot set this; supplying it is refused with an
+    /// explanatory error. Change suggest-edit permission in the `HackMD` web
+    /// UI.
     pub(crate) suggest_edit_permission: Option<SuggestEditPermission>,
     /// The default way to edit the body: one patch applied to the current
     /// body only when every hunk's context matches exactly once, then
@@ -195,9 +201,9 @@ pub(crate) struct DeleteNoteOutput {
 #[derive(Debug, Error)]
 pub(crate) enum CrudError {
     #[error(
-        "comment_permission and suggest_edit_permission are create-only; HackMD PATCH does not support changing them"
+        "comment_permission and suggest_edit_permission cannot be set through the HackMD API (neither on create nor on PATCH); change them in the HackMD web UI"
     )]
-    UnsupportedPatchPermissions,
+    UnsupportedPermissionField,
     #[error("patch cannot be combined with other fields; send it in a call of its own")]
     PatchWithFields,
     #[error("nothing to update: give a patch, content, or the metadata fields to change")]
@@ -241,7 +247,7 @@ impl crate::reply::ToolError for CrudError {
         use crate::reply::ErrorKind;
 
         match self {
-            Self::UnsupportedPatchPermissions
+            Self::UnsupportedPermissionField
             | Self::PatchWithFields
             | Self::NothingToUpdate
             | Self::MalformedExpectedHash
@@ -300,6 +306,11 @@ pub(crate) async fn create_note(
     client: &HackmdClient,
     input: CreateNoteInput,
 ) -> Result<CreateNoteOutput, CrudError> {
+    // The HackMD API silently ignores these on create and rejects them on
+    // PATCH, so refuse rather than appear to set something that never takes.
+    if input.comment_permission.is_some() || input.suggest_edit_permission.is_some() {
+        return Err(CrudError::UnsupportedPermissionField);
+    }
     let folder = input.parent_folder_id;
     let mut payload = CreateNoteRequest {
         title: input.title,
@@ -308,8 +319,6 @@ pub(crate) async fn create_note(
         description: input.description,
         read_permission: input.read_permission,
         write_permission: input.write_permission,
-        comment_permission: input.comment_permission,
-        suggest_edit_permission: input.suggest_edit_permission,
         permalink: input.permalink,
         parent_folder_id: folder.clone(),
         note_features: input.note_features,
@@ -413,7 +422,7 @@ pub(crate) async fn update_note(
         return Err(CrudError::NothingToUpdate);
     }
     if input.comment_permission.is_some() || input.suggest_edit_permission.is_some() {
-        return Err(CrudError::UnsupportedPatchPermissions);
+        return Err(CrudError::UnsupportedPermissionField);
     }
     validate_permission_order(input.read_permission, input.write_permission)?;
     let resolution = crate::note::reference::resolve_note_ref(
@@ -703,16 +712,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_patch_permissions_fail_before_resolution_or_network() {
+    async fn unsupported_permission_fields_fail_before_resolution_or_network() {
         let client = HackmdClient::new(Config::for_tests()).expect("client should build");
-        let input: UpdateNoteInput = serde_json::from_value(json!({
+        // Refused on update (PATCH rejects them) ...
+        let update: UpdateNoteInput = serde_json::from_value(json!({
             "note_ref": "id",
             "comment_permission": "everyone"
         }))
         .expect("unsupported permission remains structurally valid");
         assert!(matches!(
-            update_note(&client, input).await,
-            Err(CrudError::UnsupportedPatchPermissions)
+            update_note(&client, update).await,
+            Err(CrudError::UnsupportedPermissionField)
+        ));
+        // ... and on create (the API silently drops them), so neither pretends.
+        let create: CreateNoteInput = serde_json::from_value(json!({
+            "suggest_edit_permission": "owners"
+        }))
+        .expect("unsupported permission remains structurally valid");
+        assert!(matches!(
+            create_note(&client, create).await,
+            Err(CrudError::UnsupportedPermissionField)
         ));
     }
 

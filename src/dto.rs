@@ -77,10 +77,6 @@ pub(crate) struct CreateNoteRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) write_permission: Option<NotePermission>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) comment_permission: Option<CommentPermission>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) suggest_edit_permission: Option<SuggestEditPermission>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) permalink: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) parent_folder_id: Option<String>,
@@ -594,8 +590,6 @@ mod tests {
             description: Some("Description".to_owned()),
             read_permission: Some(NotePermission::Guest),
             write_permission: Some(NotePermission::Owner),
-            comment_permission: Some(CommentPermission::Everyone),
-            suggest_edit_permission: Some(SuggestEditPermission::SignedInUsers),
             permalink: Some("custom-link".to_owned()),
             parent_folder_id: Some("folder-id".to_owned()),
             note_features: Some(BTreeMap::from([("math".to_owned(), json!(true))])),
@@ -614,8 +608,6 @@ mod tests {
                 "description": "Description",
                 "readPermission": "guest",
                 "writePermission": "owner",
-                "commentPermission": "everyone",
-                "suggestEditPermission": "signed_in_users",
                 "permalink": "custom-link",
                 "parentFolderId": "folder-id",
                 "noteFeatures": {"math": true},
