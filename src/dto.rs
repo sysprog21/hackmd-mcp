@@ -77,10 +77,6 @@ pub(crate) struct CreateNoteRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) write_permission: Option<NotePermission>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) comment_permission: Option<CommentPermission>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) suggest_edit_permission: Option<SuggestEditPermission>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) permalink: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) parent_folder_id: Option<String>,
@@ -313,8 +309,10 @@ pub(crate) struct NoteResponse {
     pub(crate) permalink: Option<String>,
     pub(crate) user_path: Option<String>,
     pub(crate) team_path: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_null_default")]
-    pub(crate) folder_paths: Vec<FolderPathResponse>,
+    /// `None` when the read did not carry the field (list endpoints never
+    /// do), so "no folders" is never inferred from a field that was absent.
+    #[serde(default)]
+    pub(crate) folder_paths: Option<Vec<FolderPathResponse>>,
 }
 
 /// `null` read as the default, as a missing field already is with
@@ -509,7 +507,7 @@ mod tests {
         .expect("nulls must not fail the note");
         assert_eq!(note.title, "");
         assert_eq!(note.tags, Vec::<String>::new());
-        assert_eq!(note.folder_paths, []);
+        assert_eq!(note.folder_paths, None);
         let editor = note
             .last_change_user
             .expect("a null field keeps the editor");
@@ -594,8 +592,6 @@ mod tests {
             description: Some("Description".to_owned()),
             read_permission: Some(NotePermission::Guest),
             write_permission: Some(NotePermission::Owner),
-            comment_permission: Some(CommentPermission::Everyone),
-            suggest_edit_permission: Some(SuggestEditPermission::SignedInUsers),
             permalink: Some("custom-link".to_owned()),
             parent_folder_id: Some("folder-id".to_owned()),
             note_features: Some(BTreeMap::from([("math".to_owned(), json!(true))])),
@@ -614,8 +610,6 @@ mod tests {
                 "description": "Description",
                 "readPermission": "guest",
                 "writePermission": "owner",
-                "commentPermission": "everyone",
-                "suggestEditPermission": "signed_in_users",
                 "permalink": "custom-link",
                 "parentFolderId": "folder-id",
                 "noteFeatures": {"math": true},
@@ -758,7 +752,13 @@ mod tests {
         }))
         .expect("note fixture should deserialize");
         assert_eq!(note.read_permission, Some(NotePermission::Guest));
-        assert_eq!(note.folder_paths[0].id, "folder-id");
+        assert_eq!(
+            note.folder_paths
+                .as_deref()
+                .expect("folderPaths should be read")[0]
+                .id,
+            "folder-id"
+        );
         assert_eq!(note.title_updated_at, Some(2));
         assert_eq!(note.published_at, Some(4));
     }

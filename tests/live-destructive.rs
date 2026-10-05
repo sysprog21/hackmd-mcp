@@ -14,7 +14,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::FutureExt;
-use reqwest::{Method, StatusCode};
+use reqwest::Method;
 use serde_json::{Value, json};
 
 #[path = "support/liveapi.rs"]
@@ -25,6 +25,44 @@ use serde_json::{Value, json};
 mod liveapi;
 
 use liveapi::LiveApi;
+
+/// A valid 1x1 RGBA PNG (one red pixel), the smallest image `HackMD` accepts.
+const PNG_PROBE: [u8; 70] = [
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
+    0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 8, 215, 99, 248, 207, 192, 240, 31, 0, 5,
+    0, 1, 255, 114, 156, 82, 103, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
+/// `PNG_PROBE` grown to `size` bytes by a private ancillary chunk, which a
+/// decoder must skip. The file stays a valid PNG, so a refusal measures the
+/// size, not the format.
+fn padded_png(size: usize) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        !bytes.iter().fold(u32::MAX, |crc, &byte| {
+            (0..8).fold(crc ^ u32::from(byte), |crc, _| {
+                (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg())
+            })
+        })
+    }
+    const CHUNK_OVERHEAD: usize = 12;
+    // The CRC every PNG ends with, as a check on the one computed here.
+    assert_eq!(crc32(b"IEND"), 0xAE42_6082);
+    let (head, iend) = PNG_PROBE.split_at(PNG_PROBE.len() - CHUNK_OVERHEAD);
+    let padding = size - PNG_PROBE.len() - CHUNK_OVERHEAD;
+    let mut chunk = b"prVt".to_vec();
+    chunk.resize(4 + padding, 0);
+    let mut png = head.to_vec();
+    png.extend_from_slice(
+        &u32::try_from(padding)
+            .expect("padding fits a chunk")
+            .to_be_bytes(),
+    );
+    png.extend_from_slice(&chunk);
+    png.extend_from_slice(&crc32(&chunk).to_be_bytes());
+    png.extend_from_slice(iend);
+    assert_eq!(png.len(), size);
+    png
+}
 
 #[derive(Default)]
 struct Fixtures {
@@ -258,6 +296,21 @@ async fn personal_crud_folder_order_trash_and_restore() {
             "note POST did not preserve the requested folder assignment"
         );
 
+        // The create above sent no permissions, so this is what HackMD applies
+        // by default; hackmd_create_note tells agents not to rely on it.
+        eprintln!(
+            "measured (personal): a create without permissions reads back read {} / write {}",
+            post_read["readPermission"], post_read["writePermission"]
+        );
+
+        // The tool allows 5 to 10 MiB with confirmation; is that range real?
+        let large = padded_png(7 * 1024 * 1024);
+        let status = api
+            .upload_png(&["notes", &note_id, "images"], large)
+            .await
+            .status;
+        eprintln!("measured (personal): a 7 MiB image upload answers {status}");
+
         let edited = format!("# Codex live {suffix}\n\nedited\n");
         api.empty_ok(
             Method::PATCH,
@@ -318,7 +371,7 @@ async fn personal_crud_folder_order_trash_and_restore() {
 #[tokio::test]
 #[ignore = "requires explicit destructive HackMD live-test team environment"]
 #[allow(clippy::too_many_lines, reason = "one guarded team contract probe")]
-async fn team_folder_updates_and_image_route_are_measured() {
+async fn team_folder_updates_and_image_upload_are_measured() {
     let api = LiveApi::destructive_from_env();
     let team_path = std::env::var("HACKMD_LIVE_TEST_TEAM_PATH")
         .expect("set an isolated HACKMD_LIVE_TEST_TEAM_PATH for the team probe");
@@ -483,12 +536,25 @@ async fn team_folder_updates_and_image_route_are_measured() {
                 &["teams", &team_path, "notes"],
                 Some(&json!({
                     "title": format!("codex-live-team-image-{suffix}"),
-                    "content": "# image probe"
+                    "content": "# image probe",
+                    "readPermission": "owner",
+                    "writePermission": "owner"
                 })),
             )
             .await;
         let created_note_id = created["id"].as_str().expect("team note ID").to_owned();
         note_id = Some(created_note_id.clone());
+
+        // hackmd_create_note reports a permission the note does not show; the
+        // image privacy check below also depends on this one having taken.
+        assert!(
+            api.poll_json(&["teams", &team_path, "notes", &created_note_id], |note| {
+                note["readPermission"] == "owner" && note["writePermission"] == "owner"
+            })
+            .await
+            .is_some(),
+            "a team create dropped the permissions it was sent"
+        );
         probe_partial_note_patch(
             &api,
             &["teams", &team_path, "notes", &created_note_id],
@@ -497,28 +563,42 @@ async fn team_folder_updates_and_image_route_are_measured() {
             suffix,
         )
         .await;
-        let part = reqwest::multipart::Part::bytes(vec![
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
-            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 8, 215, 99, 248, 207,
-            192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
-            96, 130,
-        ])
-        .file_name("probe.png")
-        .mime_str("image/png")
-        .expect("static MIME type should parse");
         let status = api
-            .http
-            .post(api.url(&["teams", &team_path, "notes", &created_note_id, "images"]))
-            .bearer_auth(&api.token)
-            .multipart(reqwest::multipart::Form::new().part("image", part))
+            .upload_png(
+                &["teams", &team_path, "notes", &created_note_id, "images"],
+                PNG_PROBE.to_vec(),
+            )
+            .await
+            .status;
+        eprintln!("measured (team): team-prefixed image route answers {status}");
+
+        // The route production uses for every note, team or personal.
+        let response = api
+            .upload_png(&["notes", &created_note_id, "images"], PNG_PROBE.to_vec())
+            .await;
+        let (status, body) = (response.status, response.value.unwrap_or_default());
+        assert!(
+            status.is_success(),
+            "plain image route refused a team note ({status}): {body}; \
+             hackmd_upload_note_image must refuse team notes again"
+        );
+        let link = body["data"]["link"]
+            .as_str()
+            .expect("upload reply should carry data.link");
+
+        // The note is readable only by its owner, so the image must not be. A
+        // fresh client carries no token and no cookie.
+        let anonymous = reqwest::Client::new()
+            .get(link)
             .send()
             .await
-            .expect("team upload probe should complete")
+            .expect("anonymous image fetch should complete")
             .status();
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "team image route unexpectedly exists; production support must be revisited"
+        eprintln!("measured (team): anonymous fetch of a private note's image answers {anonymous}");
+        assert!(
+            !anonymous.is_success(),
+            "an image on an owner-only team note is publicly readable ({anonymous}); \
+             the upload tool must not describe its links as private"
         );
     })
     .catch_unwind()

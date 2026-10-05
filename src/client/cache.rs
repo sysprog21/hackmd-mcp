@@ -383,10 +383,12 @@ fn note_heap_bytes(note: &NoteResponse) -> usize {
             + user.photo.capacity()
             + optional(user.biography.as_ref())
     });
-    let folders = note.folder_paths.iter().fold(
-        note.folder_paths.capacity() * std::mem::size_of::<crate::dto::FolderPathResponse>(),
-        |sum, folder| sum.saturating_add(folder.id.capacity()),
-    );
+    let folders = note.folder_paths.as_ref().map_or(0, |paths| {
+        paths.iter().fold(
+            paths.capacity() * std::mem::size_of::<crate::dto::FolderPathResponse>(),
+            |sum, folder| sum.saturating_add(folder.id.capacity()),
+        )
+    });
     strings
         .saturating_add(tags)
         .saturating_add(user)

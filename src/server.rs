@@ -604,29 +604,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_tool_explains_create_only_permissions() {
+    async fn note_tools_refuse_unsettable_permission_fields() {
         let server = HackmdServer::new(
             Arc::new(
                 HackmdClient::new(Config::for_tests()).expect("test client should be constructed"),
             ),
             test_files(),
         );
-        let input = serde_json::from_value(json!({
+        let update = serde_json::from_value(json!({
             "note_ref": "id",
             "suggest_edit_permission": "owners"
         }))
-        .expect("input should deserialize");
-        let result = server
-            .update_note(rmcp::handler::server::wrapper::Parameters(input))
-            .await;
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(
-            result.content[0]
-                .as_text()
-                .expect("error should be text")
-                .text,
-            "comment_permission and suggest_edit_permission are create-only; HackMD PATCH does not support changing them"
-        );
+        .expect("update input should deserialize");
+        let create = serde_json::from_value(json!({"comment_permission": "everyone"}))
+            .expect("create input should deserialize");
+        for result in [
+            server
+                .update_note(rmcp::handler::server::wrapper::Parameters(update))
+                .await,
+            server
+                .create_note(rmcp::handler::server::wrapper::Parameters(create))
+                .await,
+        ] {
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(
+                result.content[0]
+                    .as_text()
+                    .expect("error should be text")
+                    .text,
+                "comment_permission and suggest_edit_permission cannot be set through the HackMD API (neither on create nor on PATCH); change them in the HackMD web UI"
+            );
+            let meta = result.meta.expect("error should have metadata").0;
+            assert_eq!(meta["error_kind"], "invalid_input");
+        }
     }
 
     #[tokio::test]

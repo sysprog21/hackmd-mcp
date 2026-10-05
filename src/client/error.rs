@@ -228,7 +228,7 @@ pub(crate) enum HackmdError {
         limit_mib: usize,
     },
     #[error(
-        "POST {path}: HackMD rejected the image as too large (413); resize it below 5 MB and retry"
+        "POST {path}: HackMD rejected the image as too large (413); resize it smaller and retry; HackMD does not document its limit"
     )]
     ImageTooLarge { path: String },
     #[error("team workspace {team_path:?} is not available to this HackMD account")]

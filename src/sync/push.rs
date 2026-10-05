@@ -37,7 +37,8 @@ pub(crate) struct PushNoteInput {
     pub(crate) note_ref: Option<String>,
     /// Team path (from `hackmd_get_me`) for a direct internal `note_ref`.
     /// Omitted, the tracked note's own workspace is assumed; `@owner/slug`
-    /// URLs name their own.
+    /// URLs name their own. Without `note_ref`, one naming another workspace
+    /// than the sync record is refused.
     #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
     /// Bypass the 60-second account and note-list caches when resolving an
@@ -128,6 +129,10 @@ pub(crate) enum PushNoteError {
     #[error("note_ref resolves to a different note than the one local_path was pulled from")]
     TrackingMismatch,
     #[error(
+        "team_path names a different workspace than the one local_path was pulled from; the sync record names the note, so omit team_path"
+    )]
+    TrackedWorkspaceMismatch,
+    #[error(
         "expected_remote_hash must be the remote_body_hash a conflict reported: sha256: and 64 lowercase hex digits"
     )]
     MalformedExpectedHash,
@@ -160,6 +165,7 @@ impl crate::reply::ToolError for PushNoteError {
             Self::Access(error) => error.kind(),
             Self::LocalBody(error) => error.kind(),
             Self::TrackingMismatch
+            | Self::TrackedWorkspaceMismatch
             | Self::MalformedExpectedHash
             | Self::OverwriteWithExpectedHash => ErrorKind::InvalidInput,
             Self::OverwriteConfirmationRequired => ErrorKind::ConfirmationRequired,
@@ -186,6 +192,16 @@ pub(crate) async fn push_note(
         workspace: tracked.state.workspace.clone(),
         note_id: tracked.state.internal_id.clone(),
     };
+
+    // Without note_ref the record names the note. A team_path that agrees with
+    // it is redundant but harmless, as it always was; one that names another
+    // workspace means the caller has the wrong file or note in mind.
+    if input.note_ref.is_none()
+        && input.workspace != Workspace::Personal
+        && input.workspace != note.workspace
+    {
+        return Err(PushNoteError::TrackedWorkspaceMismatch);
+    }
     if let Some(note_ref) = input.note_ref.as_deref() {
         // A bare note ID without team_path is read in the tracked note's own
         // workspace: the cross-check is about which note, and omitting
@@ -1170,6 +1186,54 @@ mod tests {
             push_note(&client, &files, with_hash).await,
             Err(PushNoteError::OverwriteWithExpectedHash)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_team_path_without_note_ref_is_refused_only_when_it_disagrees() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "local").expect("local fixture should write");
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        let team = |team_path: &str| Workspace::Team {
+            team_path: team_path.to_owned(),
+        };
+        let pushing = |workspace, refresh| PushNoteInput {
+            workspace,
+            refresh,
+            ..input(&local_path, PushStrategy::Safe, false)
+        };
+        // A stray team on a personal note, and another team on a team note.
+        for (tracked, stray) in [(Workspace::Personal, "core"), (team("core"), "other")] {
+            let state = tempfile::tempdir().expect("temp directory should create");
+            let files = crate::fixture::tracked_files_in(
+                tracked,
+                state.path(),
+                "note-id",
+                &local_path,
+                "baseline",
+            );
+            assert!(matches!(
+                push_note(&client, &files, pushing(team(stray), false)).await,
+                Err(PushNoteError::TrackedWorkspaceMismatch)
+            ));
+        }
+
+        let files = crate::fixture::tracked_files_in(
+            team("core"),
+            directory.path(),
+            "note-id",
+            &local_path,
+            "baseline",
+        );
+
+        // The record's own team and an unused refresh go through, as they did
+        // before the check existed: they get as far as the network.
+        for (workspace, refresh) in [(team("core"), false), (Workspace::Personal, true)] {
+            assert!(matches!(
+                push_note(&client, &files, pushing(workspace, refresh)).await,
+                Err(PushNoteError::Api(_))
+            ));
+        }
     }
 
     #[tokio::test]

@@ -108,6 +108,21 @@ impl LiveApi {
         self.send(request).await
     }
 
+    /// POSTs `bytes` to an image route as the multipart `image` field the
+    /// upload tool sends.
+    pub(crate) async fn upload_png(&self, segments: &[&str], bytes: Vec<u8>) -> LiveResponse {
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name("probe.png")
+            .mime_str("image/png")
+            .expect("static MIME type should parse");
+        let request = self
+            .http
+            .post(self.url(segments))
+            .bearer_auth(&self.token)
+            .multipart(reqwest::multipart::Form::new().part("image", part));
+        self.send(request).await
+    }
+
     async fn send(&self, request: reqwest::RequestBuilder) -> LiveResponse {
         let response = request
             .send()
