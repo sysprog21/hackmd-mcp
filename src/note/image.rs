@@ -429,4 +429,33 @@ mod tests {
         assert!(error.contains("resize it below 5 MB"));
         fixture.finish();
     }
+
+    #[tokio::test]
+    async fn an_unreadable_upload_reply_stays_upstream() {
+        use crate::reply::{ErrorKind, ToolError as _};
+
+        let mut image = tempfile::NamedTempFile::new().expect("temp image should create");
+        image.write_all(PNG_FIXTURE).expect("image should write");
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "POST",
+            "/v1/notes/id/images",
+            200,
+            "not json",
+        )]);
+        let error = upload_note_image(
+            &fixture.client(),
+            &files(),
+            UploadNoteImageInput {
+                workspace: crate::models::Workspace::Personal,
+                note_ref: "id".to_owned(),
+                refresh: false,
+                image_path: image.path().to_path_buf(),
+                confirm_large_file: false,
+            },
+        )
+        .await
+        .expect_err("an unreadable reply should fail");
+        assert_eq!(error.kind(), ErrorKind::Upstream, "{error}");
+        fixture.finish();
+    }
 }

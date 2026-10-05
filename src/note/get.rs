@@ -7,7 +7,8 @@ use thiserror::Error;
 use crate::{
     client::{HackmdClient, HackmdError},
     dto::{
-        CommentPermission, NotePermission, NotePublishType, NoteResponse, SimpleUserProfileResponse,
+        CommentPermission, NotePermission, NotePublishType, NoteResponse,
+        SimpleUserProfileResponse, SuggestEditPermission,
     },
     local::LocalFiles,
     models::Workspace,
@@ -75,6 +76,7 @@ pub(crate) struct NoteDetail {
     pub(crate) read_permission: Option<NotePermission>,
     pub(crate) write_permission: Option<NotePermission>,
     pub(crate) comment_permission: Option<CommentPermission>,
+    pub(crate) suggest_edit_permission: Option<SuggestEditPermission>,
 }
 
 #[derive(Debug, Error)]
@@ -171,6 +173,7 @@ pub(crate) fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> 
         read_permission: note.read_permission,
         write_permission: note.write_permission,
         comment_permission: note.comment_permission,
+        suggest_edit_permission: note.suggest_edit_permission,
     }
 }
 

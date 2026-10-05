@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use rmcp::schemars;
 use serde::{Deserialize, Deserializer, Serialize, de};
@@ -98,13 +98,17 @@ impl CreateNoteRequest {
 
 /// Patchable note fields. Create-only permission fields are intentionally not
 /// represented, preventing callers from silently sending unsupported data.
-#[derive(Debug, Clone, Default, Serialize)]
+/// `content` is not optional: `HackMD` is believed to blank the body of a
+/// PATCH that omits it (unmeasured, see TODO.md), so every metadata change
+/// carries the body back. There is no `Default` for the same reason; start
+/// from [`UpdateNoteRequest::new`]. The body is borrowed when it can be, so
+/// a large one is not copied just to be encoded.
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct UpdateNoteRequest {
+pub(crate) struct UpdateNoteRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) content: Option<String>,
+    pub(crate) content: Cow<'a, str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,15 +127,25 @@ pub(crate) struct UpdateNoteRequest {
     pub(crate) parent_folder_id: Option<Option<String>>,
 }
 
-impl UpdateNoteRequest {
-    /// An empty request is refused one layer up, where the tool can say
-    /// which inputs would have changed something.
-    pub(crate) fn validate(&self) -> Result<(), PayloadError> {
-        validate_permission_order(self.read_permission, self.write_permission)
+impl<'a> UpdateNoteRequest<'a> {
+    /// A request that changes nothing but sends `content` as the body.
+    pub(crate) fn new(content: impl Into<Cow<'a, str>>) -> Self {
+        Self {
+            title: None,
+            content: content.into(),
+            tags: None,
+            description: None,
+            read_permission: None,
+            write_permission: None,
+            permalink: None,
+            parent_folder_id: None,
+        }
     }
 }
 
-fn validate_permission_order(
+/// Checked before the network: `writePermission` may not exceed
+/// `readPermission`.
+pub(crate) fn validate_permission_order(
     read: Option<NotePermission>,
     write: Option<NotePermission>,
 ) -> Result<(), PayloadError> {
@@ -202,7 +216,7 @@ pub(crate) struct ProfileResponse {
     pub(crate) email: Option<String>,
     pub(crate) user_path: String,
     pub(crate) photo: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(crate) teams: Vec<TeamResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) upgraded: Option<bool>,
@@ -216,13 +230,19 @@ pub(crate) struct TeamResponse {
     pub(crate) id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) owner_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(crate) name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) logo: Option<String>,
     pub(crate) path: String,
     pub(crate) description: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_lenient")]
     pub(crate) hard_limit: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) visibility: Option<TeamVisibility>,
     #[serde(
         default,
@@ -239,8 +259,11 @@ pub(crate) struct TeamResponse {
 /// tool field.
 #[serde(rename_all(deserialize = "camelCase", serialize = "snake_case"))]
 pub(crate) struct SimpleUserProfileResponse {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(crate) name: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(crate) user_path: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(crate) photo: String,
     pub(crate) biography: Option<String>,
 }
@@ -251,6 +274,10 @@ pub(crate) struct SimpleUserProfileResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NoteResponse {
     pub(crate) id: String,
+
+    // `null` reads as empty, but a missing key is still refused: every note
+    // `HackMD` returns has a title, so its absence means a different shape.
+    #[serde(deserialize_with = "deserialize_null_default")]
     pub(crate) title: String,
     pub(crate) short_id: Option<String>,
     pub(crate) publish_link: Option<String>,
@@ -262,24 +289,54 @@ pub(crate) struct NoteResponse {
     pub(crate) title_updated_at: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_optional_millis")]
     pub(crate) tags_updated_at: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_lenient")]
     pub(crate) last_change_user: Option<SimpleUserProfileResponse>,
+    #[serde(default, deserialize_with = "deserialize_lenient")]
     pub(crate) publish_type: Option<NotePublishType>,
     #[serde(default, deserialize_with = "deserialize_optional_millis")]
     pub(crate) published_at: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_optional_millis")]
     pub(crate) last_visit: Option<i64>,
+
+    #[serde(default, deserialize_with = "deserialize_lenient")]
     pub(crate) read_permission: Option<NotePermission>,
+    #[serde(default, deserialize_with = "deserialize_lenient")]
     pub(crate) write_permission: Option<NotePermission>,
+    #[serde(default, deserialize_with = "deserialize_lenient")]
     pub(crate) comment_permission: Option<CommentPermission>,
+    #[serde(default, deserialize_with = "deserialize_lenient")]
+    pub(crate) suggest_edit_permission: Option<SuggestEditPermission>,
     pub(crate) content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(crate) tags: Vec<String>,
     pub(crate) description: Option<String>,
     pub(crate) permalink: Option<String>,
     pub(crate) user_path: Option<String>,
     pub(crate) team_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub(crate) folder_paths: Vec<FolderPathResponse>,
+}
+
+/// `null` read as the default, as a missing field already is with
+/// `#[serde(default)]`.
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// A value that fails to parse reads as `None`, so a value `HackMD` adds later
+/// (a new enum variant, an odd editor profile) costs that one field rather
+/// than failing every note, list, or team that carries it.
+fn deserialize_lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: de::DeserializeOwned,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 #[allow(
@@ -411,6 +468,103 @@ mod tests {
     }
 
     #[test]
+    fn note_permissions_read_known_values_and_drop_unknown_ones() {
+        let note: NoteResponse = serde_json::from_value(json!({
+            "id": "note",
+            "title": "T",
+            "commentPermission": "signed_in_users",
+            "suggestEditPermission": "owners"
+        }))
+        .expect("known permissions should deserialize");
+        assert_eq!(
+            note.comment_permission,
+            Some(CommentPermission::SignedInUsers)
+        );
+        assert_eq!(
+            note.suggest_edit_permission,
+            Some(SuggestEditPermission::Owners)
+        );
+
+        for value in [
+            json!({"id": "note", "title": "T"}),
+            json!({"id": "note", "title": "T", "commentPermission": null, "suggestEditPermission": null}),
+            json!({"id": "note", "title": "T", "commentPermission": "anyone", "suggestEditPermission": 7}),
+        ] {
+            let note: NoteResponse =
+                serde_json::from_value(value).expect("a note must not fail on its permissions");
+            assert_eq!(note.comment_permission, None);
+            assert_eq!(note.suggest_edit_permission, None);
+        }
+    }
+
+    #[test]
+    fn one_odd_field_does_not_fail_a_note_or_a_profile() {
+        let note: NoteResponse = serde_json::from_value(json!({
+            "id": "note",
+            "title": null,
+            "tags": null,
+            "folderPaths": null,
+            "lastChangeUser": {"name": "Ann", "userPath": null, "photo": null}
+        }))
+        .expect("nulls must not fail the note");
+        assert_eq!(note.title, "");
+        assert_eq!(note.tags, Vec::<String>::new());
+        assert_eq!(note.folder_paths, []);
+        let editor = note
+            .last_change_user
+            .expect("a null field keeps the editor");
+        assert_eq!(
+            (editor.name.as_str(), editor.user_path.as_str()),
+            ("Ann", "")
+        );
+        let note: NoteResponse =
+            serde_json::from_value(json!({"id": "note", "title": "T", "lastChangeUser": "ann"}))
+                .expect("an editor that is no profile at all must not fail the note");
+        assert_eq!(note.last_change_user, None);
+
+        let profile: ProfileResponse = serde_json::from_value(json!({
+            "id": "u", "name": "U", "userPath": "u", "teams": null
+        }))
+        .expect("null teams must not fail the profile");
+        assert_eq!(profile.teams, []);
+        for value in [
+            json!({"id": "t", "name": null, "path": "core", "hardLimit": "unlimited"}),
+            json!({"id": "t", "path": "core"}),
+        ] {
+            let team: TeamResponse =
+                serde_json::from_value(value).expect("an odd team must not fail /me");
+            assert_eq!((team.name.as_str(), team.hard_limit), ("", None));
+        }
+        let note: NoteResponse = serde_json::from_value(json!({
+            "id": "note", "title": "T", "lastChangeUser": {"name": "Ann"}
+        }))
+        .expect("missing editor fields must not fail the note");
+        let editor = note
+            .last_change_user
+            .expect("missing fields keep the editor");
+        assert_eq!((editor.name.as_str(), editor.photo.as_str()), ("Ann", ""));
+        let note: NoteResponse = serde_json::from_value(json!({
+            "id": "note", "title": "T", "lastChangeUser": {"userPath": "ann"}
+        }))
+        .expect("a missing editor name must not fail the note");
+        let editor = note
+            .last_change_user
+            .expect("a missing name keeps the editor");
+        assert_eq!(
+            (editor.name.as_str(), editor.user_path.as_str()),
+            ("", "ann")
+        );
+    }
+
+    #[test]
+    fn a_null_title_reads_as_empty_but_a_missing_one_is_refused() {
+        let note: NoteResponse = serde_json::from_value(json!({"id": "n", "title": null}))
+            .expect("a null title should read as empty");
+        assert_eq!(note.title, "");
+        assert!(serde_json::from_value::<NoteResponse>(json!({"id": "n"})).is_err());
+    }
+
+    #[test]
     fn profile_accepts_an_absent_or_null_email() {
         for value in [
             json!({"id":"user","name":"User","userPath":"user"}),
@@ -472,13 +626,7 @@ mod tests {
 
     #[test]
     fn explicit_empty_content_is_kept_and_absent_fields_are_omitted() {
-        let payload = UpdateNoteRequest {
-            content: Some(String::new()),
-            ..UpdateNoteRequest::default()
-        };
-        payload
-            .validate()
-            .expect("explicit empty content is a real patch");
+        let payload = UpdateNoteRequest::new(String::new());
         assert_eq!(
             serde_json::to_value(payload).expect("patch should serialize"),
             json!({"content": ""})
@@ -486,11 +634,11 @@ mod tests {
 
         let clear_folder = UpdateNoteRequest {
             parent_folder_id: Some(None),
-            ..UpdateNoteRequest::default()
+            ..UpdateNoteRequest::new("body".to_owned())
         };
         assert_eq!(
             serde_json::to_value(clear_folder).expect("null folder patch should serialize"),
-            json!({"parentFolderId": null})
+            json!({"content": "body", "parentFolderId": null})
         );
     }
 
@@ -501,13 +649,8 @@ mod tests {
             (NotePermission::Owner, NotePermission::Guest),
             (NotePermission::SignedIn, NotePermission::Guest),
         ] {
-            let payload = UpdateNoteRequest {
-                read_permission: Some(read),
-                write_permission: Some(write),
-                ..UpdateNoteRequest::default()
-            };
             assert_eq!(
-                payload.validate(),
+                super::validate_permission_order(Some(read), Some(write)),
                 Err(PayloadError::WriteMorePermissiveThanRead)
             );
         }

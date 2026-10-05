@@ -334,6 +334,22 @@ impl SequenceServer {
             .expect("fixture client should build")
     }
 
+    /// A client that retries with millisecond backoff, for tests that a write
+    /// is not retried: script a failure then a success, and only a single
+    /// attempt fails.
+    pub(crate) fn client_with_fast_retry(&self) -> HackmdClient {
+        HackmdClient::new(Config::for_loopback_test_with_retry(
+            &self.api_url,
+            FIXTURE_TOKEN,
+            crate::config::RetryConfig {
+                max_retries: 3,
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(2),
+            },
+        ))
+        .expect("retry client should build")
+    }
+
     /// A client that fails instead of retrying, so a test sees the first
     /// status.
     pub(crate) fn client_without_retry(&self, token: &str) -> HackmdClient {

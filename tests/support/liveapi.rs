@@ -130,6 +130,26 @@ impl LiveApi {
         }
     }
 
+    /// GETs `segments` until `accepted` holds, up to ten reads a second
+    /// apart, since `HackMD` shows some writes only after a delay. `None` if
+    /// it never did.
+    pub(crate) async fn poll_json(
+        &self,
+        segments: &[&str],
+        accepted: impl Fn(&Value) -> bool,
+    ) -> Option<Value> {
+        for attempt in 0..10 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let read = self.json(Method::GET, segments, None).await;
+            if accepted(&read) {
+                return Some(read);
+            }
+        }
+        None
+    }
+
     pub(crate) async fn json(
         &self,
         method: Method,
