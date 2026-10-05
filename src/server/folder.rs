@@ -59,7 +59,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_update_folder",
-        description = "Update team folder metadata, and/or set the order of a folder's direct child folders with child_order. folder_id names the folder whose fields change and whose children child_order orders; omit it with child_order to order the top level, which works in personal workspaces too. Every change is read back until visible. HackMD does not support personal folder metadata updates or folder moves; the folder order is one shared map, so an order another client overwrote is reported rather than claimed.",
+        description = "Update team folder metadata, and/or set the order of a folder's direct child folders with child_order. folder_id names the folder whose fields change and whose children child_order orders; omit it with child_order to order the top level, which works in personal workspaces too. Every change is read back until visible. child_order may name only the folder's own children, as hackmd_list_folders shows them. HackMD does not support personal folder metadata updates or folder moves; the folder order is one shared map, so an order another client overwrote is reported rather than claimed.",
         annotations(
             title = "Update HackMD Folder",
             read_only_hint = false,
