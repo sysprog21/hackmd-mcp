@@ -61,10 +61,10 @@ a restart on every platform, so create the directory first.
 Without a root, any absolute path is accepted. In that case, and under a root
 that came only from `.env` (which could be `/`), the server logs a warning at
 startup and a pull refuses to write files coding agents load as instructions:
-`CLAUDE.md`, `AGENTS.md`, `SKILL.md`, and the like, or anything under
-`.claude/`, `.github/`, `.cursor/`, and similar directories. That list is best
-effort, not a boundary (`CLAUDE.md` can import any Markdown file), so set a
-root if an agent reads the tree you pull into.
+`AGENTS.md`, `SKILL.md`, and the like, or anything under `.claude/`,
+`.github/`, `.cursor/`, and similar directories. That list is best effort, not
+a boundary (an instruction file can import any Markdown file), so set a root if
+an agent reads the tree you pull into.
 
 `hackmd_upload_note_image` puts a local file behind a HackMD link, public
 whenever the note is guest-readable, so it requires a root set in the server's
