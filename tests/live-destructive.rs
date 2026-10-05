@@ -173,17 +173,22 @@ async fn check_folder_order(
     seeded[parent] = json!(children);
     api.empty_ok(Method::PUT, route, Some(&json!({"order": seeded})))
         .await;
-    let read = api
-        .poll_json(route, |read| read[parent] == json!(children))
-        .await
+    // The map is the whole account's, so the original goes back before any
+    // check can fail, including a read that panics on an HTTP error.
+    let read =
+        std::panic::AssertUnwindSafe(api.poll_json(route, |read| read[parent] == json!(children)))
+            .catch_unwind()
+            .await;
+    api.empty_ok(Method::PUT, route, Some(&json!({"order": original})))
+        .await;
+    let read = read
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         .expect("a parent's order just written must read back");
     for (key, value) in &parents {
         if key != parent {
             assert_eq!(&read[key], value, "folder order lost parent {key}");
         }
     }
-    api.empty_ok(Method::PUT, route, Some(&json!({"order": original})))
-        .await;
     Some(parents.len())
 }
 
