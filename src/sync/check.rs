@@ -71,8 +71,8 @@ pub(crate) async fn check_note_sync(
     let (local_digest, remote_digest) =
         crate::local::offload(|| (body_digest(&local), body_digest(&remote)));
 
-    // Converged sides are in sync, as push agrees, and the next push moves
-    // the baseline there.
+    // Converged sides are in sync, as push agrees, and the next push moves the
+    // baseline there.
     let status = match classify_changes(&tracked.baseline_digest, &local_digest, &remote_digest) {
         ChangeState::InSync | ChangeState::Converged => SyncStatus::InSync,
         ChangeState::LocalOnly => SyncStatus::LocalChanged,

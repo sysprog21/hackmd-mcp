@@ -90,6 +90,7 @@ pub(super) fn map_status_error(
         StatusCode::UNAUTHORIZED => HackmdError::Unauthorized { method, path },
         StatusCode::FORBIDDEN => HackmdError::Forbidden { method, path },
         StatusCode::NOT_FOUND => HackmdError::NotFound { method, path },
+
         // Only a note's permalink is known to clash; elsewhere HackMD's own
         // words are the best hint there is.
         StatusCode::CONFLICT => HackmdError::Conflict {
@@ -354,6 +355,7 @@ impl crate::reply::ToolError for HackmdError {
             Self::EmptyPathSegment | Self::DotPathSegment | Self::ControlInPathSegment => {
                 ErrorKind::InvalidInput
             }
+
             // Serializing a payload this server validated cannot fail on
             // anything the caller sent.
             Self::ClientBuild | Self::InvalidBaseUrl | Self::InvalidPayload => ErrorKind::Internal,

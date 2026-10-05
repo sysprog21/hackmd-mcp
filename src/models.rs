@@ -66,6 +66,7 @@ impl<'de> Deserialize<'de> for Workspace {
             Some(Arg::Path(path) | Arg::Tagged(Tagged::Team { team_path: path })) => path,
             Some(Arg::Other(_)) => return Err(serde::de::Error::custom(EXPECTED)),
         };
+
         // Either spelling is judged once. A control character is no team's
         // path, and the URL library drops tabs and newlines, so `.\t.` would
         // reach it as `..`; the client refuses those too.

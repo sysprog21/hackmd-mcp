@@ -37,10 +37,10 @@ pub(crate) struct HackmdClient {
 
 impl HackmdClient {
     pub(crate) fn new(config: Config) -> Result<Self, HackmdError> {
-        // Redirects are refused: the API never sends one, and following a
-        // 307 would replay a note body to whatever origin it named. Timeouts
-        // are per request, in `send`: reqwest's own read timeout is armed
-        // once per request, so it would cut a long upload short.
+        // Redirects are refused: the API never sends one, and following a 307
+        // would replay a note body to whatever origin it named. Timeouts are
+        // per request, in `send`: reqwest's own read timeout is armed once per
+        // request, so it would cut a long upload short.
         let http = reqwest::Client::builder()
             .connect_timeout(config.connect_timeout())
             .redirect(reqwest::redirect::Policy::none())
@@ -168,8 +168,9 @@ impl HackmdClient {
                         .get_required::<Vec<NoteResponse>>(&workspace_route(workspace, &["notes"]))
                         .await
                         .map(Arc::from);
-                    // A list a write overtook is fetched again: it may lack
-                    // the note just written.
+
+                    // A list a write overtook is fetched again: it may lack the
+                    // note just written.
                     if fill.complete(&outcome) || outcome.is_err() {
                         return outcome;
                     }
@@ -578,6 +579,7 @@ impl HackmdClient {
             let status = response.status();
             let retry_after = retry_after(response.headers());
             let rate_limit = RateLimitHeaders::from_headers(response.headers());
+
             // A write whose reply nobody reads is done once its status says so.
             // Reading on would let a body that breaks off turn a write that
             // landed into a retry, or into an error.
@@ -593,8 +595,9 @@ impl HackmdClient {
                     retries += 1;
                     continue;
                 }
-                // The status already says what happened; a body that broke
-                // off loses only its detail, not the verdict.
+
+                // The status already says what happened; a body that broke off
+                // loses only its detail, not the verdict.
                 Err(_) if !status.is_success() => Vec::new(),
                 Err(error) => return Err(error.into_hackmd(&method_text, &path)),
             };
@@ -698,9 +701,9 @@ impl HackmdClient {
         {
             return Err(HackmdError::DotPathSegment);
         }
-        // The URL library also drops tabs and newlines inside a segment
-        // before judging dots, so `.\t.` would become `..` after the check
-        // above.
+
+        // The URL library also drops tabs and newlines inside a segment before
+        // judging dots, so `.\t.` would become `..` after the check above.
         if path_segments
             .iter()
             .any(|segment| segment.chars().any(char::is_control))
@@ -714,8 +717,9 @@ impl HackmdClient {
         segments.pop_if_empty();
         segments.extend(path_segments);
         drop(segments);
-        // Whatever else the library might normalize, one segment in must be
-        // one segment out, or the request names another route.
+
+        // Whatever else the library might normalize, one segment in must be one
+        // segment out, or the request names another route.
         let count = |url: &Url| {
             url.path_segments().map_or(0, |segments| {
                 segments.filter(|segment| !segment.is_empty()).count()

@@ -117,9 +117,9 @@ pub(crate) async fn pull_note(
     input: PullNoteInput,
 ) -> Result<Result<PullNoteOutput, NoteResolution>, PullNoteError> {
     files.allow_write(&input.local_path)?;
-    // A store that must not be trusted is refused before the file is
-    // touched, discard or not: the record this pull saves would be read
-    // back from there.
+
+    // A store that must not be trusted is refused before the file is touched,
+    // discard or not: the record this pull saves would be read back from there.
     files.state().trusted()?;
     validate_destination(files, &input)?;
     let resolution = crate::note::reference::resolve_note_ref(
@@ -213,9 +213,9 @@ fn has_unpushed_changes(
 ) -> Result<bool, PullNoteError> {
     // Two records naming the file are still tracking it, but there is no single
     // baseline to judge against: only a file already equal to the remote is
-    // known to have nothing to lose.
-    // Only an absent or unusable record means there is nothing to lose; any
-    // other failure, now or added later, refuses rather than overwrite.
+    // known to have nothing to lose. Only an absent or unusable record means
+    // there is nothing to lose; any other failure, now or added later, refuses
+    // rather than overwrite.
     let baseline_hash = match files.state().record_for(&input.local_path) {
         Ok(Some(record)) => Some(record.baseline_body_hash),
         Err(StateError::AmbiguousTrackedState { .. }) => None,

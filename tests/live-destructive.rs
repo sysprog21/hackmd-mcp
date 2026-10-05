@@ -108,8 +108,8 @@ async fn probe_partial_note_patch(
         probed.as_ref().map(|read| &read["content"])
     );
 
-    // Judged only when the first half confirmed the description and tags
-    // were set; otherwise a "clears" would only mean they never landed.
+    // Judged only when the first half confirmed the description and tags were
+    // set; otherwise a "clears" would only mean they never landed.
     if probed.is_none() {
         eprintln!(
             "measured ({label}): content-only note PATCH is inconclusive, the description and tags were never set"
@@ -173,6 +173,7 @@ async fn check_folder_order(
     seeded[parent] = json!(children);
     api.empty_ok(Method::PUT, route, Some(&json!({"order": seeded})))
         .await;
+
     // The map is the whole account's, so the original goes back before any
     // check can fail, including a read that panics on an HTTP error.
     let read =

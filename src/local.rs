@@ -383,9 +383,9 @@ impl LocalFiles {
     /// a tree the user chose: with no root, one confused tool call could
     /// publish any screenshot or scanned document on the machine.
     pub(crate) fn allow_publish(&self, path: &Path) -> Result<(), LocalAccessError> {
-        // A root from a working-directory `.env` may be someone else's, with
-        // a root of `/`: only one from the server's own environment counts,
-        // which is exactly when the instruction guard is off.
+        // A root from a working-directory `.env` may be someone else's, with a
+        // root of `/`: only one from the server's own environment counts, which
+        // is exactly when the instruction guard is off.
         if self.root.is_none() || self.guard_instructions {
             return Err(LocalAccessError::Unconfined {
                 path: path.to_path_buf(),
@@ -427,10 +427,11 @@ impl LocalFiles {
 
         // The sync state is this server's own, and is trusted on load: a note
         // written over a sidecar or baseline would forge it. A relative state
-        // directory is made absolute first, or no absolute path would ever
-        // fall beneath it.
+        // directory is made absolute first, or no absolute path would ever fall
+        // beneath it.
         let state_root = std::path::absolute(self.state.root())
             .unwrap_or_else(|_| self.state.root().to_path_buf());
+
         // Judged both fully resolved and with only the parent resolved: a
         // symlink as the final component resolves elsewhere, but the write
         // replaces the link itself, where it stands.
@@ -522,6 +523,7 @@ impl LocalFiles {
                     .map(cap_std::fs::File::into_std)
             }
         };
+
         // Windows refuses to open a directory at all, with "access denied",
         // where Unix opens it and the check below refuses it. Either way the
         // caller hears the same thing. Looking only after a failed open
@@ -816,8 +818,8 @@ mod tests {
                 .is_ok()
         );
 
-        // Through a directory that does not exist yet, `..` cannot be
-        // resolved, so it is refused for writes even without a root.
+        // Through a directory that does not exist yet, `..` cannot be resolved,
+        // so it is refused for writes even without a root.
         let around = directory
             .path()
             .join("missing/../state/tracked/x.baseline.md");

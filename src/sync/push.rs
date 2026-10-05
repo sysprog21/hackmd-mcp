@@ -242,8 +242,9 @@ fn validate_and_read_local(
         if !input.confirm {
             return Err(PushNoteError::OverwriteConfirmationRequired);
         }
-        // An overwrite replaces whatever the remote holds, so a hash naming
-        // the remote a merge was built against would guard nothing.
+
+        // An overwrite replaces whatever the remote holds, so a hash naming the
+        // remote a merge was built against would guard nothing.
         if input.expected_remote_hash.is_some() {
             return Err(PushNoteError::OverwriteWithExpectedHash);
         }
@@ -338,9 +339,10 @@ async fn push_resolved(
     } else {
         remote != local
     };
+
     // Only the local body is needed from here on. Holding the remote and the
-    // baseline through the write and its read-back would keep three copies of
-    // a large note alive at once.
+    // baseline through the write and its read-back would keep three copies of a
+    // large note alive at once.
     drop(remote);
     drop(tracked.baseline_body);
 
@@ -519,9 +521,10 @@ impl BoundedWriter {
         if self.truncated {
             self.bytes.extend_from_slice("…".as_bytes());
         }
+
         // The formatter writes whole `str` pieces and the cut lands on a
-        // character boundary, so this is valid UTF-8; lossy costs nothing
-        // and leaves no panic behind if that ever changes.
+        // character boundary, so this is valid UTF-8; lossy costs nothing and
+        // leaves no panic behind if that ever changes.
         String::from_utf8_lossy(&self.bytes).into_owned()
     }
 }
@@ -764,6 +767,7 @@ mod tests {
         .expect("safe push should succeed")
         .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::Pushed);
+
         // The result carries the converged hash and the new timestamp, so a
         // caller confirms the sync without a follow-up read.
         assert_eq!(output.body_hash, Some(crate::hash::body_hash("local edit")));
@@ -814,8 +818,9 @@ mod tests {
             .expect("comparison should succeed")
             .expect("direct note should resolve");
         assert_eq!(output.status, PushStatus::Conflict);
-        // A conflict reports remote_body_hash, not the converged fields:
-        // being None, they are omitted from the serialized result.
+
+        // A conflict reports remote_body_hash, not the converged fields: being
+        // None, they are omitted from the serialized result.
         assert!(output.body_hash.is_none());
         assert!(output.remote_timestamp.is_none());
         assert!(output.remote_body_hash.is_some());
