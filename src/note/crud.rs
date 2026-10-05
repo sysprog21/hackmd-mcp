@@ -57,7 +57,8 @@ pub(crate) struct CreateNoteInput {
     /// Folder ID for placement. The server verifies POST placement and uses
     /// PATCH only as a compatibility fallback.
     pub(crate) parent_folder_id: Option<String>,
-    /// Per-feature `HackMD` permission overrides.
+    /// Sent to `HackMD` as `noteFeatures`, unchecked: no read reports it, so
+    /// whether it takes effect cannot be confirmed.
     pub(crate) note_features: Option<BTreeMap<String, Value>>,
     /// Optional client origin identifier.
     pub(crate) origin: Option<String>,
@@ -81,7 +82,8 @@ pub(crate) struct UpdateNoteInput {
     /// only then this field, so on a note with either it changes nothing.
     pub(crate) title: Option<String>,
     /// Explicit full-body replacement. Prefer `patch` for normal content
-    /// edits: this overwrites the complete unversioned body.
+    /// edits: this overwrites the complete body, and nothing this server
+    /// offers can undo it.
     pub(crate) content: Option<String>,
     /// Complete replacement tag list.
     pub(crate) tags: Option<Vec<String>>,
@@ -93,7 +95,8 @@ pub(crate) struct UpdateNoteInput {
     pub(crate) read_permission: Option<NotePermission>,
     /// Who may edit the note; may not exceed `read_permission`.
     pub(crate) write_permission: Option<NotePermission>,
-    /// Folder ID, or null to move the note to the workspace root.
+    /// Folder ID, or null to move the note to the workspace root. Whether the
+    /// read shows the move is reported in `folder_placement_confirmed`.
     #[serde(default, deserialize_with = "deserialize_patch_field")]
     #[schemars(with = "Option<String>")]
     parent_folder_id: PatchField,
@@ -230,7 +233,9 @@ pub(crate) enum CrudError {
     NoBodyToResend { note_id: String },
     #[error(transparent)]
     BodyChanged(#[from] BodyChanged),
-    #[error("only personal notes can be restored from trash; team deletion has no restore")]
+    #[error(
+        "only personal notes can be restored through the API; restore a team note from the HackMD web UI if it offers one"
+    )]
     TeamRestore,
     #[error(transparent)]
     Edit(#[from] EditNoteError),
@@ -622,7 +627,8 @@ pub(crate) async fn delete_note(
         return Ok(Err(resolution));
     };
     if input.restore {
-        // HackMD's trash is personal only: a deleted team note is gone.
+        // The trash API is personal only; whether a team deletion can be undone
+        // elsewhere is unmeasured.
         if !matches!(note.workspace, Workspace::Personal) {
             return Err(CrudError::TeamRestore);
         }

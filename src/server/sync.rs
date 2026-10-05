@@ -54,7 +54,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_push_note",
-        description = "Push a tracked local Markdown file to the note it was pulled from. The default safe strategy writes only if the remote still matches the last-synced baseline; otherwise it returns remote_changed, or conflict with a bounded diff, the current remote body saved as a sibling *.remote.md, and remote_body_hash. After merging, push again with expected_remote_hash to write only if the remote has not moved. strategy: overwrite requires confirm: true and replaces unversioned remote content. On a successful push or a no-op it returns body_hash (shared by the local baseline and the remote as of this push) and remote_timestamp, so the sync can be confirmed without a follow-up hackmd_get_note.",
+        description = "Push a tracked local Markdown file to the note it was pulled from. The default safe strategy writes only if the remote still matches the last-synced baseline; otherwise it returns remote_changed, or conflict with a bounded diff, the current remote body saved as a sibling *.remote.md, and remote_body_hash. After merging, push again with expected_remote_hash to write only if the remote has not moved. strategy: overwrite requires confirm: true and replaces the remote body, and nothing this server offers can undo it. On a successful push or a no-op it returns body_hash (shared by the local baseline and the remote as of this push) and remote_timestamp, so the sync can be confirmed without a follow-up hackmd_get_note.",
         annotations(
             title = "Push HackMD Note",
             read_only_hint = false,

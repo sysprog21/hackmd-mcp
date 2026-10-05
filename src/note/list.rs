@@ -45,8 +45,12 @@ pub(crate) struct ListNotesInput {
     #[serde(default)]
     pub(crate) refresh: bool,
     /// Note ordering. Omitted, the `workspace` source sorts by
-    /// `last_changed_desc`, and history and trash keep `HackMD`'s own order
-    /// (history is most recently viewed first).
+    /// `last_changed_desc`, and history and trash keep `HackMD`'s own order.
+    /// Whether history and trash entries carry tags, descriptions, and dates
+    /// is unmeasured. An entry without tags never passes a `tags` filter;
+    /// `query` still matches whatever fields it has, its ID included; and a
+    /// date sort puts entries without that date last when descending, first
+    /// when ascending, ordered among themselves by ID.
     pub(crate) sort: Option<NoteSort>,
 }
 

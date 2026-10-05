@@ -439,7 +439,7 @@ mod tests {
         .await
         .expect_err("413 should fail")
         .to_string();
-        assert!(error.contains("resize it below 5 MB"));
+        assert!(error.contains("resize it smaller and retry"));
         fixture.finish();
     }
 

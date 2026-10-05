@@ -33,6 +33,37 @@ const PNG_PROBE: [u8; 70] = [
     0, 1, 255, 114, 156, 82, 103, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
 ];
 
+/// `PNG_PROBE` grown to `size` bytes by a private ancillary chunk, which a
+/// decoder must skip. The file stays a valid PNG, so a refusal measures the
+/// size, not the format.
+fn padded_png(size: usize) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        !bytes.iter().fold(u32::MAX, |crc, &byte| {
+            (0..8).fold(crc ^ u32::from(byte), |crc, _| {
+                (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg())
+            })
+        })
+    }
+    const CHUNK_OVERHEAD: usize = 12;
+    // The CRC every PNG ends with, as a check on the one computed here.
+    assert_eq!(crc32(b"IEND"), 0xAE42_6082);
+    let (head, iend) = PNG_PROBE.split_at(PNG_PROBE.len() - CHUNK_OVERHEAD);
+    let padding = size - PNG_PROBE.len() - CHUNK_OVERHEAD;
+    let mut chunk = b"prVt".to_vec();
+    chunk.resize(4 + padding, 0);
+    let mut png = head.to_vec();
+    png.extend_from_slice(
+        &u32::try_from(padding)
+            .expect("padding fits a chunk")
+            .to_be_bytes(),
+    );
+    png.extend_from_slice(&chunk);
+    png.extend_from_slice(&crc32(&chunk).to_be_bytes());
+    png.extend_from_slice(iend);
+    assert_eq!(png.len(), size);
+    png
+}
+
 #[derive(Default)]
 struct Fixtures {
     note: Option<String>,
@@ -271,6 +302,14 @@ async fn personal_crud_folder_order_trash_and_restore() {
             "measured (personal): a create without permissions reads back read {} / write {}",
             post_read["readPermission"], post_read["writePermission"]
         );
+
+        // The tool allows 5 to 10 MiB with confirmation; is that range real?
+        let large = padded_png(7 * 1024 * 1024);
+        let status = api
+            .upload_png(&["notes", &note_id, "images"], large)
+            .await
+            .status;
+        eprintln!("measured (personal): a 7 MiB image upload answers {status}");
 
         let edited = format!("# Codex live {suffix}\n\nedited\n");
         api.empty_ok(

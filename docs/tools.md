@@ -20,7 +20,7 @@ teams you belong to.
 | `source` | Lists |
 |----------|-------|
 | `workspace` (default) | notes in a personal or team workspace |
-| `history` | notes you viewed recently, across workspaces |
+| `history` | the account's view history, in the order HackMD returns it |
 | `trash` | trashed personal notes |
 | `tracked` | local files synced by `hackmd_pull_note`, read without any request |
 
@@ -57,7 +57,8 @@ write, so it catches every change made before then but not one landing in the
 instant between the two.
 
 `content` replaces the whole body instead. It is for rewriting a note from
-scratch and carries the destructive hint; HackMD keeps no version to undo it.
+scratch and carries the destructive hint; nothing this server offers can undo
+it.
 
 A metadata-only update (title, tags, description, permalink, permissions,
 folder) still sends the body: HackMD is believed to blank a body the PATCH
@@ -124,14 +125,17 @@ file or the note.
 ## Folders, deletion, images
 
 - `hackmd_update_folder` updates team folder metadata and sets folder order
-  with `child_order`. HackMD reports folder moves as successful while doing
-  nothing, so moves are refused outright. Personal folder metadata cannot be
-  changed through the API.
+  with `child_order`, which may name only the folder's own children. The
+  read-back confirms HackMD stored the order; the team order route is inferred
+  from the personal one and unmeasured. HackMD reports folder moves as
+  successful while doing nothing, so moves are refused outright. Personal
+  folder metadata updates are refused too, since nothing confirms they take
+  effect.
 - `hackmd_delete_folder` leaves a folder that has child folders alone unless
   `confirm: true` is given. HackMD does not report which notes a folder holds,
   so check `folder_ids` from `hackmd_get_note` first if that matters.
 - `hackmd_delete_note` with `restore: true` brings a personal note back from
-  trash. Team deletions cannot be restored.
+  trash. Team notes cannot be restored through the API.
 - `hackmd_upload_note_image` uploads a local image to a personal or team note
   and returns its CDN link. The link is public whenever the note is
   guest-readable; an anonymous fetch of an image on an owner-only note was

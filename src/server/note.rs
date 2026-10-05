@@ -18,7 +18,7 @@ use crate::{
 impl HackmdServer {
     #[tool(
         name = "hackmd_list_notes",
-        description = "List HackMD notes with metadata filtering, sorting, and pagination. source picks the list: workspace (default; a personal or team workspace's notes), history (recently viewed, account-wide), trash (trashed personal notes), or tracked (local files synced by hackmd_pull_note, read without a request; team_path narrows it to one team). This never searches note bodies. refresh=true bypasses the 60-second workspace cache.",
+        description = "List HackMD notes with metadata filtering, sorting, and pagination. source picks the list: workspace (default; a personal or team workspace's notes), history (the account's view history, in HackMD's order), trash (trashed personal notes), or tracked (local files synced by hackmd_pull_note, read without a request; team_path narrows it to one team). This never searches note bodies. refresh=true bypasses the 60-second workspace cache.",
         annotations(
             title = "List HackMD Notes",
             read_only_hint = true,
@@ -94,7 +94,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_update_note",
-        description = "Edit a HackMD note's body with a patch (the default and safe way), or update its metadata, or replace the whole body with content. The destructive hint is for content; a patch is context-checked and changes only what its hunks name. It applies only when every hunk's context matches the current body exactly once, then the write is confirmed by reading it back. Pass expected_hash (body_hash from hackmd_get_note) with any update to refuse the write if the body changed since you read it. A metadata-only update reads the current body and sends it back with the change: an edit landing between that read and the write is reverted, and expected_hash catches any made before it. Title precedence: a YAML title: in the body wins, then a leading H1, then title, so on a note with either a title change has no effect. Format:\n*** Begin Patch\n*** Update File: <patch_path from hackmd_get_note>\n@@ optional anchor line\n context line\n-removed line\n+added line\n*** End Patch\nText after @@ is an anchor that must equal exactly one line, ignoring leading and trailing whitespace; the hunk then applies after it, and an addition-only hunk is inserted directly below it. A line range such as @@ -3,4 +3,5 @@ is not an anchor. A hunk closed by *** End of File must match the end of the body, and an addition-only one appends there. A patch goes in a call of its own. content overwrites the complete unversioned body. For @owner/slug references, refresh=true bypasses the 60-second caches.",
+        description = "Edit a HackMD note's body with a patch (the default and safe way), or update its metadata, or replace the whole body with content. The destructive hint is for content; a patch is context-checked and changes only the body lines its hunks name. It applies only when every hunk's context matches the current body exactly once, then the write is confirmed by reading it back. Pass expected_hash (body_hash from hackmd_get_note) with any update to refuse the write if the body changed since you read it. A metadata-only update reads the current body and sends it back with the change: an edit landing between that read and the write is reverted, and expected_hash catches any made before it. Title precedence: a YAML title: in the body wins, then a leading H1, then title, so on a note with either a title change has no effect. Format:\n*** Begin Patch\n*** Update File: <patch_path from hackmd_get_note>\n@@ optional anchor line\n context line\n-removed line\n+added line\n*** End Patch\nText after @@ is an anchor that must equal exactly one line, ignoring leading and trailing whitespace; the hunk then applies after it, and an addition-only hunk is inserted directly below it. A line range such as @@ -3,4 +3,5 @@ is not an anchor. A hunk closed by *** End of File must match the end of the body, and an addition-only one appends there. A patch goes in a call of its own. content overwrites the complete body, and nothing this server offers can undo it. For @owner/slug references, refresh=true bypasses the 60-second caches.",
         annotations(
             title = "Update HackMD Note",
             read_only_hint = false,
@@ -125,7 +125,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_delete_note",
-        description = "Delete a HackMD note, or with restore: true bring a personal note back from trash (note_ref is then the internal ID from hackmd_list_notes with source: trash). Team deletion has no restore. For @owner/slug references, refresh=true bypasses the 60-second caches.",
+        description = "Delete a HackMD note, or with restore: true bring a personal note back from trash (note_ref is then the internal ID from hackmd_list_notes with source: trash). Only personal notes can be restored through the API. For @owner/slug references, refresh=true bypasses the 60-second caches.",
         annotations(
             title = "Delete or Restore HackMD Note",
             read_only_hint = false,

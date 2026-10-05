@@ -15,7 +15,7 @@ that loop and the risks that come with it:
   team", "fix the broken links in https://hackmd.io/@me/syllabus", or "move the
   action items into a new note under `Projects`". The agent finds notes by ID or
   by the URL you paste, across your personal and team workspaces.
-- Edits touch only what they mean to. The agent changes a note with a
+- Body edits touch only the lines they mean to. The agent changes a note with a
   context-checked patch, not by rewriting the whole body, so a typo fix stays a
   typo fix, and it can pass along the hash it read to refuse the write if the
   note changed in between. See [patch editing](docs/tools.md#editing-a-note).
@@ -24,8 +24,8 @@ that loop and the risks that come with it:
   the note also changed on HackMD the push stops and hands you both versions
   instead of overwriting either. See
   [sync](docs/tools.md#pull-edit-locally-push).
-- Edits are confirmed, not assumed. HackMD applies some writes
-  asynchronously, so body edits and folder changes are read back before they
+- Edits are confirmed, not assumed. HackMD may show a write
+  only after a delay, so body edits and folder changes are read back before they
   are reported as done. A write whose outcome is unknown is reported as such
   and never retried blindly, so you do not get duplicate notes.
 - Local file access can be fenced in. Set a workspace root and every local path

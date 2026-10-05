@@ -60,15 +60,15 @@ pub(crate) struct UpdateFolderInput {
     pub(crate) folder_id: Option<String>,
     /// New non-empty name; unlike other fields, name cannot be null.
     pub(crate) name: Option<String>,
-    /// New description, null to clear, or omit to preserve.
+    /// New description, or null to clear. Omitted, it is not sent.
     #[serde(default, deserialize_with = "deserialize_patch_field")]
     #[schemars(with = "Option<String>")]
     description: PatchField,
-    /// New icon, null to clear, or omit to preserve.
+    /// New icon, or null to clear. Omitted, it is not sent.
     #[serde(default, deserialize_with = "deserialize_patch_field")]
     #[schemars(with = "Option<String>")]
     icon: PatchField,
-    /// New color, null to clear, or omit to preserve.
+    /// New color, or null to clear. Omitted, it is not sent.
     #[serde(default, deserialize_with = "deserialize_patch_field")]
     #[schemars(with = "Option<String>")]
     color: PatchField,
@@ -200,7 +200,9 @@ pub(crate) enum FolderError {
         "HackMD accepted the order for {parent}, but it did not read back; another client may have written the folder order at the same time, so read it and set it again"
     )]
     OrderReadbackMismatch { parent: String },
-    #[error("personal folder updates are unsupported: HackMD exposes PATCH only for team folders")]
+    #[error(
+        "personal folder updates are unsupported: nothing confirms HackMD applies a personal folder PATCH"
+    )]
     UnsupportedPersonalUpdate,
     #[error("folder moves are unsupported: HackMD accepts parent_folder_id but ignores it")]
     UnsupportedFolderMove,

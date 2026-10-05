@@ -10,7 +10,7 @@ only command-line flags are `--self-check` with its optional `--probe-api`,
 | Variable | Required | Read from `.env` | Purpose |
 |----------|----------|------------------|---------|
 | `HACKMD_API_TOKEN` | when a tool contacts HackMD | yes | API token |
-| `HACKMD_API_URL` | no | yes, with a restriction | HTTPS API endpoint for HackMD Enterprise; defaults to `https://api.hackmd.io/v1` |
+| `HACKMD_API_URL` | no | yes, with a restriction | HTTPS API endpoint; defaults to `https://api.hackmd.io/v1`. Note URLs are parsed only for `hackmd.io`; elsewhere, pass note IDs |
 | `HACKMD_MCP_WORKSPACE_ROOT` | no, recommended | yes, with a restriction | Absolute directory that local file access is confined to |
 | `HACKMD_MCP_STATE_DIR` | no | never | Private directory for sync state |
 | `RUST_LOG` | no | no | Log filter for stderr; defaults to `info` |
