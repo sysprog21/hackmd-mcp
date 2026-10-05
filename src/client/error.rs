@@ -102,6 +102,14 @@ pub(super) fn map_status_error(
             path,
         },
         StatusCode::TOO_MANY_REQUESTS => HackmdError::RateLimited {
+            // A note PATCH is never retried for the caller (its body was read
+            // just before), so say what the retry must start with. Create,
+            // delete, and image upload have no body read to redo.
+            then: if method == "PATCH" && is_note_route(&path) {
+                ", then read the note again before writing it"
+            } else {
+                ""
+            },
             method,
             path,
             detail: combine_details(rate_limit.detail(), &body_detail),
@@ -231,7 +239,7 @@ pub(crate) enum HackmdError {
     )]
     ReadbackTimeout,
     #[error(
-        "HackMD accepted the update for note {note_id}, but read-back content did not match; call hackmd_get_note and compare before writing again"
+        "HackMD accepted the update for note {note_id}, but no read-back showed it; call hackmd_get_note and compare before writing again"
     )]
     ReadbackMismatch { note_id: String },
     #[error(
@@ -260,11 +268,12 @@ pub(crate) enum HackmdError {
         path: String,
         detail: String,
     },
-    #[error("{method} {path}: 429 rate limited ({detail}); wait before retrying")]
+    #[error("{method} {path}: 429 rate limited ({detail}); wait before retrying{then}")]
     RateLimited {
         method: String,
         path: String,
         detail: String,
+        then: &'static str,
     },
     #[error("{method} {path}: upstream HackMD error ({status}): {detail}; retry later")]
     Upstream {
@@ -288,6 +297,38 @@ pub(crate) enum HackmdError {
     },
     #[error("{method} {path}: HackMD returned an empty response where JSON was required")]
     EmptyResponse { method: String, path: String },
+}
+
+impl HackmdError {
+    /// A success reply that could not be read: invalid JSON (`status`), or
+    /// an empty body (`None`). After a write this is no upstream fault to
+    /// retry: the write landed, and repeating a create would duplicate it, so
+    /// the agent is told to look first.
+    pub(crate) fn unreadable_reply(
+        method: String,
+        path: String,
+        status: Option<StatusCode>,
+    ) -> Self {
+        if method == "GET" {
+            return match status {
+                Some(status) => Self::InvalidJson {
+                    method,
+                    path,
+                    status,
+                },
+                None => Self::EmptyResponse { method, path },
+            };
+        }
+        let cause = status.map_or_else(
+            || "was answered with an empty body where JSON was required".to_owned(),
+            |status| format!("was answered {status} with invalid JSON"),
+        );
+        Self::WriteUnconfirmed {
+            method,
+            path,
+            cause,
+        }
+    }
 }
 
 impl crate::reply::ToolError for HackmdError {
@@ -472,6 +513,7 @@ mod tests {
                     method: m(),
                     path: p(),
                     detail: d(),
+                    then: "",
                 },
                 ErrorKind::RateLimited,
             ),
@@ -511,6 +553,25 @@ mod tests {
         ];
         for (error, kind) in cases {
             assert_eq!(error.kind(), kind, "{error}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_reply_to_a_write_says_look_not_retry() {
+        use crate::reply::{ErrorKind, ToolError as _};
+        use reqwest::StatusCode;
+
+        for status in [Some(StatusCode::CREATED), None] {
+            let read =
+                HackmdError::unreadable_reply("GET".to_owned(), "/v1/notes".to_owned(), status);
+            assert_eq!(read.kind(), ErrorKind::Upstream, "{read}");
+            let write =
+                HackmdError::unreadable_reply("POST".to_owned(), "/v1/notes".to_owned(), status);
+            assert_eq!(write.kind(), ErrorKind::Readback, "{write}");
+            assert!(
+                write.to_string().contains("check whether it did"),
+                "{write}"
+            );
         }
     }
 

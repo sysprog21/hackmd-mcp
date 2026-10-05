@@ -198,15 +198,16 @@ impl HackmdClient {
             .await
     }
 
+    /// The one note PATCH. Sent once through `write`: every payload carries a
+    /// body, and nearly every body was read or checked just before.
     pub(crate) async fn update_note(
         &self,
         workspace: &Workspace,
         note_id: &str,
-        payload: &UpdateNoteRequest,
+        payload: &UpdateNoteRequest<'_>,
     ) -> Result<(), HackmdError> {
         let segments = workspace_route(workspace, &["notes", note_id]);
-        self.write_idempotent(Method::PATCH, &segments, Some(payload))
-            .await
+        self.write(Method::PATCH, &segments, Some(payload)).await
     }
 
     /// A note with its Markdown body taken out, for the tools that work on
@@ -236,7 +237,8 @@ impl HackmdClient {
         note_id: &str,
         body: &str,
     ) -> Result<NoteResponse, HackmdError> {
-        self.update_note_content(workspace, note_id, body).await?;
+        self.update_note(workspace, note_id, &UpdateNoteRequest::new(body))
+            .await?;
         self.confirm_note_write(workspace, note_id, body.len(), |note| {
             note.content.as_deref() == Some(body)
         })
@@ -262,24 +264,6 @@ impl HackmdClient {
         .confirmed_or(|| HackmdError::ReadbackMismatch {
             note_id: note_id.to_owned(),
         })
-    }
-
-    /// Updates only note content without cloning the caller's potentially
-    /// large Markdown body into an owned DTO before JSON encoding.
-    async fn update_note_content(
-        &self,
-        workspace: &Workspace,
-        note_id: &str,
-        content: &str,
-    ) -> Result<(), HackmdError> {
-        #[derive(Serialize)]
-        struct ContentUpdate<'a> {
-            content: &'a str,
-        }
-
-        let segments = workspace_route(workspace, &["notes", note_id]);
-        self.write_idempotent(Method::PATCH, &segments, Some(&ContentUpdate { content }))
-            .await
     }
 
     pub(crate) async fn delete_note(
@@ -400,19 +384,30 @@ impl HackmdClient {
         if status == StatusCode::PAYLOAD_TOO_LARGE {
             return Err(HackmdError::ImageTooLarge { path });
         }
-        Reply::check(
+        let reply = Reply::check(
             status,
             "POST".to_owned(),
             path.clone(),
             bytes,
             token,
             rate_limit,
-        )?
-        .json()?
-        .ok_or(HackmdError::EmptyResponse {
-            method: "POST".to_owned(),
-            path,
-        })
+        )?;
+
+        // Unlike other writes, an unreadable reply here stays `upstream`, retry
+        // later: no tool can look for an uploaded image, and uploading it again
+        // only leaves an unused copy.
+        match reply.json() {
+            Ok(Some(uploaded)) => Ok(uploaded),
+            Ok(None) => Err(HackmdError::EmptyResponse {
+                method: "POST".to_owned(),
+                path,
+            }),
+            Err(_) => Err(HackmdError::InvalidJson {
+                method: "POST".to_owned(),
+                path,
+                status,
+            }),
+        }
     }
 
     /// Issues a GET whose response body is mandatory.
@@ -430,10 +425,11 @@ impl HackmdClient {
     ) -> Result<T, HackmdError> {
         match self.request_json(method.clone(), segments, body).await? {
             Some(value) => Ok(value),
-            None => Err(HackmdError::EmptyResponse {
-                method: method.as_str().to_owned(),
-                path: self.url_for_segments(segments)?.path().to_owned(),
-            }),
+            None => Err(HackmdError::unreadable_reply(
+                method.as_str().to_owned(),
+                self.url_for_segments(segments)?.path().to_owned(),
+                None,
+            )),
         }
     }
 
@@ -469,8 +465,10 @@ impl HackmdClient {
 
     /// `write`, retried because repeating it lands on the same state:
     /// `HackMD`'s PATCH and PUT routes set fields to given values rather than
-    /// accumulating. A retry can still overwrite an edit made by someone else
-    /// in between, which is the same exposure the first attempt already had.
+    /// accumulating. Only for a payload of the caller's own values: one built
+    /// from a read (a note body, the folder-order map) goes through `write`,
+    /// because a retry after backoff would send it back over edits made while
+    /// waiting.
     async fn write_idempotent(
         &self,
         method: Method,
@@ -539,8 +537,8 @@ impl HackmdClient {
         let retry = self.config.retry();
         let mut retries = 0_u8;
 
-        // Encoded once, not once per attempt: a retried PATCH carries the whole
-        // note body, and re-encoding it costs more than copying the bytes.
+        // Encoded once, not once per attempt: a retried request clones these
+        // bytes rather than serializing the payload again.
         let body = body
             .map(|body| serde_json::to_vec(body))
             .transpose()
@@ -775,7 +773,9 @@ async fn sleep_before_retry(
 /// it; anything larger is refused before it is buffered, not after.
 const RESPONSE_MAX_BYTES: usize = 2 * crate::sync::BODY_MAX_BYTES + 1024 * 1024;
 
-/// The largest request body retried after a transport failure.
+/// The largest request body retried after a transport failure. Today's
+/// retried writes (folder PATCH, trash restore) are far below it; it keeps a
+/// future large idempotent write from re-uploading its whole body blind.
 const RETRY_BODY_MAX_BYTES: usize = 1024 * 1024;
 
 /// Clears the note-list cache when dropped, on whichever path leaves the
@@ -878,11 +878,7 @@ impl Reply {
         }
         serde_json::from_slice(&self.bytes)
             .map(Some)
-            .map_err(|_| HackmdError::InvalidJson {
-                method: self.method,
-                path: self.path,
-                status: self.status,
-            })
+            .map_err(|_| HackmdError::unreadable_reply(self.method, self.path, Some(self.status)))
     }
 }
 
@@ -963,7 +959,9 @@ mod tests {
             Scenario::new("GET", "/v1/notes", 200, NOTES),
             Scenario::new("PATCH", "/v1/notes/note-id", 202, "")
                 .expect_header("content-type", "application/json")
-                .expect_body("the renamed title", |body| body == r#"{"title":"Renamed"}"#),
+                .expect_body("the renamed title", |body| {
+                    body == r#"{"title":"Renamed","content":"body"}"#
+                }),
             Scenario::new("GET", "/v1/notes", 200, NOTES),
         ]);
         let client = server.client_with_cache();
@@ -984,7 +982,7 @@ mod tests {
                 "note-id",
                 &UpdateNoteRequest {
                     title: Some("Renamed".to_owned()),
-                    ..UpdateNoteRequest::default()
+                    ..UpdateNoteRequest::new("body".to_owned())
                 },
             )
             .await
@@ -1211,7 +1209,7 @@ mod tests {
                 "note-id",
                 &UpdateNoteRequest {
                     title: Some("Renamed".to_owned()),
-                    ..UpdateNoteRequest::default()
+                    ..UpdateNoteRequest::new("body".to_owned())
                 },
             )
             .await
@@ -1311,7 +1309,7 @@ mod tests {
                 "id",
                 &UpdateNoteRequest {
                     title: Some("Renamed".to_owned()),
-                    ..UpdateNoteRequest::default()
+                    ..UpdateNoteRequest::new("body".to_owned())
                 },
             )
             .await
@@ -1400,7 +1398,7 @@ mod tests {
         )
         .expect_header("content-type", "application/json")
         .expect_body("the cleared parent folder", |body| {
-            body == r#"{"parentFolderId":null}"#
+            body == r#"{"content":"body","parentFolderId":null}"#
         })]);
         let update_client = update_server.client();
         update_client
@@ -1409,7 +1407,7 @@ mod tests {
                 "note/id",
                 &UpdateNoteRequest {
                     parent_folder_id: Some(None),
-                    ..UpdateNoteRequest::default()
+                    ..UpdateNoteRequest::new("body".to_owned())
                 },
             )
             .await
@@ -1808,18 +1806,8 @@ mod tests {
                 .response_header("Retry-After", "0"),
             Scenario::new("GET", "/v1/retry", 200, r#"{"ok":true}"#),
         ]);
-        let retry = crate::config::RetryConfig {
-            max_retries: 3,
-            initial_backoff: Duration::from_millis(1),
-            max_backoff: Duration::from_millis(2),
-        };
-        let get_client = HackmdClient::new(Config::for_loopback_test_with_retry(
-            &get_server.api_url,
-            "fixture-token",
-            retry,
-        ))
-        .expect("retry client should build");
-        let response = get_client
+        let response = get_server
+            .client_with_fast_retry()
             .request_json::<Value>(Method::GET, &["retry"], NO_BODY)
             .await
             .expect("GET should recover")
@@ -1839,13 +1827,8 @@ mod tests {
                     body == r#"{"title":"same replacement"}"#
                 }),
         ]);
-        let patch_client = HackmdClient::new(Config::for_loopback_test_with_retry(
-            &patch_server.api_url,
-            "fixture-token",
-            retry,
-        ))
-        .expect("retry client should build");
-        patch_client
+        patch_server
+            .client_with_fast_retry()
             .write_idempotent(
                 Method::PATCH,
                 &["notes", "id"],
@@ -1863,18 +1846,41 @@ mod tests {
         )
         .expect_header("content-type", "application/json")
         .expect_body("an empty JSON object", |body| body == "{}")]);
-        let post_client = HackmdClient::new(Config::for_loopback_test_with_retry(
-            &post_server.api_url,
-            "fixture-token",
-            retry,
-        ))
-        .expect("retry client should build");
         assert!(matches!(
-            post_client
+            post_server
+                .client_with_fast_retry()
                 .request_json::<Value>(Method::POST, &["notes"], Some(&json!({})))
                 .await,
             Err(HackmdError::WriteUnconfirmed { .. })
         ));
         post_server.finish();
+
+        // Every note PATCH carries a body that was read or checked just before,
+        // so it is sent once: a retrying client would reach the 202.
+        let note_server = SequenceServer::spawn_scenarios([
+            Scenario::new("PATCH", "/v1/notes/id", 503, ""),
+            Scenario::new("PATCH", "/v1/notes/id", 202, ""),
+        ]);
+        assert!(matches!(
+            note_server
+                .client_with_fast_retry()
+                .update_note(&Workspace::Personal, "id", &UpdateNoteRequest::new("body"))
+                .await,
+            Err(HackmdError::WriteUnconfirmed { .. })
+        ));
+
+        // Not after a rate limit either; the error says the retry must start by
+        // reading the note again.
+        let limited_server = SequenceServer::spawn_scenarios([
+            Scenario::new("PATCH", "/v1/notes/id", 429, "").response_header("Retry-After", "0"),
+            Scenario::new("PATCH", "/v1/notes/id", 202, ""),
+        ]);
+        let error = limited_server
+            .client_with_fast_retry()
+            .update_note(&Workspace::Personal, "id", &UpdateNoteRequest::new("body"))
+            .await
+            .expect_err("a rate-limited note write is not retried");
+        assert!(matches!(error, HackmdError::RateLimited { .. }), "{error}");
+        assert!(error.to_string().contains("read the note again"), "{error}");
     }
 }

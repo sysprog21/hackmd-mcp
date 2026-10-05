@@ -57,6 +57,11 @@ pub(crate) struct PullNoteOutput {
     pub(crate) title: String,
     pub(crate) local_path: PathBuf,
     pub(crate) bytes: usize,
+    /// The body hash now recorded as the baseline, the same `sha256:` form
+    /// `hackmd_push_note` and `hackmd_get_note` report. It is the hash of the
+    /// bytes just written locally, so a caller can confirm the file landed
+    /// intact and anchor later verification without reading the sync sidecar.
+    pub(crate) body_hash: String,
 }
 
 #[derive(Debug, Error)]
@@ -160,6 +165,7 @@ pub(crate) async fn pull_note(
         workspace: note.workspace,
         note_id: note.note_id,
         title: remote.title,
+        body_hash: state.baseline_body_hash,
         // The canonical path the record keeps, which is what push reports back.
         local_path: state.local_path,
         bytes: size_bytes,
@@ -322,6 +328,11 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&destination).expect("note should read"),
             "# Exact\n\nBody\n"
+        );
+        assert_eq!(
+            output.body_hash,
+            crate::hash::body_hash("# Exact\n\nBody\n"),
+            "pull reports the hash of the exact bytes it wrote"
         );
         let tracked = state_dir.join("tracked");
         let entries = fs::read_dir(&tracked)

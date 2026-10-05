@@ -73,7 +73,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_create_note",
-        description = "Create a HackMD note in a personal or team workspace and return its metadata and patch_path (not the body). Folder placement is read back after POST; a compatibility PATCH runs only if the API dropped parentFolderId.",
+        description = "Create a HackMD note in a personal or team workspace and return its metadata and patch_path (not the body). Folder placement is read back after POST; a compatibility PATCH runs only if the API dropped parentFolderId, resending the body so it is kept. Title precedence: a YAML title: in content wins, then a leading H1, then title.",
         annotations(
             title = "Create HackMD Note",
             read_only_hint = false,
@@ -94,7 +94,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_update_note",
-        description = "Edit a HackMD note's body with a patch (the default and safe way), or update its metadata, or replace the whole body with content. The destructive hint is for content; a patch is context-checked and changes only what its hunks name. It applies only when every hunk's context matches the current body exactly once, then the write is confirmed by reading it back. Pass expected_hash (body_hash from hackmd_get_note) with a patch or content to refuse the write if the body changed since you read it. Format:\n*** Begin Patch\n*** Update File: <patch_path from hackmd_get_note>\n@@ optional anchor line\n context line\n-removed line\n+added line\n*** End Patch\nText after @@ is an anchor that must equal exactly one line, ignoring leading and trailing whitespace; the hunk then applies after it, and an addition-only hunk is inserted directly below it. A line range such as @@ -3,4 +3,5 @@ is not an anchor. A hunk closed by *** End of File must match the end of the body, and an addition-only one appends there. A patch goes in a call of its own. content overwrites the complete unversioned body. For @owner/slug references, refresh=true bypasses the 60-second caches.",
+        description = "Edit a HackMD note's body with a patch (the default and safe way), or update its metadata, or replace the whole body with content. The destructive hint is for content; a patch is context-checked and changes only what its hunks name. It applies only when every hunk's context matches the current body exactly once, then the write is confirmed by reading it back. Pass expected_hash (body_hash from hackmd_get_note) with any update to refuse the write if the body changed since you read it. A metadata-only update reads the current body and sends it back with the change: an edit landing between that read and the write is reverted, and expected_hash catches any made before it. Title precedence: a YAML title: in the body wins, then a leading H1, then title, so on a note with either a title change has no effect. Format:\n*** Begin Patch\n*** Update File: <patch_path from hackmd_get_note>\n@@ optional anchor line\n context line\n-removed line\n+added line\n*** End Patch\nText after @@ is an anchor that must equal exactly one line, ignoring leading and trailing whitespace; the hunk then applies after it, and an addition-only hunk is inserted directly below it. A line range such as @@ -3,4 +3,5 @@ is not an anchor. A hunk closed by *** End of File must match the end of the body, and an addition-only one appends there. A patch goes in a call of its own. content overwrites the complete unversioned body. For @owner/slug references, refresh=true bypasses the 60-second caches.",
         annotations(
             title = "Update HackMD Note",
             read_only_hint = false,
@@ -110,7 +110,9 @@ impl HackmdServer {
         reply::respond_resolved(
             crate::note::crud::update_note(&self.client, input).await,
             |output| match output {
-                UpdateNoteOutput::Updated { note } => format!("Updated HackMD note {}", note.id),
+                UpdateNoteOutput::Updated { note, .. } => {
+                    format!("Updated HackMD note {}", note.id)
+                }
                 UpdateNoteOutput::Patched(edit) if edit.changed => {
                     format!("Edited HackMD note {}", edit.note_id)
                 }

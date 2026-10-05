@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::FutureExt;
 use reqwest::{Method, StatusCode};
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[path = "support/liveapi.rs"]
 #[allow(
@@ -52,6 +52,144 @@ async fn cleanup(api: &LiveApi, fixtures: &mut Fixtures) {
         )
         .await;
     }
+}
+
+/// Probe for TODO.md, reported rather than asserted so either answer is
+/// recorded; the note's body is restored before returning.
+///
+/// First half: does a note PATCH that omits content blank the body?
+/// `update_note` and create's folder fallback resend the body because it is
+/// believed to. The body is judged only once both fields the PATCH set show,
+/// since an earlier read could still show the old note and pass for "keeps".
+///
+/// Second half: patch edits and pushes send content alone and assume every
+/// other field survives. A distinct temporary body is sent so the fields are
+/// judged only once that PATCH shows; resending the same body could match a
+/// read from before it.
+async fn probe_partial_note_patch(
+    api: &LiveApi,
+    note: &[&str],
+    body: &str,
+    label: &str,
+    suffix: u128,
+) {
+    // A note just created may not show its body yet; judged before it does,
+    // creation lag would pass for the PATCH blanking it.
+    if api
+        .poll_json(note, |read| read["content"] == body)
+        .await
+        .is_none()
+    {
+        eprintln!("measured ({label}): note PATCH probes are inconclusive, the body never showed");
+        return;
+    }
+    let marker = format!("probe {suffix}");
+    let tags = json!([format!("probe-{suffix}")]);
+    api.empty_ok(
+        Method::PATCH,
+        note,
+        Some(&json!({"description": marker, "tags": tags})),
+    )
+    .await;
+    let probed = api
+        .poll_json(note, |read| {
+            read["description"] == marker.as_str() && read["tags"] == tags
+        })
+        .await;
+    let verdict = match probed.as_ref().map(|read| &read["content"]) {
+        None => "is inconclusive, the description and tags never showed",
+        Some(content) if *content == body => "keeps the body",
+        Some(content) if *content == "" => "blanks the body",
+        Some(content) if content.is_null() => "drops the body (null)",
+        Some(_) => "changes the body",
+    };
+    eprintln!(
+        "measured ({label}): content-less note PATCH {verdict} (read {:?})",
+        probed.as_ref().map(|read| &read["content"])
+    );
+
+    // Judged only when the first half confirmed the description and tags
+    // were set; otherwise a "clears" would only mean they never landed.
+    if probed.is_none() {
+        eprintln!(
+            "measured ({label}): content-only note PATCH is inconclusive, the description and tags were never set"
+        );
+    }
+    let temporary = format!("{body}\nprobe {suffix}\n");
+    api.empty_ok(Method::PATCH, note, Some(&json!({"content": temporary})))
+        .await;
+    match api
+        .poll_json(note, |read| read["content"] == temporary.as_str())
+        .await
+    {
+        None => eprintln!(
+            "measured ({label}): content-only note PATCH is inconclusive, the body never showed"
+        ),
+        Some(_) if probed.is_none() => {}
+        Some(read) => {
+            for (field, set) in [("description", json!(marker)), ("tags", tags.clone())] {
+                eprintln!(
+                    "measured ({label}): content-only note PATCH {} {field} (read {})",
+                    if read[field] == set {
+                        "keeps"
+                    } else {
+                        "clears"
+                    },
+                    read[field]
+                );
+            }
+        }
+    }
+
+    api.empty_ok(Method::PATCH, note, Some(&json!({"content": body})))
+        .await;
+    api.poll_json(note, |read| read["content"] == body)
+        .await
+        .expect("the probe must restore the body");
+}
+
+/// Sets one parent's order through the same read-modify-write `child_order`
+/// uses, then requires a later read to show it alongside every parent the
+/// first read had. `child_order` PUTs back the whole map it reads, so a GET
+/// that dropped entries would make it wipe them; this shows the GET returns
+/// what was written, not that it returns every entry `HackMD` holds. The
+/// original map is put back. Returns how many parents it had, or `None` when
+/// that parent already had this order, so the write could show nothing.
+async fn check_folder_order(
+    api: &LiveApi,
+    route: &[&str],
+    parent: &str,
+    children: &[&str],
+) -> Option<usize> {
+    let original = api.json(Method::GET, route, None).await;
+    let parents = original
+        .as_object()
+        .unwrap_or_else(|| panic!("folder order must be a map, got {original}"))
+        .clone();
+    if original[parent] == json!(children) {
+        return None;
+    }
+    let mut seeded = original.clone();
+    seeded[parent] = json!(children);
+    api.empty_ok(Method::PUT, route, Some(&json!({"order": seeded})))
+        .await;
+    // The map is the whole account's, so the original goes back before any
+    // check can fail, including a read that panics on an HTTP error.
+    let read =
+        std::panic::AssertUnwindSafe(api.poll_json(route, |read| read[parent] == json!(children)))
+            .catch_unwind()
+            .await;
+    api.empty_ok(Method::PUT, route, Some(&json!({"order": original})))
+        .await;
+    let read = read
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        .expect("a parent's order just written must read back");
+    for (key, value) in &parents {
+        if key != parent {
+            assert_eq!(&read[key], value, "folder order lost parent {key}");
+        }
+    }
+    Some(parents.len())
 }
 
 #[tokio::test]
@@ -137,15 +275,21 @@ async fn personal_crud_folder_order_trash_and_restore() {
         let unchanged = api.json(Method::GET, &["notes", &note_id], None).await;
         assert_eq!(unchanged["content"], edited);
 
-        let order = api
-            .json(Method::GET, &["folders", "folder-order"], None)
-            .await;
-        api.empty_ok(
-            Method::PUT,
+        probe_partial_note_patch(&api, &["notes", &note_id], &edited, "personal", suffix).await;
+
+        if check_folder_order(
+            &api,
             &["folders", "folder-order"],
-            Some(&json!({"order": order})),
+            &parent_id,
+            &[child_id.as_str()],
         )
-        .await;
+        .await
+        .is_none()
+        {
+            eprintln!(
+                "measured (personal): folder-order check is inconclusive, the order was already set"
+            );
+        }
 
         api.delete_note(&note_id).await;
         let trash = api.json(Method::GET, &["trash"], None).await;
@@ -253,6 +397,60 @@ async fn team_folder_updates_and_image_route_are_measured() {
             .await;
         assert_eq!(rooted["parentFolderId"], parent_id);
 
+        // The team folder-order route is inferred from the personal one.
+        let parents = check_folder_order(
+            &api,
+            &["teams", team_path.as_str(), "folders", "folder-order"],
+            &parent_id,
+            &[child_id.as_str()],
+        )
+        .await;
+        eprintln!(
+            "measured (team): folder-order {}",
+            parents.map_or_else(
+                || "check is inconclusive, the order was already set".to_owned(),
+                |parents| format!("read-modify-write keeps {parents} parents"),
+            )
+        );
+
+        // Probe for TODO.md: the update_folder read-back checks only the fields
+        // sent, so whether a name-only PATCH keeps the rest is measured here,
+        // not assumed. The extras go in their own PATCH so a value HackMD
+        // rejects only makes the probe inconclusive.
+        let extras = [
+            ("description", "probe"),
+            ("icon", "1F600"),
+            ("color", "#4F46E5"),
+        ];
+        let folder = ["teams", team_path.as_str(), "folders", child_id.as_str()];
+        let shows = |read: &Value, field: &str, value: &str| {
+            read[field]
+                .as_str()
+                .is_some_and(|read| read.eq_ignore_ascii_case(value))
+        };
+        let extras_set = api
+            .request(
+                Method::PATCH,
+                &folder,
+                Some(&Value::Object(
+                    extras
+                        .iter()
+                        .map(|(field, value)| ((*field).to_owned(), json!(value)))
+                        .collect(),
+                )),
+            )
+            .await
+            .status
+            .is_success()
+            && api
+                .poll_json(&folder, |read| {
+                    extras
+                        .iter()
+                        .all(|(field, value)| shows(read, field, value))
+                })
+                .await
+                .is_some();
+
         let renamed = format!("codex-live-renamed-{suffix}");
         api.empty_ok(
             Method::PATCH,
@@ -261,13 +459,22 @@ async fn team_folder_updates_and_image_route_are_measured() {
         )
         .await;
         let updated = api
-            .json(
-                Method::GET,
-                &["teams", &team_path, "folders", &child_id],
-                None,
-            )
-            .await;
-        assert_eq!(updated["name"], renamed);
+            .poll_json(&folder, |read| read["name"] == renamed.as_str())
+            .await
+            .expect("the renamed folder should read back");
+        for (field, value) in extras {
+            let verdict = if !extras_set {
+                "is inconclusive on"
+            } else if shows(&updated, field, value) {
+                "keeps"
+            } else {
+                "clears"
+            };
+            eprintln!(
+                "measured (team): name-only folder PATCH {verdict} {field} (read {})",
+                updated[field]
+            );
+        }
 
         let created = api
             .json(
@@ -281,6 +488,14 @@ async fn team_folder_updates_and_image_route_are_measured() {
             .await;
         let created_note_id = created["id"].as_str().expect("team note ID").to_owned();
         note_id = Some(created_note_id.clone());
+        probe_partial_note_patch(
+            &api,
+            &["teams", &team_path, "notes", &created_note_id],
+            "# image probe",
+            "team",
+            suffix,
+        )
+        .await;
         let part = reqwest::multipart::Part::bytes(vec![
             137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
             8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 8, 215, 99, 248, 207,

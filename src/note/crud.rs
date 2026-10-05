@@ -10,6 +10,7 @@ use crate::{
     dto::{
         CommentPermission, CreateNoteRequest, NotePermission, NoteResponse, PatchField,
         PayloadError, SuggestEditPermission, UpdateNoteRequest, deserialize_patch_field,
+        validate_permission_order,
     },
     models::Workspace,
     note::{
@@ -70,8 +71,8 @@ pub(crate) struct UpdateNoteInput {
     /// `@owner/slug` URL.
     #[serde(default)]
     pub(crate) refresh: bool,
-    /// New title. `HackMD` may still derive the title from the body's first
-    /// heading.
+    /// New title. A YAML `title:` in the body wins, then a leading H1, and
+    /// only then this field, so on a note with either it changes nothing.
     pub(crate) title: Option<String>,
     /// Explicit full-body replacement. Prefer `patch` for normal content
     /// edits: this overwrites the complete unversioned body.
@@ -107,10 +108,10 @@ pub(crate) struct UpdateNoteInput {
     /// an anchor. A hunk closed by `*** End of File` must match the end of
     /// the body, and an addition-only one appends there.
     pub(crate) patch: Option<String>,
-    /// The `body_hash` from `hackmd_get_note` that a `patch` or `content` was
-    /// written against. The write is then refused if the body has changed
-    /// since, so an edit made meanwhile, in the browser or by another agent,
-    /// is not overwritten.
+    /// The `body_hash` from `hackmd_get_note` that the write was made against.
+    /// The write is then refused if the body has changed since, so an edit
+    /// made meanwhile, in the browser or by another agent, is not overwritten.
+    /// A metadata-only change resends the current body, so it takes one too.
     pub(crate) expected_hash: Option<String>,
 }
 
@@ -169,7 +170,15 @@ pub(crate) struct CreateNoteOutput {
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub(crate) enum UpdateNoteOutput {
     /// Fields were set: the note as read back, without its body.
-    Updated { note: Box<NoteDetail> },
+    Updated {
+        note: Box<NoteDetail>,
+        /// `null` when no folder was asked for. Otherwise whether that read
+        /// shows the note in the requested folder (or at the root for
+        /// `null`). Reported, not waited on: `HackMD` may show a move late,
+        /// so `false` is not a failure, and since the read lists ancestors, a
+        /// move up to an ancestor of the old folder shows `true` at once.
+        folder_placement_confirmed: Option<bool>,
+    },
     /// A patch was applied, or matched a body that already had it.
     Patched(EditNoteOutput),
 }
@@ -193,8 +202,6 @@ pub(crate) enum CrudError {
     PatchWithFields,
     #[error("nothing to update: give a patch, content, or the metadata fields to change")]
     NothingToUpdate,
-    #[error("expected_hash guards a body write; give it with patch or content")]
-    ExpectedHashWithoutBody,
     #[error(
         "expected_hash must be a body_hash from hackmd_get_note: sha256: and 64 lowercase hex digits"
     )]
@@ -203,6 +210,10 @@ pub(crate) enum CrudError {
         "restore takes the internal note ID from hackmd_list_notes with source trash; a trashed note has no live @owner/slug to resolve, and refresh does not apply"
     )]
     RestoreNeedsId,
+    #[error(
+        "cannot change note {note_id}'s metadata: HackMD returned no body to send back with it, and an update without one may blank the note"
+    )]
+    NoBodyToResend { note_id: String },
     #[error(transparent)]
     BodyChanged(#[from] BodyChanged),
     #[error("only personal notes can be restored from trash; team deletion has no restore")]
@@ -215,7 +226,9 @@ pub(crate) enum CrudError {
     Reference(#[from] NoteRefError),
     #[error(transparent)]
     Api(#[from] HackmdError),
-    #[error("note {note_id} was created, but folder placement failed: {source}")]
+    #[error(
+        "note {note_id} was created, but folder placement failed: {source}. Do not create it again; set its folder with hackmd_update_note parent_folder_id"
+    )]
     FolderPlacement {
         note_id: String,
         #[source]
@@ -231,11 +244,11 @@ impl crate::reply::ToolError for CrudError {
             Self::UnsupportedPatchPermissions
             | Self::PatchWithFields
             | Self::NothingToUpdate
-            | Self::ExpectedHashWithoutBody
             | Self::MalformedExpectedHash
             | Self::RestoreNeedsId
             | Self::TeamRestore => ErrorKind::InvalidInput,
             Self::BodyChanged(_) => ErrorKind::Conflict,
+            Self::NoBodyToResend { .. } => ErrorKind::Upstream,
             Self::Edit(error) => error.kind(),
             Self::Payload(error) => error.kind(),
             Self::Reference(error) => error.kind(),
@@ -243,6 +256,40 @@ impl crate::reply::ToolError for CrudError {
             Self::FolderPlacement { .. } => ErrorKind::PartialWrite,
         }
     }
+}
+
+/// Whether a read shows the metadata a PATCH set, so a read from before the
+/// PATCH is not reported as its result. Values are compared the way `HackMD`
+/// may normalize them, so a write that landed is not failed over a format:
+/// tags as a trimmed set without empties (as the official CLI sends them),
+/// a missing description as empty, a permalink ignoring case. Left out: the
+/// title, which `HackMD` may derive from the body, and the folder, whose read
+/// is an ancestor list of unverified order (and unmeasured for teams), so a
+/// move to an ancestor would match before it landed.
+fn shows_metadata(sent: &UpdateNoteRequest<'_>, note: &NoteResponse) -> bool {
+    fn tag_set(tags: &[String]) -> std::collections::BTreeSet<&str> {
+        tags.iter()
+            .map(|tag| tag.trim())
+            .filter(|tag| !tag.is_empty())
+            .collect()
+    }
+    sent.tags
+        .as_ref()
+        .is_none_or(|tags| tag_set(tags) == tag_set(&note.tags))
+        && sent.description.as_ref().is_none_or(|description| {
+            note.description.as_deref().unwrap_or_default() == description
+        })
+        && sent.permalink.as_ref().is_none_or(|permalink| {
+            note.permalink
+                .as_ref()
+                .is_some_and(|read| read.eq_ignore_ascii_case(permalink))
+        })
+        && sent
+            .read_permission
+            .is_none_or(|permission| note.read_permission == Some(permission))
+        && sent
+            .write_permission
+            .is_none_or(|permission| note.write_permission == Some(permission))
 }
 
 fn placed_in(note: &NoteResponse, folder_id: &str) -> bool {
@@ -254,7 +301,7 @@ pub(crate) async fn create_note(
     input: CreateNoteInput,
 ) -> Result<CreateNoteOutput, CrudError> {
     let folder = input.parent_folder_id;
-    let payload = CreateNoteRequest {
+    let mut payload = CreateNoteRequest {
         title: input.title,
         content: input.content,
         tags: input.tags,
@@ -286,10 +333,21 @@ pub(crate) async fn create_note(
             .get_note(&input.workspace, &note_id)
             .await
             .map_err(placement_failed)?;
-        if !placed_in(&note, folder_id) {
+
+        // The PATCH must carry the body (see `UpdateNoteRequest`). The one this
+        // call just created the note with comes first: nobody else has edited a
+        // note this new, while the read may be too early to show it. With
+        // neither, there is no body to send, so placement is left unconfirmed
+        // rather than risk blanking the note.
+        let body = if placed_in(&note, folder_id) {
+            None
+        } else {
+            payload.content.take().or_else(|| note.content.take())
+        };
+        if let Some(body) = body {
             let placement = UpdateNoteRequest {
                 parent_folder_id: Some(Some(folder_id.clone())),
-                ..UpdateNoteRequest::default()
+                ..UpdateNoteRequest::new(body)
             };
             client
                 .update_note(&input.workspace, &note_id, &placement)
@@ -304,7 +362,7 @@ pub(crate) async fn create_note(
             // error would create a second one on retry.
             note = client
                 .poll_readback(
-                    0,
+                    placement.content.len(),
                     || client.get_note(&input.workspace, &note_id),
                     |note| placed_in(note, folder_id),
                 )
@@ -357,20 +415,7 @@ pub(crate) async fn update_note(
     if input.comment_permission.is_some() || input.suggest_edit_permission.is_some() {
         return Err(CrudError::UnsupportedPatchPermissions);
     }
-    if input.expected_hash.is_some() && input.content.is_none() {
-        return Err(CrudError::ExpectedHashWithoutBody);
-    }
-    let payload = UpdateNoteRequest {
-        title: input.title,
-        content: input.content,
-        tags: input.tags,
-        description: input.description,
-        read_permission: input.read_permission,
-        write_permission: input.write_permission,
-        permalink: input.permalink,
-        parent_folder_id: input.parent_folder_id.into_request(),
-    };
-    payload.validate()?;
+    validate_permission_order(input.read_permission, input.write_permission)?;
     let resolution = crate::note::reference::resolve_note_ref(
         client,
         input.workspace,
@@ -381,32 +426,69 @@ pub(crate) async fn update_note(
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
-    if let Some(expected) = input.expected_hash.as_deref() {
-        let (_, current) = client.get_note_body(&note.workspace, &note.note_id).await?;
-        ensure_unchanged(&note.note_id, &current, Some(expected))?;
-    }
+
+    // A metadata-only change resends the body it reads here. expected_hash is
+    // checked against that same read, so what goes back is the body the agent
+    // saw; an edit landing between this read and the PATCH is still reverted,
+    // since `HackMD` has no conditional write.
+    let replacing = input.content.is_some();
+    let content = match (input.content, input.expected_hash.as_deref()) {
+        (Some(content), None) => content,
+        (replacement, expected) => {
+            let resending = replacement.is_none();
+            let (_, current) = client
+                .get_note_body(&note.workspace, &note.note_id)
+                .await
+                .map_err(|error| match error {
+                    HackmdError::MissingContent { note_id } if resending => {
+                        CrudError::NoBodyToResend { note_id }
+                    }
+                    other => other.into(),
+                })?;
+            ensure_unchanged(&note.note_id, &current, expected)?;
+            replacement.unwrap_or(current)
+        }
+    };
+    let mut payload = UpdateNoteRequest {
+        title: input.title,
+        content: content.into(),
+        tags: input.tags,
+        description: input.description,
+        read_permission: input.read_permission,
+        write_permission: input.write_permission,
+        permalink: input.permalink,
+        parent_folder_id: input.parent_folder_id.into_request(),
+    };
     client
         .update_note(&note.workspace, &note.note_id, &payload)
         .await?;
 
-    // Only a body replacement is compared. Metadata is not: `HackMD` derives a
-    // title from the body's first heading, so a supplied title can legitimately
-    // read back different, and waiting on it would only stall.
+    // A body replacement is compared, and only it is kept alive for the
+    // read-back; a resent body is not, since an edit can land after the PATCH.
+    // The metadata sent is compared too (see `shows_metadata`).
+    let written_bytes = payload.content.len();
+    let body = std::mem::take(&mut payload.content);
+    let expected = replacing.then_some(body);
     let written = client
-        .confirm_note_write(
-            &note.workspace,
-            &note.note_id,
-            payload.content.as_ref().map_or(0, String::len),
-            |readback| {
-                payload
-                    .content
+        .confirm_note_write(&note.workspace, &note.note_id, written_bytes, |readback| {
+            shows_metadata(&payload, readback)
+                && expected
                     .as_deref()
-                    .is_none_or(|content| readback.content.as_deref() == Some(content))
-            },
-        )
+                    .is_none_or(|body| readback.content.as_deref() == Some(body))
+        })
         .await?;
+    // Judged from the read being returned, like create's flag, so it can
+    // never disagree with the folder_ids the caller reads out of it.
+    let folder_placement_confirmed = payload
+        .parent_folder_id
+        .as_ref()
+        .map(|folder| match folder {
+            Some(id) => placed_in(&written, id),
+            None => written.folder_paths.is_empty(),
+        });
     Ok(Ok(UpdateNoteOutput::Updated {
         note: Box::new(crate::local::offload(|| without_content(note, written))),
+        folder_placement_confirmed,
     }))
 }
 
@@ -502,18 +584,6 @@ mod tests {
             update_note(&client, update(json!({"note_ref": "id"}))).await,
             Err(CrudError::NothingToUpdate)
         ));
-        assert!(matches!(
-            update_note(
-                &client,
-                update(json!({
-                    "note_ref": "id",
-                    "title": "T",
-                    "expected_hash": crate::hash::body_hash("")
-                }))
-            )
-            .await,
-            Err(CrudError::ExpectedHashWithoutBody)
-        ));
         for malformed in ["sha256:x", "SHA256:00", " sha256:00"] {
             assert!(matches!(
                 update_note(
@@ -562,6 +632,31 @@ mod tests {
             Err(CrudError::BodyChanged(_))
         ));
         assert_eq!(fixture.finish().len(), 1, "nothing may be written");
+    }
+
+    #[tokio::test]
+    async fn metadata_update_honors_expected_hash_on_the_body_it_resends() {
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/id",
+            200,
+            r#"{"id":"id","title":"T","content":"edited meanwhile"}"#,
+        )]);
+        let input = serde_json::from_value(json!({
+            "note_ref": "id",
+            "title": "New",
+            "expected_hash": crate::hash::body_hash("as read")
+        }))
+        .expect("input should deserialize");
+        assert!(matches!(
+            update_note(&fixture.client(), input).await,
+            Err(CrudError::BodyChanged(_))
+        ));
+        assert_eq!(
+            fixture.finish().len(),
+            1,
+            "a stale body must not be sent back"
+        );
     }
 
     #[tokio::test]
@@ -621,14 +716,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_update_is_read_back() {
+    async fn metadata_only_update_resends_the_body_so_hackmd_cannot_blank_it() {
+        // HackMD clears the body on a PATCH that omits content, so a metadata
+        // change (here a title) must first read the body and send it back. The
+        // read-back shows an edit typed after the PATCH; a resent body is not
+        // compared, so that must not fail a title change that took.
         let server = SequenceServer::spawn_scenarios([
-            Scenario::new("PATCH", "/v1/notes/note%2Fid", 202, ""),
             Scenario::new(
                 "GET",
                 "/v1/notes/note%2Fid",
                 200,
-                r#"{"id":"note/id","title":"Updated"}"#,
+                r#"{"id":"note/id","title":"Old","content":"keep me"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/note%2Fid", 202, "").expect_body(
+                "the metadata change plus the preserved body",
+                |body| {
+                    body.contains(r#""title":"Updated""#) && body.contains(r#""content":"keep me""#)
+                },
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note%2Fid",
+                200,
+                r#"{"id":"note/id","title":"Updated","content":"typed after"}"#,
             ),
         ]);
         let client = server.client();
@@ -641,11 +751,165 @@ mod tests {
             .await
             .expect("update should succeed")
             .expect("direct reference should resolve");
-        let super::UpdateNoteOutput::Updated { note } = output else {
+        let super::UpdateNoteOutput::Updated { note, .. } = output else {
             panic!("fields without a patch should update the note");
         };
         assert_eq!(note.title, "Updated");
         assert_eq!(note.patch_path, "notes/note/id.md");
+        server.finish();
+    }
+
+    #[tokio::test]
+    async fn a_metadata_update_without_a_body_to_resend_says_why() {
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/id",
+            200,
+            r#"{"id":"id","title":"T"}"#,
+        )]);
+        let input = serde_json::from_value(json!({"note_ref": "id", "title": "New"}))
+            .expect("input should deserialize");
+        let error = update_note(&fixture.client(), input)
+            .await
+            .expect_err("nothing can be sent without a body");
+        assert!(matches!(error, CrudError::NoBodyToResend { .. }), "{error}");
+        assert_eq!(fixture.finish().len(), 1, "nothing may be written");
+    }
+
+    #[test]
+    fn metadata_is_compared_the_way_hackmd_may_normalize_it() {
+        use super::{NoteResponse, UpdateNoteRequest, shows_metadata};
+        use crate::dto::NotePermission;
+
+        let read = |value: serde_json::Value| -> NoteResponse {
+            serde_json::from_value(value).expect("note should deserialize")
+        };
+        let sent = UpdateNoteRequest {
+            tags: Some(vec![
+                " a".to_owned(),
+                "b".to_owned(),
+                "b".to_owned(),
+                String::new(),
+            ]),
+            description: Some(String::new()),
+            permalink: Some("My-Note".to_owned()),
+            read_permission: Some(NotePermission::Guest),
+            write_permission: Some(NotePermission::Owner),
+            parent_folder_id: Some(Some("elsewhere".to_owned())),
+            ..UpdateNoteRequest::new("body")
+        };
+        let shown = read(json!({
+            "id": "n", "title": "T", "tags": ["b", "a"], "permalink": "my-note",
+            "readPermission": "guest", "writePermission": "owner"
+        }));
+        assert!(
+            shows_metadata(&sent, &shown),
+            "normalized values and an unconfirmed folder must match"
+        );
+        for stale in [
+            json!({"id": "n", "title": "T", "tags": ["a"], "permalink": "my-note",
+                   "readPermission": "guest", "writePermission": "owner"}),
+            json!({"id": "n", "title": "T", "tags": ["a", "b"], "description": "old",
+                   "permalink": "my-note", "readPermission": "guest", "writePermission": "owner"}),
+            json!({"id": "n", "title": "T", "tags": ["a", "b"], "permalink": "other",
+                   "readPermission": "guest", "writePermission": "owner"}),
+            json!({"id": "n", "title": "T", "tags": ["a", "b"], "permalink": "my-note",
+                   "readPermission": "owner", "writePermission": "owner"}),
+            json!({"id": "n", "title": "T", "tags": ["a", "b"], "permalink": "my-note",
+                   "readPermission": "guest", "writePermission": "signed_in"}),
+        ] {
+            assert!(!shows_metadata(&sent, &read(stale.clone())), "{stale}");
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_that_never_shows_is_a_readback_error() {
+        let fixture = SequenceServer::spawn_repeating([
+            (200, r#"{"id":"id","title":"T","content":"body"}"#),
+            (202, ""),
+            (
+                200,
+                r#"{"id":"id","title":"T","content":"body","tags":["old"]}"#,
+            ),
+        ]);
+        let input = serde_json::from_value(json!({"note_ref": "id", "tags": ["new"]}))
+            .expect("input should deserialize");
+        assert!(matches!(
+            update_note(&fixture.client(), input).await,
+            Err(CrudError::Api(super::HackmdError::ReadbackMismatch { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_folder_move_the_read_does_not_show_is_reported_unconfirmed() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"T","content":"body","folderPaths":[{"id":"old","name":"Old"}]}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/id", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"T","content":"body","folderPaths":[{"id":"old","name":"Old"}]}"#,
+            ),
+        ]);
+        let input = serde_json::from_value(json!({"note_ref": "id", "parent_folder_id": "new"}))
+            .expect("input should deserialize");
+        let output = update_note(&server.client(), input)
+            .await
+            .expect("update should succeed")
+            .expect("direct reference should resolve");
+        server.finish();
+        let super::UpdateNoteOutput::Updated {
+            note,
+            folder_placement_confirmed,
+        } = output
+        else {
+            panic!("fields without a patch should update the note");
+        };
+        assert_eq!(folder_placement_confirmed, Some(false));
+        assert_eq!(note.folder_ids, ["old"]);
+    }
+
+    #[tokio::test]
+    async fn a_metadata_update_waits_for_a_read_that_shows_it() {
+        // The first read-back predates the PATCH and must not be reported as
+        // its result; the second shows the tags, in another order.
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"T","content":"body"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/id", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"T","content":"body","tags":[]}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"T","content":"body","tags":["b","a"]}"#,
+            ),
+        ]);
+        let input = serde_json::from_value(json!({"note_ref": "id", "tags": ["a", "b"]}))
+            .expect("input should deserialize");
+        let output = update_note(&server.client(), input)
+            .await
+            .expect("update should succeed")
+            .expect("direct reference should resolve");
+        let super::UpdateNoteOutput::Updated { note, .. } = output else {
+            panic!("fields without a patch should update the note");
+        };
+        assert_eq!(note.tags, ["b", "a"]);
         server.finish();
     }
 
@@ -667,7 +931,7 @@ mod tests {
             .expect_err("an unconfirmed write should fail");
         assert_eq!(
             error.to_string(),
-            "HackMD accepted the update for note note-id, but read-back content did not match; call hackmd_get_note and compare before writing again"
+            "HackMD accepted the update for note note-id, but no read-back showed it; call hackmd_get_note and compare before writing again"
         );
     }
 
@@ -696,7 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn unplaced_note_is_reported_not_failed() {
-        const UNPLACED: &str = r#"{"id":"new-id","title":"New"}"#;
+        const UNPLACED: &str = r#"{"id":"new-id","title":"New","content":"kept"}"#;
 
         // Create, first read, PATCH, then a read-back that never shows the
         // folder however many times it is retried.
@@ -734,11 +998,11 @@ mod tests {
                 "GET",
                 "/v1/notes/new-id",
                 200,
-                r#"{"id":"new-id","title":"New"}"#,
+                r#"{"id":"new-id","title":"New","content":"kept"}"#,
             ),
             Scenario::new("PATCH", "/v1/notes/new-id", 202, "")
-                .expect_body("the compatibility folder placement", |body| {
-                    body == r#"{"parentFolderId":"folder-id"}"#
+                .expect_body("the folder placement carrying the body back", |body| {
+                    body == r#"{"content":"kept","parentFolderId":"folder-id"}"#
                 }),
             Scenario::new(
                 "GET",
@@ -804,12 +1068,17 @@ mod tests {
                 200,
                 r#"{"id":"recoverable-id","title":"New"}"#,
             ),
+            // The read does not show the body yet; the PATCH must still carry
+            // the one this call created the note with, never a blank.
             Scenario::new(
                 "PATCH",
                 "/v1/notes/recoverable-id",
                 500,
                 r#"{"error":"fixture"}"#,
-            ),
+            )
+            .expect_body("the created body", |body| {
+                body == r#"{"content":"created body","parentFolderId":"folder-id"}"#
+            }),
         ]);
         let client = HackmdClient::new(Config::for_loopback_test_no_retry(
             &server.api_url,
@@ -817,6 +1086,7 @@ mod tests {
         ))
         .expect("fixture client should build");
         let input: CreateNoteInput = serde_json::from_value(json!({
+            "content": "created body",
             "parent_folder_id": "folder-id"
         }))
         .expect("create input should deserialize");
@@ -829,5 +1099,83 @@ mod tests {
             message.starts_with("note recoverable-id was created, but folder placement failed:")
         );
         assert!(message.contains("PATCH /v1/notes/recoverable-id"));
+        assert!(message.contains("Do not create it again"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_create_reply_says_look_not_retry() {
+        let server =
+            SequenceServer::spawn_scenarios([Scenario::new("POST", "/v1/notes", 201, "not json")]);
+        let input: CreateNoteInput =
+            serde_json::from_value(json!({"title": "New"})).expect("input should deserialize");
+        let error = create_note(&server.client(), input)
+            .await
+            .expect_err("an unreadable reply should fail");
+        server.finish();
+        assert!(
+            matches!(
+                error,
+                CrudError::Api(super::HackmdError::WriteUnconfirmed { .. })
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_sends_the_created_body_over_a_stale_blank_read() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("POST", "/v1/notes", 201, r#"{"id":"new-id","title":"New"}"#),
+            // Too early to show the body just created.
+            Scenario::new(
+                "GET",
+                "/v1/notes/new-id",
+                200,
+                r#"{"id":"new-id","title":"New","content":""}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/new-id", 202, "")
+                .expect_body("the created body, not the stale blank", |body| {
+                    body == r#"{"content":"created","parentFolderId":"folder-id"}"#
+                }),
+            Scenario::new(
+                "GET",
+                "/v1/notes/new-id",
+                200,
+                r#"{"id":"new-id","title":"New","content":"created","folderPaths":[{"id":"folder-id","name":"F"}]}"#,
+            ),
+        ]);
+        let input: CreateNoteInput = serde_json::from_value(json!({
+            "content": "created",
+            "parent_folder_id": "folder-id"
+        }))
+        .expect("create input should deserialize");
+        let output = create_note(&server.client(), input)
+            .await
+            .expect("create and placement should succeed");
+        server.finish();
+        assert!(output.folder_placement_confirmed);
+    }
+
+    #[tokio::test]
+    async fn placement_without_any_body_is_left_unconfirmed_not_blanked() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("POST", "/v1/notes", 201, r#"{"id":"new-id","title":"New"}"#),
+            Scenario::new(
+                "GET",
+                "/v1/notes/new-id",
+                200,
+                r#"{"id":"new-id","title":"New"}"#,
+            ),
+        ]);
+        let input: CreateNoteInput = serde_json::from_value(json!({
+            "title": "New",
+            "parent_folder_id": "folder-id"
+        }))
+        .expect("create input should deserialize");
+        let output = create_note(&server.client(), input)
+            .await
+            .expect("an unplaced note is reported, not failed");
+        server.finish();
+        assert!(!output.folder_placement_confirmed);
+        assert!(!output.compatibility_patch_applied);
     }
 }
