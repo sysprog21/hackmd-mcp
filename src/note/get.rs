@@ -158,6 +158,7 @@ pub(crate) fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> 
         folder_ids: note
             .folder_paths
             .into_iter()
+            .flatten()
             .map(|folder| folder.id)
             .collect(),
         created_at: note.created_at,

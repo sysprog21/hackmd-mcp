@@ -309,8 +309,10 @@ pub(crate) struct NoteResponse {
     pub(crate) permalink: Option<String>,
     pub(crate) user_path: Option<String>,
     pub(crate) team_path: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_null_default")]
-    pub(crate) folder_paths: Vec<FolderPathResponse>,
+    /// `None` when the read did not carry the field (list endpoints never
+    /// do), so "no folders" is never inferred from a field that was absent.
+    #[serde(default)]
+    pub(crate) folder_paths: Option<Vec<FolderPathResponse>>,
 }
 
 /// `null` read as the default, as a missing field already is with
@@ -505,7 +507,7 @@ mod tests {
         .expect("nulls must not fail the note");
         assert_eq!(note.title, "");
         assert_eq!(note.tags, Vec::<String>::new());
-        assert_eq!(note.folder_paths, []);
+        assert_eq!(note.folder_paths, None);
         let editor = note
             .last_change_user
             .expect("a null field keeps the editor");
@@ -750,7 +752,13 @@ mod tests {
         }))
         .expect("note fixture should deserialize");
         assert_eq!(note.read_permission, Some(NotePermission::Guest));
-        assert_eq!(note.folder_paths[0].id, "folder-id");
+        assert_eq!(
+            note.folder_paths
+                .as_deref()
+                .expect("folderPaths should be read")[0]
+                .id,
+            "folder-id"
+        );
         assert_eq!(note.title_updated_at, Some(2));
         assert_eq!(note.published_at, Some(4));
     }

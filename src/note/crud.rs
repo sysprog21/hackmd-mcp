@@ -299,7 +299,10 @@ fn shows_metadata(sent: &UpdateNoteRequest<'_>, note: &NoteResponse) -> bool {
 }
 
 fn placed_in(note: &NoteResponse, folder_id: &str) -> bool {
-    note.folder_paths.iter().any(|path| path.id == folder_id)
+    note.folder_paths
+        .iter()
+        .flatten()
+        .any(|path| path.id == folder_id)
 }
 
 pub(crate) async fn create_note(
@@ -494,7 +497,10 @@ pub(crate) async fn update_note(
         .as_ref()
         .map(|folder| match folder {
             Some(id) => placed_in(&written, id),
-            None => written.folder_paths.is_empty(),
+
+            // A read that omits folderPaths says nothing about the folder, so
+            // it cannot confirm a move to the root.
+            None => written.folder_paths.as_ref().is_some_and(Vec::is_empty),
         });
     Ok(Ok(UpdateNoteOutput::Updated {
         note: Box::new(crate::local::offload(|| without_content(note, written))),
@@ -893,6 +899,46 @@ mod tests {
         };
         assert_eq!(folder_placement_confirmed, Some(false));
         assert_eq!(note.folder_ids, ["old"]);
+    }
+
+    #[tokio::test]
+    async fn a_move_to_root_is_not_confirmed_by_a_read_without_folder_paths() {
+        // A read that leaves out folderPaths (as a team read may) is not the
+        // same as one that lists no folders.
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/teams/core/notes/id",
+                200,
+                r#"{"id":"id","title":"T","content":"body"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/teams/core/notes/id", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/teams/core/notes/id",
+                200,
+                r#"{"id":"id","title":"T","content":"body"}"#,
+            ),
+        ]);
+        let input = serde_json::from_value(json!({
+            "team_path": "core",
+            "note_ref": "id",
+            "parent_folder_id": null
+        }))
+        .expect("input should deserialize");
+        let output = update_note(&server.client(), input)
+            .await
+            .expect("update should succeed")
+            .expect("direct reference should resolve");
+        server.finish();
+        let super::UpdateNoteOutput::Updated {
+            folder_placement_confirmed,
+            ..
+        } = output
+        else {
+            panic!("fields without a patch should update the note");
+        };
+        assert_eq!(folder_placement_confirmed, Some(false));
     }
 
     #[tokio::test]
