@@ -479,17 +479,35 @@ async fn update_fields(
         })
 }
 
+/// Whether a read shows the fields an update sent, compared the way `HackMD`
+/// may store them so a write that landed is not failed over a format: a
+/// cleared field may read back empty rather than null, and an icon or color
+/// in another case.
 fn folder_matches_update(folder: &FolderResponse, update: &UpdateFolderRequest) -> bool {
+    fn shows(
+        sent: Option<&Option<String>>,
+        read: Option<&String>,
+        same: fn(&str, &str) -> bool,
+    ) -> bool {
+        let read = read.map_or("", String::as_str);
+        sent.is_none_or(|sent| same(sent.as_deref().unwrap_or_default(), read))
+    }
     update.name.as_ref().is_none_or(|name| folder.name == *name)
-        && update
-            .description
-            .as_ref()
-            .is_none_or(|description| folder.description == *description)
-        && update.icon.as_ref().is_none_or(|icon| folder.icon == *icon)
-        && update
-            .color
-            .as_ref()
-            .is_none_or(|color| folder.color == *color)
+        && shows(
+            update.description.as_ref(),
+            folder.description.as_ref(),
+            |sent, read| sent == read,
+        )
+        && shows(
+            update.icon.as_ref(),
+            folder.icon.as_ref(),
+            str::eq_ignore_ascii_case,
+        )
+        && shows(
+            update.color.as_ref(),
+            folder.color.as_ref(),
+            str::eq_ignore_ascii_case,
+        )
 }
 
 pub(crate) async fn delete_folder(
@@ -776,6 +794,35 @@ mod tests {
         assert_eq!(order.parent, "root");
         assert!(output.folder.is_none());
         fixture.finish();
+    }
+
+    #[test]
+    fn folder_readback_tolerates_how_hackmd_may_store_a_field() {
+        use crate::dto::{FolderResponse, UpdateFolderRequest};
+
+        let read: FolderResponse = serde_json::from_value(json!({
+            "id": "f", "name": "N", "description": "", "icon": "STAR", "color": "#ABCDEF"
+        }))
+        .expect("folder should deserialize");
+        let sent = |description: Option<Option<&str>>, color: &str| UpdateFolderRequest {
+            name: None,
+            description: description.map(|value| value.map(str::to_owned)),
+            icon: Some(Some("star".to_owned())),
+            color: Some(Some(color.to_owned())),
+        };
+        assert!(super::folder_matches_update(
+            &read,
+            &sent(Some(None), "#abcdef")
+        ));
+        assert!(super::folder_matches_update(
+            &read,
+            &sent(Some(Some("")), "#abcdef")
+        ));
+        assert!(!super::folder_matches_update(
+            &read,
+            &sent(Some(Some("old")), "#abcdef")
+        ));
+        assert!(!super::folder_matches_update(&read, &sent(None, "#000000")));
     }
 
     #[tokio::test]
