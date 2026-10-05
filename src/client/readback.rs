@@ -68,8 +68,8 @@ where
         accepted,
         readback_window(written_bytes),
         READBACK_FIRST_DELAY,
-        // A read under way keeps the whole budget the client gives it, so
-        // the window never cuts off a fetch the HTTP layer still accepts.
+        // A read under way keeps the whole budget the client gives it, so the
+        // window never cuts off a fetch the HTTP layer still accepts.
         request_timeout + transfer_allowance(written_bytes),
     )
     .await

@@ -415,8 +415,9 @@ impl StateStore {
         let mut records = Vec::new();
         for entry in entries {
             let entry = entry?;
-            // This server writes only regular files here; anything else, a
-            // FIFO above all, would only hang the read below.
+
+            // This server writes only regular files here; anything else, a FIFO
+            // above all, would only hang the read below.
             if !entry.file_type()?.is_file() {
                 continue;
             }
@@ -788,18 +789,19 @@ fn untrusted_reason(root: &Path) -> Option<&'static str> {
     use std::os::unix::fs::MetadataExt;
     use std::sync::OnceLock;
 
-    // The account this server runs as, read off a file it just created:
-    // asking the OS directly takes `unsafe`, which this crate forbids. Only
-    // an answer is cached; a failed probe is tried again next time.
+    // The account this server runs as, read off a file it just created: asking
+    // the OS directly takes `unsafe`, which this crate forbids. Only an answer
+    // is cached; a failed probe is tried again next time.
     static OWN_UID: OnceLock<u32> = OnceLock::new();
 
-    // A missing directory is fine: this server creates it owner-only. Any
-    // other failure to look is a failure to vouch for it.
+    // A missing directory is fine: this server creates it owner-only. Any other
+    // failure to look is a failure to vouch for it.
     let metadata = match fs::metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
         Err(_) => return Some("could not be checked: its metadata could not be read"),
     };
+
     // The probe goes to the system temporary directory, never into the
     // directory under judgment, and a failed probe fails closed.
     let own = if let Some(uid) = OWN_UID.get() {
@@ -814,11 +816,11 @@ fn untrusted_reason(root: &Path) -> Option<&'static str> {
         *OWN_UID.get_or_init(|| uid)
     };
 
-    // The root and the directories records live in are held to one rule:
-    // owned by this account, and not writable by its group or anyone else,
-    // since a group member could plant records as readily as a stranger.
-    // The record directories must also be real directories, since a symlink
-    // could lead anywhere.
+    // The root and the directories records live in are held to one rule: owned
+    // by this account, and not writable by its group or anyone else, since a
+    // group member could plant records as readily as a stranger. The record
+    // directories must also be real directories, since a symlink could lead
+    // anywhere.
     let mut directories = vec![metadata];
     for name in ["tracked", "by-path"] {
         match fs::symlink_metadata(root.join(name)) {

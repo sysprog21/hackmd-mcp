@@ -111,6 +111,7 @@ pub(crate) async fn edit_note(
         let changed = updated != content;
         Ok::<_, PatchError>((updated, changed))
     })?;
+
     // The old body is not needed past here; a large note is held once less
     // through the write and its read-back.
     drop(content);

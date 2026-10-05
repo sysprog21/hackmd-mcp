@@ -47,8 +47,8 @@ if [ "$release_status" = 200 ]; then
     gh release delete latest --yes
 fi
 
-# Deleted explicitly rather than with --cleanup-tag, which fails when the tag
-# is already gone. The tag can outlive its release (a web UI delete, a run that
+# Deleted explicitly rather than with --cleanup-tag, which fails when the tag is
+# already gone. The tag can outlive its release (a web UI delete, a run that
 # died after the delete above), and "gh release create" ignores --target when
 # the tag exists, which would publish these binaries under an older commit.
 tag_status=$(status_of "repos/$GH_REPO/git/ref/tags/latest")

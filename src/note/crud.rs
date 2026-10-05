@@ -477,8 +477,9 @@ pub(crate) async fn update_note(
                     .is_none_or(|body| readback.content.as_deref() == Some(body))
         })
         .await?;
-    // Judged from the read being returned, like create's flag, so it can
-    // never disagree with the folder_ids the caller reads out of it.
+
+    // Judged from the read being returned, like create's flag, so it can never
+    // disagree with the folder_ids the caller reads out of it.
     let folder_placement_confirmed = payload
         .parent_folder_id
         .as_ref()

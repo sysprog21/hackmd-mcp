@@ -227,6 +227,7 @@ impl NotesCache {
         if current {
             state.flights.remove(workspace);
         }
+
         // A list fetched across a write is stale before it lands; an error is
         // not, and is shared either way.
         let fresh = current && state.generation == generation;

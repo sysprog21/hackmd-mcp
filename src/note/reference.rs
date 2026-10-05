@@ -83,8 +83,8 @@ pub(crate) async fn resolve_note_ref(
             note: ResolvedNoteRef { workspace, note_id },
         }),
         ParsedNoteRef::Scoped { owner, slug } => {
-            // A URL names its own workspace. A team_path that names another
-            // is a mistake to report, not a hint to drop.
+            // A URL names its own workspace. A team_path that names another is
+            // a mistake to report, not a hint to drop.
             if let Workspace::Team { team_path } = workspace
                 && team_path != owner
             {
