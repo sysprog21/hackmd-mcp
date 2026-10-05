@@ -73,7 +73,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_create_note",
-        description = "Create a HackMD note in a personal or team workspace and return its metadata and patch_path (not the body). Folder placement is read back after POST; a compatibility PATCH runs only if the API dropped parentFolderId, resending the body so it is kept. Title precedence: a YAML title: in content wins, then a leading H1, then title.",
+        description = "Create a HackMD note in a personal or team workspace and return its metadata and patch_path (not the body). Folder placement is read back after POST; a compatibility PATCH runs only if the API dropped parentFolderId, resending the body so it is kept. Title precedence: a YAML title: in content wins, then a leading H1, then title. Pass read_permission whenever access matters. Sent tags, description, permalink, and permissions the created note does not show are listed in unconfirmed_fields (no other field is checked); fix them with hackmd_update_note, never by creating the note again.",
         annotations(
             title = "Create HackMD Note",
             read_only_hint = false,

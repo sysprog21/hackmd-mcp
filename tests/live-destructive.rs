@@ -265,6 +265,13 @@ async fn personal_crud_folder_order_trash_and_restore() {
             "note POST did not preserve the requested folder assignment"
         );
 
+        // The create above sent no permissions, so this is what HackMD applies
+        // by default; hackmd_create_note tells agents not to rely on it.
+        eprintln!(
+            "measured (personal): a create without permissions reads back read {} / write {}",
+            post_read["readPermission"], post_read["writePermission"]
+        );
+
         let edited = format!("# Codex live {suffix}\n\nedited\n");
         api.empty_ok(
             Method::PATCH,
@@ -498,6 +505,17 @@ async fn team_folder_updates_and_image_upload_are_measured() {
             .await;
         let created_note_id = created["id"].as_str().expect("team note ID").to_owned();
         note_id = Some(created_note_id.clone());
+
+        // hackmd_create_note reports a permission the note does not show; the
+        // image privacy check below also depends on this one having taken.
+        assert!(
+            api.poll_json(&["teams", &team_path, "notes", &created_note_id], |note| {
+                note["readPermission"] == "owner" && note["writePermission"] == "owner"
+            })
+            .await
+            .is_some(),
+            "a team create dropped the permissions it was sent"
+        );
         probe_partial_note_patch(
             &api,
             &["teams", &team_path, "notes", &created_note_id],

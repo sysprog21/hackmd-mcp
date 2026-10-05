@@ -40,9 +40,12 @@ pub(crate) struct CreateNoteInput {
     pub(crate) description: Option<String>,
     /// Custom URL slug.
     pub(crate) permalink: Option<String>,
-    /// Who may read the note; omitted preserves the workspace default.
+    /// Who may read the note. Omitted, `HackMD` applies its own default, which
+    /// is unmeasured and may be more open than the workspace's, so pass it
+    /// whenever access matters.
     pub(crate) read_permission: Option<NotePermission>,
-    /// Who may edit the note; omitted preserves the workspace default.
+    /// Who may edit the note; may not exceed `read_permission`. Omitted,
+    /// `HackMD` applies its own (unmeasured) default.
     pub(crate) write_permission: Option<NotePermission>,
     /// The `HackMD` API cannot set this; supplying it is refused with an
     /// explanatory error. Change comment permission in the `HackMD` web UI.
@@ -168,6 +171,11 @@ pub(crate) struct CreateNoteOutput {
     /// False means `HackMD` accepted the placement but never showed it.
     pub(crate) folder_placement_confirmed: bool,
     pub(crate) compatibility_patch_applied: bool,
+    /// Fields sent that the returned note does not show, so `HackMD` may have
+    /// dropped them. Check before relying on one: a `read_permission` here
+    /// means the note may be readable by more than asked. Never create the
+    /// note again over this; set the field with `hackmd_update_note`.
+    pub(crate) unconfirmed_fields: Vec<&'static str>,
 }
 
 /// Tagged with `mode` (`updated` or `patched`) so a caller can tell the two
@@ -273,29 +281,54 @@ impl crate::reply::ToolError for CrudError {
 /// is an ancestor list of unverified order (and unmeasured for teams), so a
 /// move to an ancestor would match before it landed.
 fn shows_metadata(sent: &UpdateNoteRequest<'_>, note: &NoteResponse) -> bool {
+    unshown_metadata(sent, note).is_empty()
+}
+
+/// The names of the fields `sent` set that `note` does not show.
+fn unshown_metadata(sent: &UpdateNoteRequest<'_>, note: &NoteResponse) -> Vec<&'static str> {
     fn tag_set(tags: &[String]) -> std::collections::BTreeSet<&str> {
         tags.iter()
             .map(|tag| tag.trim())
             .filter(|tag| !tag.is_empty())
             .collect()
     }
-    sent.tags
-        .as_ref()
-        .is_none_or(|tags| tag_set(tags) == tag_set(&note.tags))
-        && sent.description.as_ref().is_none_or(|description| {
-            note.description.as_deref().unwrap_or_default() == description
-        })
-        && sent.permalink.as_ref().is_none_or(|permalink| {
-            note.permalink
-                .as_ref()
-                .is_some_and(|read| read.eq_ignore_ascii_case(permalink))
-        })
-        && sent
-            .read_permission
-            .is_none_or(|permission| note.read_permission == Some(permission))
-        && sent
-            .write_permission
-            .is_none_or(|permission| note.write_permission == Some(permission))
+    [
+        (
+            "tags",
+            sent.tags
+                .as_deref()
+                .is_none_or(|tags| tag_set(tags) == tag_set(&note.tags)),
+        ),
+        (
+            "description",
+            sent.description.as_deref().is_none_or(|description| {
+                note.description.as_deref().unwrap_or_default() == description
+            }),
+        ),
+        (
+            "permalink",
+            // An empty permalink clears it, which may read back as null.
+            sent.permalink.as_deref().is_none_or(|permalink| {
+                note.permalink
+                    .as_deref()
+                    .unwrap_or_default()
+                    .eq_ignore_ascii_case(permalink)
+            }),
+        ),
+        (
+            "read_permission",
+            sent.read_permission
+                .is_none_or(|permission| note.read_permission == Some(permission)),
+        ),
+        (
+            "write_permission",
+            sent.write_permission
+                .is_none_or(|permission| note.write_permission == Some(permission)),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(field, shown)| (!shown).then_some(field))
+    .collect()
 }
 
 fn placed_in(note: &NoteResponse, folder_id: &str) -> bool {
@@ -331,6 +364,10 @@ pub(crate) async fn create_note(
     client.ensure_team_exists(&input.workspace).await?;
     let mut note = client.create_note(&input.workspace, &payload).await?;
     let note_id = note.id.clone();
+
+    // The body size sizes the read-back window; the fallback below may move the
+    // body out of the payload, so it is kept here.
+    let mut written_bytes = payload.content.as_ref().map_or(0, String::len);
     let mut compatibility_patch_applied = false;
     if let Some(folder_id) = folder.as_ref() {
         let placement_failed = |source| CrudError::FolderPlacement {
@@ -366,6 +403,7 @@ pub(crate) async fn create_note(
                 .await
                 .map_err(placement_failed)?;
             compatibility_patch_applied = true;
+            written_bytes = placement.content.len();
 
             // Placement is a write like any other, so confirm it the way the
             // edit and push tools confirm theirs rather than trusting one
@@ -384,6 +422,24 @@ pub(crate) async fn create_note(
         }
     }
 
+    let (note, unconfirmed_fields) = confirm_created_metadata(
+        client,
+        &input.workspace,
+        &note_id,
+        written_bytes,
+        // Compared, never sent: create's metadata in the shape update checks.
+        &UpdateNoteRequest {
+            tags: payload.tags.clone(),
+            description: payload.description.clone(),
+            permalink: payload.permalink.clone(),
+            read_permission: payload.read_permission,
+            write_permission: payload.write_permission,
+            ..UpdateNoteRequest::new("")
+        },
+        note,
+    )
+    .await;
+
     // Judged from the note being returned, so the flag can never disagree with
     // the folder_ids the caller reads out of it.
     let folder_placement_confirmed = folder.as_ref().is_some_and(|id| placed_in(&note, id));
@@ -396,7 +452,38 @@ pub(crate) async fn create_note(
         folder_placement_requested: folder.is_some(),
         folder_placement_confirmed,
         compatibility_patch_applied,
+        unconfirmed_fields,
     })
+}
+
+/// `HackMD` may drop a field it does not take on create, as it does the comment
+/// permissions, and a dropped `read_permission` leaves the note at a default
+/// that may be more open than asked. So the fields sent are checked against
+/// the note being returned, polling only when they do not show yet. What
+/// still does not show is returned with it, never as an error: the note
+/// exists, and an agent that saw an error would create a second one on retry.
+async fn confirm_created_metadata(
+    client: &HackmdClient,
+    workspace: &Workspace,
+    note_id: &str,
+    written_bytes: usize,
+    sent: &UpdateNoteRequest<'_>,
+    mut note: NoteResponse,
+) -> (NoteResponse, Vec<&'static str>) {
+    let mut unshown = unshown_metadata(sent, &note);
+    if !unshown.is_empty()
+        && let Ok(readback) = client
+            .poll_readback(
+                written_bytes,
+                || client.get_note(workspace, note_id),
+                |note| shows_metadata(sent, note),
+            )
+            .await
+    {
+        note = readback.value;
+        unshown = unshown_metadata(sent, &note);
+    }
+    (note, unshown)
 }
 
 pub(crate) async fn update_note(
@@ -832,6 +919,14 @@ mod tests {
             shows_metadata(&sent, &shown),
             "normalized values and an unconfirmed folder must match"
         );
+        let cleared = UpdateNoteRequest {
+            permalink: Some(String::new()),
+            ..UpdateNoteRequest::new("body")
+        };
+        assert!(
+            shows_metadata(&cleared, &read(json!({"id": "n", "title": "T"}))),
+            "a cleared permalink may read back as null"
+        );
         for stale in [
             json!({"id": "n", "title": "T", "tags": ["a"], "permalink": "my-note",
                    "readPermission": "guest", "writePermission": "owner"}),
@@ -1093,6 +1188,47 @@ mod tests {
         assert!(output.compatibility_patch_applied);
         server.finish();
         assert_eq!(output.note.folder_ids, ["folder-id"]);
+    }
+
+    #[tokio::test]
+    async fn create_reports_a_permission_the_note_does_not_show() {
+        // The POST reply and every read show the workspace default, so the
+        // owner-only read permission asked for never took.
+        let note = r#"{"id":"new-id","title":"New","readPermission":"guest","tags":["a"]}"#;
+        let fixture = SequenceServer::spawn_repeating([(201, note), (200, note)]);
+        let input: CreateNoteInput = serde_json::from_value(json!({
+            "title": "New",
+            "tags": ["a"],
+            "read_permission": "owner"
+        }))
+        .expect("create input should deserialize");
+        let output = create_note(&fixture.client(), input)
+            .await
+            .expect("a created note is never an error");
+        assert_eq!(output.unconfirmed_fields, ["read_permission"]);
+    }
+
+    #[tokio::test]
+    async fn create_confirms_a_permission_a_later_read_shows() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("POST", "/v1/notes", 201, r#"{"id":"new-id","title":"New"}"#),
+            Scenario::new(
+                "GET",
+                "/v1/notes/new-id",
+                200,
+                r#"{"id":"new-id","title":"New","readPermission":"owner"}"#,
+            ),
+        ]);
+        let input: CreateNoteInput = serde_json::from_value(json!({
+            "title": "New",
+            "read_permission": "owner"
+        }))
+        .expect("create input should deserialize");
+        let output = create_note(&server.client(), input)
+            .await
+            .expect("create should succeed");
+        assert_eq!(output.unconfirmed_fields, Vec::<&str>::new());
+        server.finish();
     }
 
     #[tokio::test]
