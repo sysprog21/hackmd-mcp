@@ -104,7 +104,12 @@ details.
 ```
 
 It prints a JSON report and exits nonzero if anything is wrong, without ever
-printing the token.
+printing the token. Its `commit` field, also shown by `--version`, names the
+commit the binary was built from, with `-dirty` when that checkout had
+uncommitted edits to its sources (so two dirty builds of one commit look
+alike); it is absent for a build made outside a git checkout. If it is not the
+commit you expect, the installed binary is stale: install the new one and
+restart your agent, since a running agent keeps the server it started.
 
 ### 4. Connect your agent
 

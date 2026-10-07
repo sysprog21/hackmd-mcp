@@ -93,11 +93,12 @@ fn help_and_version_exit_without_starting_the_transport() {
         .output()
         .expect("version should run");
     assert!(version.status.success());
+    // The package version, then the source commit when the build knew it.
     assert_eq!(
         String::from_utf8(version.stdout)
             .expect("version should be UTF-8")
             .trim(),
-        concat!("hackmd-mcp ", env!("CARGO_PKG_VERSION"))
+        format!("hackmd-mcp {}", hackmd_mcp::VERSION_TEXT)
     );
 }
 

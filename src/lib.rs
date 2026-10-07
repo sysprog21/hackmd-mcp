@@ -23,6 +23,14 @@ mod fixture;
 /// The package version exposed by the server binary.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The commit this binary was built from, `-dirty` when its sources differed
+/// from it; empty when built outside a git checkout of this repository. Set
+/// by `build.rs`.
+pub const COMMIT: &str = env!("HACKMD_MCP_COMMIT");
+
+/// `VERSION`, followed by the commit in parentheses when it is known.
+pub const VERSION_TEXT: &str = env!("HACKMD_MCP_VERSION_TEXT");
+
 pub use health::{SelfCheckReport, run_self_check};
 
 /// Runs the MCP server over standard input and output until the client closes
