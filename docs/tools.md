@@ -11,6 +11,11 @@ URL, such as `https://hackmd.io/@owner/slug`. If a URL matches no note, or more
 than one, the tool does not guess: it returns the candidates so the agent can
 pick.
 
+Notes the tools return carry a `note_url`, `https://hackmd.io/<id>`, which opens
+personal and team notes alike. It is a link, not an invite: whoever follows it
+still needs read access. It is absent with a custom `HACKMD_API_URL`, whose
+website the server cannot know, and on trashed notes, whose link answers 404.
+
 Notes live in a workspace: your personal one, or a team's. Tools take a
 `team_path` for a team and omit it for personal notes. `hackmd_get_me` lists the
 teams you belong to.

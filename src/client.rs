@@ -40,6 +40,11 @@ pub(crate) struct HackmdClient {
 }
 
 impl HackmdClient {
+    /// The website serving this API's notes, when it is known.
+    pub(crate) fn site_url(&self) -> Option<&Url> {
+        self.config.site_url()
+    }
+
     pub(crate) fn new(config: Config) -> Result<Self, HackmdError> {
         // Redirects are refused: the API never sends one, and following a 307
         // would replay a note body to whatever origin it named. Timeouts are
@@ -735,51 +740,57 @@ impl HackmdClient {
     }
 
     fn url_for_segments(&self, path_segments: &[&str]) -> Result<Url, HackmdError> {
-        if path_segments
-            .iter()
-            .any(|segment| segment.trim().is_empty())
-        {
-            return Err(HackmdError::EmptyPathSegment);
-        }
-
-        // The URL library drops these rather than encoding them, so a note ID
-        // of `..` would quietly turn `/teams/../notes/X` into another route on
-        // the same API.
-        if path_segments
-            .iter()
-            .any(|segment| matches!(*segment, "." | ".."))
-        {
-            return Err(HackmdError::DotPathSegment);
-        }
-
-        // The URL library also drops tabs and newlines inside a segment before
-        // judging dots, so `.\t.` would become `..` after the check above.
-        if path_segments
-            .iter()
-            .any(|segment| segment.chars().any(char::is_control))
-        {
-            return Err(HackmdError::ControlInPathSegment);
-        }
-        let mut url = self.config.api_url().clone();
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|()| HackmdError::InvalidBaseUrl)?;
-        segments.pop_if_empty();
-        segments.extend(path_segments);
-        drop(segments);
-
-        // Whatever else the library might normalize, one segment in must be one
-        // segment out, or the request names another route.
-        let count = |url: &Url| {
-            url.path_segments().map_or(0, |segments| {
-                segments.filter(|segment| !segment.is_empty()).count()
-            })
-        };
-        if count(&url) != count(self.config.api_url()) + path_segments.len() {
-            return Err(HackmdError::DotPathSegment);
-        }
-        Ok(url)
+        append_segments(self.config.api_url(), path_segments)
     }
+}
+
+/// Appends each segment to `base`, encoded, refusing any the URL library would
+/// drop or rewrite: one segment in must be one segment out.
+pub(crate) fn append_segments(base: &Url, path_segments: &[&str]) -> Result<Url, HackmdError> {
+    if path_segments
+        .iter()
+        .any(|segment| segment.trim().is_empty())
+    {
+        return Err(HackmdError::EmptyPathSegment);
+    }
+
+    // The URL library drops these rather than encoding them, so a note ID of
+    // `..` would quietly turn `/teams/../notes/X` into another route on the
+    // same API.
+    if path_segments
+        .iter()
+        .any(|segment| matches!(*segment, "." | ".."))
+    {
+        return Err(HackmdError::DotPathSegment);
+    }
+
+    // The URL library also drops tabs and newlines inside a segment before
+    // judging dots, so `.\t.` would become `..` after the check above.
+    if path_segments
+        .iter()
+        .any(|segment| segment.chars().any(char::is_control))
+    {
+        return Err(HackmdError::ControlInPathSegment);
+    }
+    let mut url = base.clone();
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|()| HackmdError::InvalidBaseUrl)?;
+    segments.pop_if_empty();
+    segments.extend(path_segments);
+    drop(segments);
+
+    // Whatever else the library might normalize, one segment in must be one
+    // segment out, or the request names another route.
+    let count = |url: &Url| {
+        url.path_segments().map_or(0, |segments| {
+            segments.filter(|segment| !segment.is_empty()).count()
+        })
+    };
+    if count(&url) != count(base) + path_segments.len() {
+        return Err(HackmdError::DotPathSegment);
+    }
+    Ok(url)
 }
 
 /// Reads how long the server asked us to wait, preferring the standard header

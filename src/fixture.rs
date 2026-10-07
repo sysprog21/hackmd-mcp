@@ -19,6 +19,11 @@ use crate::{
 /// The token every fixture client presents. Nothing verifies it; it exists so
 /// requests carry an Authorization header the assertions can inspect.
 pub(crate) const FIXTURE_TOKEN: &str = "fixture-token";
+
+/// The public API's site, as `Config` derives it.
+pub(crate) fn site() -> url::Url {
+    url::Url::parse(crate::config::SITE_URL).expect("site fixture should parse")
+}
 const FIXTURE_DEADLINE: Duration = Duration::from_secs(5);
 
 type FixtureHeaders = &'static [(&'static str, &'static str)];
@@ -348,6 +353,12 @@ impl SequenceServer {
             Some(FIXTURE_TOKEN),
         ))
         .expect("fixture client should build")
+    }
+
+    /// A client that knows the public site, for tests about `note_url`.
+    pub(crate) fn client_with_site(&self) -> HackmdClient {
+        HackmdClient::new(Config::for_loopback_test(&self.api_url, Some(FIXTURE_TOKEN)).with_site())
+            .expect("fixture client should build")
     }
 
     /// A client whose note-list cache is on, for tests about caching.

@@ -12,6 +12,8 @@ use url::Host;
 use url::Url;
 
 const DEFAULT_API_URL: &str = "https://api.hackmd.io/v1";
+/// The website `DEFAULT_API_URL` serves notes on.
+pub(crate) const SITE_URL: &str = "https://hackmd.io/";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRIES: u8 = 3;
@@ -42,6 +44,8 @@ const ENVIRONMENT_ONLY_KEYS: [&str; 1] = ["HACKMD_MCP_STATE_DIR"];
 pub(crate) struct Config {
     api_token: Option<SecretToken>,
     api_url: Url,
+    /// The website serving `api_url`'s notes, known only for the public API.
+    site_url: Option<Url>,
     request_timeout: Duration,
     connect_timeout: Duration,
     retry: RetryConfig,
@@ -121,6 +125,7 @@ impl Config {
 
         Ok(Self {
             api_token,
+            site_url: site_url(&api_url),
             api_url,
             request_timeout: REQUEST_TIMEOUT,
             connect_timeout: CONNECT_TIMEOUT,
@@ -143,6 +148,10 @@ impl Config {
 
     pub(crate) fn api_url(&self) -> &Url {
         &self.api_url
+    }
+
+    pub(crate) fn site_url(&self) -> Option<&Url> {
+        self.site_url.as_ref()
     }
 
     pub(crate) fn request_timeout(&self) -> Duration {
@@ -181,6 +190,14 @@ impl Config {
 
     pub(crate) const fn loopback_images(&self) -> bool {
         self.loopback_images
+    }
+
+    /// Gives a loopback test config the public site, which only the public
+    /// API would otherwise have.
+    #[cfg(test)]
+    pub(crate) fn with_site(mut self) -> Self {
+        self.site_url = Url::parse(SITE_URL).ok();
+        self
     }
 
     #[cfg(test)]
@@ -272,6 +289,17 @@ enum ApiUrlPolicy {
     HttpsOnly,
     #[cfg(test)]
     AllowLoopbackHttp,
+}
+
+/// Custom API endpoints do not identify their deployment's website, so only
+/// the public API gets one. `serves` is deliberately looser: it only decides
+/// whether a link may be probed, not what a note's link is.
+fn site_url(api: &Url) -> Option<Url> {
+    let api = api.as_str();
+    if api.strip_suffix('/').unwrap_or(api) != DEFAULT_API_URL {
+        return None;
+    }
+    Url::parse(SITE_URL).ok()
 }
 
 fn validate_api_url(url: &Url, policy: ApiUrlPolicy) -> Result<(), ConfigError> {
@@ -448,6 +476,36 @@ mod tests {
     fn config_from(entries: &[(&str, &str)]) -> Result<Config, super::ConfigError> {
         let values: HashMap<&str, &str> = entries.iter().copied().collect();
         Config::from_getter(|key| values.get(key).map(ToString::to_string))
+    }
+
+    #[test]
+    fn only_the_public_api_has_a_known_site() {
+        for api in [
+            "https://api.hackmd.io/v1",
+            "https://api.hackmd.io/v1/",
+            "https://api.hackmd.io:443/v1",
+        ] {
+            let config = config_from(&[("HACKMD_API_URL", api)]).expect("public API is valid");
+            assert_eq!(
+                config.site_url().map(url::Url::as_str),
+                Some(super::SITE_URL),
+                "{api}"
+            );
+        }
+        for api in [
+            "https://example.test/v1",
+            "https://api.hackmd.io:8443/v1",
+            "https://api.hackmd.io/custom",
+            "https://api.hackmd.io.example.test/v1",
+        ] {
+            let config = config_from(&[("HACKMD_API_URL", api)]).expect("custom API is valid");
+            assert!(config.site_url().is_none(), "{api}");
+        }
+        assert!(
+            Config::for_loopback_test("http://127.0.0.1:1/v1", None)
+                .site_url()
+                .is_none()
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use url::Url;
 
 use crate::{
     client::{HackmdClient, HackmdError},
@@ -453,7 +454,7 @@ pub(crate) async fn create_note(
         note_id,
     };
     Ok(CreateNoteOutput {
-        note: crate::local::offload(|| without_content(reference, note)),
+        note: crate::local::offload(|| without_content(client.site_url(), reference, note)),
         folder_placement_requested: folder.is_some(),
         folder_placement_confirmed,
         compatibility_patch_applied,
@@ -595,15 +596,21 @@ pub(crate) async fn update_note(
             None => written.folder_paths.as_ref().is_some_and(Vec::is_empty),
         });
     Ok(Ok(UpdateNoteOutput::Updated {
-        note: Box::new(crate::local::offload(|| without_content(note, written))),
+        note: Box::new(crate::local::offload(|| {
+            without_content(client.site_url(), note, written)
+        })),
         folder_placement_confirmed,
     }))
 }
 
-fn without_content(reference: ResolvedNoteRef, note: NoteResponse) -> NoteDetail {
+fn without_content(
+    site: Option<&Url>,
+    reference: ResolvedNoteRef,
+    note: NoteResponse,
+) -> NoteDetail {
     NoteDetail {
         content: None,
-        ..normalize_note(reference, note)
+        ..normalize_note(site, reference, note)
     }
 }
 
