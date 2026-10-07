@@ -244,12 +244,23 @@ async fn resolve(
 /// its entry. Any other name fails, so no lookup reqwest makes on its own can
 /// fall through to the system resolver. Fetches share it safely, since every
 /// entry passed the same check.
+///
+/// A pin is needed only until its connection is made, so past
+/// [`Pinned::MAX_HOSTS`] the others are dropped rather than kept for the life
+/// of the server. A concurrent fetch whose pin was dropped before it
+/// connected fails to connect, never connects unchecked; pooled connections
+/// are unaffected.
 #[derive(Debug, Default)]
 struct Pinned(Mutex<HashMap<String, Vec<SocketAddr>>>);
 
 impl Pinned {
+    const MAX_HOSTS: usize = 64;
+
     fn set(&self, host: String, addrs: Vec<SocketAddr>) {
         if let Ok(mut pins) = self.0.lock() {
+            if pins.len() >= Self::MAX_HOSTS && !pins.contains_key(&host) {
+                pins.clear();
+            }
             pins.insert(host, addrs);
         }
     }
@@ -650,6 +661,14 @@ mod tests {
             .collect();
         assert_eq!(addrs, [addr]);
         assert!(pinned.resolve(name("other.example")).await.is_err());
+
+        // Past the bound, older hosts go and the newest stays.
+        for index in 0..Pinned::MAX_HOSTS {
+            pinned.set(format!("host{index}.example"), vec![addr]);
+        }
+        let pins = pinned.0.lock().expect("pins lock");
+        assert!(pins.len() <= Pinned::MAX_HOSTS, "{}", pins.len());
+        assert!(pins.contains_key(&format!("host{}.example", Pinned::MAX_HOSTS - 1)));
     }
 
     /// The fetch client connects where the pin says: `image.invalid` exists
