@@ -79,7 +79,16 @@ pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     clippy::unused_async_trait_impl,
     reason = "rmcp generates the trait method body and requires its async signature"
 )]
-#[rmcp::tool_handler(router = Self::router().clone())]
+// `name` makes the macro report this crate's name and version; without it,
+// `Implementation::from_build_env` expands inside rmcp and reports rmcp's.
+#[rmcp::tool_handler(
+    router = Self::router().clone(),
+    name = "hackmd-mcp",
+    instructions = "Before editing an existing note, fetch it with hackmd_get_note, preserve unrelated passages, and pass its body_hash as expected_hash to hackmd_update_note. Prefer a context-checked patch. On a conflict, fetch again and rebuild the change; do not blindly retry an uncertain write or create. HackMD has no atomic conditional writes, so concurrent edits can still race.\n\
+        Locate notes with hackmd_list_notes metadata filters, then fetch only relevant candidates to search their bodies. There is no full-text search or revision diff; history means recently viewed notes, not edit history. Do not pick arbitrarily among ambiguous destinations.\n\
+        Use hackmd_get_me to identify team_path for shared workspaces. folder_ids is the ancestor chain of the note's folder; parent_folder_id sets that folder.\n\
+        When sharing, check the intended audience and read_permission, including unconfirmed_fields after creation. When present, note_url identifies a note but grants no access and is not an invite or published link. This server does not create invite links or publish pages; use the HackMD web UI. A YAML title: in the body, then a leading H1, may take precedence over the title field (unmeasured)."
+)]
 impl rmcp::ServerHandler for HackmdServer {
     /// Wraps every dispatch in one span and one retry scope, so each tool call
     /// carries a request ID through its logs and reports in `_meta` how much
@@ -710,6 +719,14 @@ mod tests {
         assert!(info.capabilities.tools.is_some());
         assert!(info.capabilities.prompts.is_none());
         assert!(info.capabilities.resources.is_none());
+        let instructions = info
+            .instructions
+            .expect("workflow guidance should be advertised");
+        assert!(instructions.contains("expected_hash"));
+        assert!(instructions.contains("not edit history"));
+        assert!(instructions.contains("grants no access"));
+        assert_eq!(info.server_info.name, "hackmd-mcp");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]
@@ -719,6 +736,14 @@ mod tests {
     )]
     async fn in_process_tools_list_exposes_generated_contract() {
         let (client, server_task) = protocol_client(Config::for_tests()).await;
+        let info = client
+            .peer_info()
+            .expect("initialize should return server info");
+        assert!(info.instructions.is_some());
+        assert_eq!(
+            info.server_info.as_ref().map(|server| server.name.as_str()),
+            Some("hackmd-mcp")
+        );
         let listed = client
             .list_tools(None)
             .await
@@ -851,6 +876,7 @@ mod tests {
         assert_eq!(structured["offset"], 1);
         assert_eq!(structured["has_more"], false);
         assert_eq!(structured["notes"][0]["id"], "b");
+        assert!(structured["notes"][0].get("note_url").is_none());
         // Output names the workspace the way input takes it.
         assert_eq!(structured["notes"][0]["team_path"], "core/team");
         assert!(structured["notes"][0].get("workspace").is_none());

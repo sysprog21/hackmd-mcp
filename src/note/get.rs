@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 use crate::{
     client::{HackmdClient, HackmdError},
@@ -42,6 +43,9 @@ pub(crate) struct GetNoteInput {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct NoteDetail {
     pub(crate) id: String,
+    /// See [`note_url`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) note_url: Option<String>,
     pub(crate) short_id: Option<String>,
     pub(crate) title: String,
     /// The Markdown body. Write tools leave it out: the caller just sent it,
@@ -139,13 +143,28 @@ pub(crate) async fn get_note(
         return Ok(Err(resolution));
     };
     let response = client.get_note(&note.workspace, &note.note_id).await?;
-    let detail = crate::local::offload(|| normalize_note(note, response));
+    let detail = crate::local::offload(|| normalize_note(client.site_url(), note, response));
     Ok(Ok(GetNoteOutput::Note(Box::new(detail))))
 }
 
-pub(crate) fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> NoteDetail {
+/// The site link of a note, reported as `note_url`: `https://hackmd.io/<id>`
+/// opens personal and team notes alike. It is a link, not an invite or proof
+/// of public access. There is none without a known site (a custom API
+/// endpoint), nor for an ID that is not one safe path segment.
+pub(crate) fn note_url(site: Option<&Url>, note_id: &str) -> Option<String> {
+    crate::client::append_segments(site?, &[note_id])
+        .ok()
+        .map(Into::into)
+}
+
+pub(crate) fn normalize_note(
+    site: Option<&Url>,
+    reference: ResolvedNoteRef,
+    note: NoteResponse,
+) -> NoteDetail {
     let patch_path = crate::note::patch::patch_path(&reference.workspace, &reference.note_id);
     NoteDetail {
+        note_url: note_url(site, &note.id),
         id: note.id,
         short_id: note.short_id,
         title: note.title,
@@ -182,7 +201,7 @@ pub(crate) fn normalize_note(reference: ResolvedNoteRef, note: NoteResponse) -> 
 mod tests {
     use serde_json::json;
 
-    use super::{GetNoteInput, normalize_note};
+    use super::{GetNoteInput, normalize_note, note_url};
     use crate::{
         dto::NoteResponse,
         fixture::{Scenario, SequenceServer},
@@ -209,8 +228,28 @@ mod tests {
     }
 
     #[test]
+    fn note_links_encode_the_id_and_refuse_unsafe_ones() {
+        let site = crate::fixture::site();
+        let link = |id| note_url(Some(&site), id);
+        assert_eq!(
+            link("note-id").as_deref(),
+            Some("https://hackmd.io/note-id")
+        );
+        assert_eq!(
+            link("a/b?#%2F\\").as_deref(),
+            Some("https://hackmd.io/a%2Fb%3F%23%252F%5C")
+        );
+        assert_eq!(link("é").as_deref(), Some("https://hackmd.io/%C3%A9"));
+        for id in ["", " ", ".", "..", "a\nb"] {
+            assert!(link(id).is_none(), "{id:?}");
+        }
+        assert!(note_url(None, "note-id").is_none());
+    }
+
+    #[test]
     fn personal_detail_has_exact_patch_path_and_flat_folder_ids() {
         let detail = normalize_note(
+            Some(&crate::fixture::site()),
             ResolvedNoteRef {
                 workspace: Workspace::Personal,
                 note_id: "internal-id".to_owned(),
@@ -221,6 +260,7 @@ mod tests {
         assert_eq!(detail.folder_ids, ["parent", "child"]);
         let value = serde_json::to_value(detail).expect("detail should serialize");
         assert_eq!(value["content"], "# Body");
+        assert_eq!(value["note_url"], "https://hackmd.io/internal-id");
         assert_eq!(value["title_updated_at"], 10);
         assert_eq!(value["tags_updated_at"], 11);
         assert_eq!(value["publish_type"], "view");
@@ -233,6 +273,7 @@ mod tests {
     #[test]
     fn team_patch_path_is_deliberately_unencoded() {
         let detail = normalize_note(
+            Some(&crate::fixture::site()),
             ResolvedNoteRef {
                 workspace: Workspace::Team {
                     team_path: "team/path".to_owned(),

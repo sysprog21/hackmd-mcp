@@ -24,6 +24,9 @@ pub(crate) struct EditNoteOutput {
     #[serde(rename = "team_path")]
     pub(crate) workspace: Workspace,
     pub(crate) note_id: String,
+    /// See [`crate::note::get::note_url`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) note_url: Option<String>,
     pub(crate) patch_path: String,
     pub(crate) changed: bool,
     /// Size of the body now stored; `hackmd_get_note` returns the body itself.
@@ -122,6 +125,7 @@ pub(crate) async fn edit_note(
     }
     Ok(Ok(EditNoteOutput {
         workspace: note.workspace,
+        note_url: crate::note::get::note_url(client.site_url(), &note.note_id),
         note_id: note.note_id,
         patch_path,
         changed,
@@ -194,12 +198,16 @@ mod tests {
         ]);
         let patch =
             "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+new\n*** End Patch";
-        let output = edit_note(&server.client(), input(patch))
+        let output = edit_note(&server.client_with_site(), input(patch))
             .await
             .expect("edit should succeed")
             .expect("reference should resolve");
         assert!(output.changed);
         assert_eq!(output.bytes, "new\n".len());
+        assert_eq!(
+            output.note_url.as_deref(),
+            Some("https://hackmd.io/note-id")
+        );
         server.finish();
     }
 

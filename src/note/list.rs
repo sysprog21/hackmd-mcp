@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 use crate::{
     client::HackmdClient,
@@ -94,6 +95,10 @@ pub(crate) struct ListNotesOutput {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct NoteSummary {
     pub(crate) id: String,
+    /// See [`crate::note::get::note_url`]. Trashed notes, whose link answers
+    /// 404, carry none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) note_url: Option<String>,
     pub(crate) short_id: Option<String>,
     pub(crate) title: String,
     pub(crate) description: Option<String>,
@@ -111,9 +116,10 @@ pub(crate) struct NoteSummary {
 }
 
 impl NoteSummary {
-    pub(crate) fn new(note: &NoteResponse, workspace: Workspace) -> Self {
+    pub(crate) fn new(site: Option<&Url>, note: &NoteResponse, workspace: Workspace) -> Self {
         Self {
             id: note.id.clone(),
+            note_url: crate::note::get::note_url(site, &note.id),
             short_id: note.short_id.clone(),
             title: note.title.clone(),
             description: note.description.clone(),
@@ -248,17 +254,18 @@ async fn list_remote(
         RemoteSource::Workspace => Some(input.sort.unwrap_or(NoteSort::LastChangedDesc)),
         RemoteSource::History | RemoteSource::Trash => input.sort,
     };
+    let site = client.site_url();
     match source {
         RemoteSource::Workspace => {
             let notes = client.list_notes(&input.workspace, input.refresh).await?;
-            Ok(filter_sort_page(&notes, &input, sort, |_| {
+            Ok(filter_sort_page(site, &notes, &input, sort, |_| {
                 input.workspace.clone()
             }))
         }
         RemoteSource::History => {
             account_wide("history")?;
             let notes = client.get_history().await?;
-            Ok(filter_sort_page(&notes, &input, sort, |note| {
+            Ok(filter_sort_page(site, &notes, &input, sort, |note| {
                 note.team_path
                     .as_ref()
                     .map_or(Workspace::Personal, |team_path| Workspace::Team {
@@ -269,7 +276,8 @@ async fn list_remote(
         RemoteSource::Trash => {
             account_wide("trash")?;
             let notes = client.list_trash().await?;
-            Ok(filter_sort_page(&notes, &input, sort, |_| {
+            // A trashed note's link answers 404, so it gets none.
+            Ok(filter_sort_page(None, &notes, &input, sort, |_| {
                 Workspace::Personal
             }))
         }
@@ -280,6 +288,7 @@ async fn list_remote(
 /// not `input.sort`. Only the page is turned into summaries, so a large
 /// workspace costs one clone per returned note.
 fn filter_sort_page(
+    site: Option<&Url>,
     notes: &[NoteResponse],
     input: &ListNotesInput,
     sort: Option<NoteSort>,
@@ -312,7 +321,7 @@ fn filter_sort_page(
         meta,
         notes: page
             .into_iter()
-            .map(|note| NoteSummary::new(note, workspace_of(note)))
+            .map(|note| NoteSummary::new(site, note, workspace_of(note)))
             .collect(),
     }
 }
@@ -458,9 +467,26 @@ mod tests {
     }
 
     fn page(notes: &[NoteResponse], input: &ListNotesInput) -> ListNotesOutput {
-        filter_sort_page(notes, input, Some(NoteSort::LastChangedDesc), |_| {
+        filter_sort_page(None, notes, input, Some(NoteSort::LastChangedDesc), |_| {
             Workspace::Personal
         })
+    }
+
+    #[test]
+    fn summary_links_only_when_the_site_is_known() {
+        let site = crate::fixture::site();
+        let linked = super::NoteSummary::new(
+            Some(&site),
+            &note("a", "A", 1, &[]),
+            Workspace::Team {
+                team_path: "team".to_owned(),
+            },
+        );
+        let value = serde_json::to_value(linked).expect("summary should serialize");
+        assert_eq!(value["note_url"], "https://hackmd.io/a");
+        let unlinked = super::NoteSummary::new(None, &note("a", "A", 1, &[]), Workspace::Personal);
+        let value = serde_json::to_value(unlinked).expect("summary should serialize");
+        assert!(value.get("note_url").is_none());
     }
 
     #[test]
