@@ -117,10 +117,17 @@ goes through only if the remote still has exactly that body. A `.remote.md` you
 edited yourself is never overwritten by a later conflict.
 
 `strategy: overwrite` with `confirm: true` replaces the remote regardless. A
-pull over a tracked file with unpushed edits is refused unless
-`discard_local_changes: true` is given. `hackmd_untrack_note`, given the
-`note_id` and `confirm: true`, forgets the sync record without touching the
-file or the note.
+pull over any existing file needs `overwrite_local: true`. Even then, a pull
+over a tracked file with unpushed edits is refused unless
+`discard_local_changes: true` is given, and so is a pull over a file with no
+usable sync record (none, or a broken one) whose content differs from the
+note, such as one fetched by other means and edited since: nothing shows
+those edits were ever pushed. To keep them, pull to another path, carry the
+edits into that file, and push it. A file that already matches the note is
+adopted, and tracked from then on. `hackmd_untrack_note`, given the `note_id`
+and `confirm: true`, forgets the sync record without touching the file or the
+note; a later pull over that file, once edited, needs `discard_local_changes`
+like any other unrecorded file.
 
 ## Folders, deletion, images
 

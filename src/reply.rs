@@ -107,6 +107,10 @@ pub(crate) enum ErrorKind {
     ConfirmationRequired,
     /// The local file has edits a pull would discard.
     UnpushedChanges,
+    /// The local file differs from the note and has no sync record, so it
+    /// cannot be pushed: pull to another path and carry the edits over, or
+    /// discard them.
+    UnverifiedLocalContent,
     /// The input is malformed or unsupported; change it before retrying.
     InvalidInput,
     /// A patch did not apply to the current note body; re-read and regenerate

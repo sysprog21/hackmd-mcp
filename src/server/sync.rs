@@ -33,7 +33,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_pull_note",
-        description = "Pull one HackMD note's exact Markdown body to an absolute local .md path and record a private sync baseline, which starts tracking the file. An existing file needs overwrite_local: true, and a tracked file with unpushed edits also needs discard_local_changes: true. For @owner/slug references, refresh=true bypasses the 60-second caches. The result returns body_hash, the sha256 of the bytes just written, matching the form hackmd_push_note and hackmd_get_note report.",
+        description = "Pull one HackMD note's exact Markdown body to an absolute local .md path and record a private sync baseline, which starts tracking the file. An existing file needs overwrite_local: true. A tracked file with unpushed edits, or a file with no usable sync record whose content differs from the note, also needs discard_local_changes: true; a file that already matches the note is simply adopted. For @owner/slug references, refresh=true bypasses the 60-second caches. The result returns body_hash, the sha256 of the bytes just written, matching the form hackmd_push_note and hackmd_get_note report.",
         annotations(
             title = "Pull HackMD Note",
             read_only_hint = false,
