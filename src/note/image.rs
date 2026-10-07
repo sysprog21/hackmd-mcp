@@ -43,6 +43,9 @@ pub(crate) struct UploadNoteImageInput {
 #[derive(Debug, Serialize)]
 pub(crate) struct UploadNoteImageOutput {
     pub(crate) link: String,
+    /// [`crate::client::HackmdClient::anonymous_access`] of `link` right after
+    /// the upload.
+    pub(crate) publicly_readable: Option<bool>,
 }
 
 #[derive(Debug, Error)]
@@ -181,8 +184,14 @@ pub(crate) async fn upload_note_image(
             size_bytes,
         )
         .await?;
+
+    // An image on a note others cannot read is refused to them too, and nothing
+    // in the reply says so: an agent handed only the link would publish an
+    // article whose images fail for every reader.
+    let publicly_readable = client.anonymous_access(&response.data.link).await;
     Ok(Ok(UploadNoteImageOutput {
         link: response.data.link,
+        publicly_readable,
     }))
 }
 
@@ -245,7 +254,102 @@ mod tests {
         .expect("upload should succeed")
         .expect("direct note should resolve");
         assert_eq!(output.link, "https://hackmd.io/_uploads/image.png");
+        // The link is not on the fixture's origin, so it is never fetched.
+        assert_eq!(output.publicly_readable, None);
         fixture.finish();
+    }
+
+    /// Uploads to a fixture whose reply names a link on the fixture itself,
+    /// then answers the signed-out HEAD for that link with `head`.
+    async fn upload_then_check(head: Scenario) -> Option<bool> {
+        let mut image = tempfile::NamedTempFile::new().expect("temp image should create");
+        image.write_all(PNG_FIXTURE).expect("image should write");
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "POST",
+                "/v1/notes/id/images",
+                201,
+                r#"{"data":{"link":"{origin}/_uploads/x.png"}}"#,
+            ),
+            head,
+        ]);
+        let output = upload_note_image(
+            &fixture.client(),
+            &files(),
+            UploadNoteImageInput {
+                workspace: crate::models::Workspace::Personal,
+                note_ref: "id".to_owned(),
+                refresh: false,
+                image_path: image.path().to_path_buf(),
+                confirm_large_file: false,
+            },
+        )
+        .await
+        .expect("upload should succeed")
+        .expect("a bare id resolves directly");
+        let requests = fixture.finish();
+        assert!(
+            !requests[1].to_ascii_lowercase().contains("authorization:"),
+            "the signed-out check must not carry the token"
+        );
+        output.publicly_readable
+    }
+
+    fn head(status: u16) -> Scenario {
+        Scenario::new("HEAD", "/_uploads/x.png", status, "")
+    }
+
+    #[tokio::test]
+    async fn an_image_on_a_private_note_is_reported_unreadable() {
+        assert_eq!(upload_then_check(head(403)).await, Some(false));
+    }
+
+    #[tokio::test]
+    async fn a_redirect_off_the_site_to_storage_is_readable() {
+        let storage = head(302).response_header(
+            "location",
+            "https://storage.example/x.png?AWSAccessKeyId=K&Expires=1&Signature=S",
+        );
+        assert_eq!(upload_then_check(storage).await, Some(true));
+        let v4 = head(302).response_header(
+            "location",
+            "https://storage.example/x.png?X-Amz-Credential=C&X-Amz-Expires=60&X-Amz-Signature=S",
+        );
+        assert_eq!(upload_then_check(v4).await, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_served_image_is_readable() {
+        let served = head(200).response_header("content-type", "Image/PNG");
+        assert_eq!(upload_then_check(served).await, Some(true));
+    }
+
+    /// None of these shows the image reached a signed-out reader: a login
+    /// page on the site or at an identity provider (signed or not), an unsigned
+    /// or plain-http storage redirect, a redirect with nowhere to go, a cache
+    /// revalidation, or a page that is not an image.
+    #[tokio::test]
+    async fn anything_short_of_an_image_or_storage_is_unknown() {
+        for scenario in [
+            head(302).response_header("location", "{origin}/login"),
+            head(302).response_header("location", "/login"),
+            head(302).response_header("location", "https://sso.example/auth?next=x"),
+            head(302).response_header("location", "//other.example/x.png"),
+            head(302).response_header("location", "https://storage.example/x.png"),
+            head(302).response_header("location", "http://storage.example/x.png?Signature=S"),
+            head(302).response_header("location", "https://md.example/login?Signature=S"),
+            head(302).response_header(
+                "location",
+                "https://storage.example/x.png?AWSAccessKeyId=K&Expires=1&Signature=",
+            ),
+            head(302).response_header("location", "https://sso.example/auth?Expires=1&Signature=S"),
+            head(302),
+            head(304),
+            head(200).response_header("content-type", "text/html"),
+            head(404),
+        ] {
+            assert_eq!(upload_then_check(scenario).await, None);
+        }
     }
 
     #[tokio::test]

@@ -246,6 +246,17 @@ impl SequenceServer {
             .set_nonblocking(true)
             .expect("fixture listener should be nonblocking");
         let address = listener.local_addr().expect("fixture address should exist");
+
+        // A body can name a link on the fixture itself, whose port is known
+        // only now: `{origin}` stands for it.
+        let origin = format!("http://{address}");
+        let mut responses = responses;
+        for response in &mut responses {
+            response.body = response.body.replace("{origin}", &origin);
+            for (_, value) in &mut response.headers {
+                *value = value.replace("{origin}", &origin);
+            }
+        }
         let (sender, requests) = mpsc::channel();
         let (shutdown, shutdown_rx) = mpsc::channel();
         let (ready, ready_rx) = mpsc::sync_channel(0);
@@ -276,8 +287,20 @@ impl SequenceServer {
                     let _ = sender.send(captured);
                     return;
                 }
+
+                // A scenario that names its own content type replaces the JSON
+                // default rather than sending two.
+                let content_type = if response
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                {
+                    ""
+                } else {
+                    "Content-Type: application/json\r\n"
+                };
                 let response = format!(
-                    "HTTP/1.1 {} Fixture\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {} Fixture\r\n{content_type}{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                     response.status,
                     response.body.len(),
                     response.body

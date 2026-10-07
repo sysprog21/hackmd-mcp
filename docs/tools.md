@@ -139,10 +139,18 @@ file or the note.
 - `hackmd_upload_note_image` uploads a local image to a personal or team note
   and returns its CDN link. The link is public whenever the note is
   guest-readable; an anonymous fetch of an image on an owner-only note was
-  refused when measured, but treat that as observed, not promised. It needs a
-  workspace root (see [configuration.md](configuration.md#workspace-root));
-  files over 5 MiB need `confirm_large_file: true` and files over 10 MiB are
-  refused.
+  refused when measured, but treat that as observed, not promised. So the
+  result also reports `publicly_readable`: right after the upload the server
+  sends one signed-out `HEAD` for the link, without the token and only to
+  HackMD's own site, and reports `true` if an image or a redirect to a
+  presigned storage URL comes back, `false` if the request is refused, and
+  `null` if the check could not run or proved nothing (any other redirect,
+  such as to a login page, counts as nothing). It is always `null` when the
+  API is neither on the site's own host nor on its `api.` subdomain. A
+  `false` usually means the note is not guest-readable, and signed-out
+  readers will not see the image until it is. It needs a workspace root (see
+  [configuration.md](configuration.md#workspace-root)); files over 5 MiB need
+  `confirm_large_file: true` and files over 10 MiB are refused.
 
 ## Errors
 
