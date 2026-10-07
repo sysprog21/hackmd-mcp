@@ -153,7 +153,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_upload_note_image",
-        description = "Upload a local image to a HackMD note (personal or team) and return only its HackMD CDN link. Treat the link as public whenever the note is guest-readable. The image must lie under HACKMD_MCP_WORKSPACE_ROOT; with no root configured, uploads are refused. Files above 5 MiB require confirmation; files above 10 MiB are refused. For @owner/slug references, refresh=true bypasses the 60-second caches.",
+        description = "Upload a local image to a HackMD note (personal or team) and return its HackMD CDN link. publicly_readable is what one signed-out HEAD of the link showed right after the upload: true when an image or a redirect to presigned storage came back, false when it was refused, null when the check could not run or proved nothing. A false usually means the note is not guest-readable, and signed-out readers will not see the image until it is. The image must lie under HACKMD_MCP_WORKSPACE_ROOT; with no root configured, uploads are refused. Files above 5 MiB require confirmation; files above 10 MiB are refused. For @owner/slug references, refresh=true bypasses the 60-second caches.",
         annotations(
             title = "Upload HackMD Note Image",
             read_only_hint = false,
@@ -169,7 +169,16 @@ impl HackmdServer {
     ) -> rmcp::model::CallToolResult {
         reply::respond_resolved(
             crate::note::image::upload_note_image(&self.client, &self.files, input).await,
-            |_| "Uploaded HackMD note image".to_owned(),
+            |output| {
+                let readers = match output.publicly_readable {
+                    Some(true) => "a signed-out request for the link was served",
+                    Some(false) => {
+                        "a signed-out request for the link was refused, usually because the note is not guest-readable"
+                    }
+                    None => "whether signed-out readers can open the link is unknown",
+                };
+                format!("Uploaded HackMD note image; {readers}")
+            },
         )
     }
 }

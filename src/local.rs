@@ -135,13 +135,30 @@ pub(crate) enum LocalAccessError {
         path.display()
     )]
     StateDirectory { path: PathBuf },
-    #[error(
-        "{} would be published at a public link, and HACKMD_MCP_WORKSPACE_ROOT is not set in the server's environment; set it there to the tree images may come from",
-        path.display()
-    )]
-    Unconfined { path: PathBuf },
+    #[error("{}", unconfined_message(path, *from_dotenv))]
+    Unconfined { path: PathBuf, from_dotenv: bool },
     #[error("local file operation failed: {0}")]
     Io(#[from] io::Error),
+}
+
+/// Why a publish was refused and how to allow it: which root counts, a
+/// directory that would admit this file (only for an absolute path, whose
+/// parent names one), and that the server reads the root only at startup.
+fn unconfined_message(path: &Path, from_dotenv: bool) -> String {
+    let reason = if from_dotenv {
+        "HACKMD_MCP_WORKSPACE_ROOT comes only from the working-directory .env, which does not count for publishing"
+    } else {
+        "HACKMD_MCP_WORKSPACE_ROOT is not set in the server's environment"
+    };
+    let example = path
+        .parent()
+        .filter(|_| path.is_absolute())
+        .map(|parent| format!(", such as {}", parent.display()))
+        .unwrap_or_default();
+    format!(
+        "{} would be published at a public link, and {reason}; set it in the server's own environment to the narrowest directory that holds the images to share{example}, then restart the server, which reads it only at startup",
+        path.display()
+    )
 }
 
 impl crate::reply::ToolError for LocalAccessError {
@@ -389,6 +406,7 @@ impl LocalFiles {
         if self.root.is_none() || self.guard_instructions {
             return Err(LocalAccessError::Unconfined {
                 path: path.to_path_buf(),
+                from_dotenv: self.root.is_some(),
             });
         }
         self.allow(path)

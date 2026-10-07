@@ -117,10 +117,17 @@ goes through only if the remote still has exactly that body. A `.remote.md` you
 edited yourself is never overwritten by a later conflict.
 
 `strategy: overwrite` with `confirm: true` replaces the remote regardless. A
-pull over a tracked file with unpushed edits is refused unless
-`discard_local_changes: true` is given. `hackmd_untrack_note`, given the
-`note_id` and `confirm: true`, forgets the sync record without touching the
-file or the note.
+pull over any existing file needs `overwrite_local: true`. Even then, a pull
+over a tracked file with unpushed edits is refused unless
+`discard_local_changes: true` is given, and so is a pull over a file with no
+usable sync record (none, or a broken one) whose content differs from the
+note, such as one fetched by other means and edited since: nothing shows
+those edits were ever pushed. To keep them, pull to another path, carry the
+edits into that file, and push it. A file that already matches the note is
+adopted, and tracked from then on. `hackmd_untrack_note`, given the `note_id`
+and `confirm: true`, forgets the sync record without touching the file or the
+note; a later pull over that file, once edited, needs `discard_local_changes`
+like any other unrecorded file.
 
 ## Folders, deletion, images
 
@@ -139,10 +146,18 @@ file or the note.
 - `hackmd_upload_note_image` uploads a local image to a personal or team note
   and returns its CDN link. The link is public whenever the note is
   guest-readable; an anonymous fetch of an image on an owner-only note was
-  refused when measured, but treat that as observed, not promised. It needs a
-  workspace root (see [configuration.md](configuration.md#workspace-root));
-  files over 5 MiB need `confirm_large_file: true` and files over 10 MiB are
-  refused.
+  refused when measured, but treat that as observed, not promised. So the
+  result also reports `publicly_readable`: right after the upload the server
+  sends one signed-out `HEAD` for the link, without the token and only to
+  HackMD's own site, and reports `true` if an image or a redirect to a
+  presigned storage URL comes back, `false` if the request is refused, and
+  `null` if the check could not run or proved nothing (any other redirect,
+  such as to a login page, counts as nothing). It is always `null` when the
+  API is neither on the site's own host nor on its `api.` subdomain. A
+  `false` usually means the note is not guest-readable, and signed-out
+  readers will not see the image until it is. It needs a workspace root (see
+  [configuration.md](configuration.md#workspace-root)); files over 5 MiB need
+  `confirm_large_file: true` and files over 10 MiB are refused.
 
 ## Errors
 

@@ -8,6 +8,10 @@ use crate::{client::HackmdClient, config::Config, local::LocalFiles};
 pub struct SelfCheckReport {
     ok: bool,
     version: &'static str,
+    /// The commit the binary was built from, absent when unknown: compare it
+    /// with the checkout to spot an installed binary that predates it.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    commit: &'static str,
     token_present: bool,
     api_origin: String,
     state_directory: StateDirectoryCheck,
@@ -104,6 +108,7 @@ async fn self_check(
     Ok(SelfCheckReport {
         ok,
         version: crate::VERSION,
+        commit: crate::COMMIT,
         token_present,
         api_origin,
         state_directory: StateDirectoryCheck {

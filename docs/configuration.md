@@ -68,7 +68,9 @@ an agent reads the tree you pull into.
 
 `hackmd_upload_note_image` puts a local file behind a HackMD link, public
 whenever the note is guest-readable, so it requires a root set in the server's
-own environment, not only in `.env`, and refuses every upload otherwise.
+own environment, not only in `.env`, and refuses every upload otherwise. As
+with every setting, a change takes effect only when the server restarts; in
+Claude Code, reconnect it with `/mcp`.
 
 ## Sync state directory
 
@@ -98,12 +100,15 @@ hackmd-mcp --self-check
 ```
 
 Prints a JSON report and exits without starting the MCP transport. It covers the
-package version, whether a token is present, the API origin, whether the state
-directory is writable, and whether the workspace root is configured and
-accessible. Adding `--probe-api` makes one read-only `GET /me`, which reports
-only success or a bounded error, never profile data; without it the checks stay
-local. A failed check exits nonzero and still prints valid JSON, so editor
-integrations can parse it.
+package version, the source commit the binary was built from (`commit`, with
+`-dirty` when that checkout had uncommitted edits to `src/`, `build.rs`, or the
+Cargo manifest or lockfile, absent when the build had no git checkout), whether
+a token is present, the API origin, whether the state directory is writable,
+and whether the workspace root is configured and accessible. Adding
+`--probe-api` makes one read-only `GET /me`, which reports only success or a
+bounded error, never profile data; without it the checks stay local. A failed
+check exits nonzero and still prints valid JSON, so editor integrations can
+parse it.
 
 ## Logging
 

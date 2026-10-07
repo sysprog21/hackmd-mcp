@@ -411,6 +411,51 @@ impl HackmdClient {
         }
     }
 
+    /// Whether a signed-out reader can fetch `link`, from one unauthenticated
+    /// HEAD: `Some(true)` when an image is served, or the request is
+    /// redirected to a presigned storage URL (what `HackMD` answers for a
+    /// guest-readable note); `Some(false)` when it is refused; `None` for
+    /// anything else, any other redirect included (a login page, on the site
+    /// or at an identity provider), or when the check could not run. This is
+    /// the one request sent without the token and outside `send`: it is a
+    /// best-effort annotation, so it is neither retried nor traced. Only the
+    /// API's own origin or the site it serves (`api.hackmd.io` serves
+    /// `hackmd.io`) is asked, so an upload reply cannot point this request
+    /// anywhere else.
+    pub(crate) async fn anonymous_access(&self, link: &str) -> Option<bool> {
+        let url = Url::parse(link).ok()?;
+        if !serves(self.config.api_url(), &url) {
+            return None;
+        }
+        let response = self
+            .http
+            .head(url.clone())
+            .timeout(self.config.request_timeout().min(PROBE_TIMEOUT))
+            .send()
+            .await
+            .ok()?;
+        let status = response.status();
+        let header = |name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+        };
+        if status.is_success() {
+            header(reqwest::header::CONTENT_TYPE)
+                .and_then(|kind| kind.get(..6))
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+                .then_some(true)
+        } else if status.is_redirection() {
+            let target = url.join(header(reqwest::header::LOCATION)?).ok()?;
+            presigned_storage(&target).then_some(true)
+        } else if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     /// Issues a GET whose response body is mandatory.
     async fn get_required<T: DeserializeOwned>(&self, segments: &[&str]) -> Result<T, HackmdError> {
         self.request_required(Method::GET, segments, NO_BODY).await
@@ -894,6 +939,44 @@ fn includes_team(teams: &[TeamResponse], team_path: &str) -> bool {
     teams.iter().any(|team| team.path == team_path)
 }
 
+/// Whether a redirect target looks like a presigned S3 URL: https, carrying a
+/// non-empty access key, signature, and expiry. `HackMD` sends a
+/// guest-readable note's image to one (measured 2026-10-06: `AWSAccessKeyId`,
+/// `Expires`, `Signature`, for S3 signature version 2; version 4 names them
+/// `X-Amz-Credential`, `X-Amz-Signature`, and `X-Amz-Expires`). Requiring all
+/// three keeps a login or signed-app redirect that happens to carry a
+/// signature and an expiry from passing for storage.
+fn presigned_storage(target: &Url) -> bool {
+    let present = |names: [&str; 2]| {
+        target
+            .query_pairs()
+            .any(|(key, value)| names.contains(&key.as_ref()) && !value.is_empty())
+    };
+    target.scheme() == "https"
+        && present(["AWSAccessKeyId", "X-Amz-Credential"])
+        && present(["Signature", "X-Amz-Signature"])
+        && present(["Expires", "X-Amz-Expires"])
+}
+
+/// The longest a signed-out check of an upload link may take: it only
+/// annotates an upload that already succeeded, so a slow answer is reported
+/// as unknown rather than holding up the result.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Whether `link` sits on the API's own origin or on the site the API host
+/// serves under an `api.` prefix, with the same scheme and port. A link that
+/// carries credentials is refused: the request would no longer be signed out.
+fn serves(api: &Url, link: &Url) -> bool {
+    let (Some(api_host), Some(link_host)) = (api.host_str(), link.host_str()) else {
+        return false;
+    };
+    link.username().is_empty()
+        && link.password().is_none()
+        && api.scheme() == link.scheme()
+        && api.port_or_known_default() == link.port_or_known_default()
+        && (api_host == link_host || api_host.strip_prefix("api.") == Some(link_host))
+}
+
 /// Whether a write to this route can change a note list. A folder rename or
 /// reorder cannot: a listed note carries no folder fields. A folder DELETE
 /// still counts, since what it does to the notes inside is not verified.
@@ -949,11 +1032,37 @@ mod tests {
         );
         assert_eq!(retry_after(&headers), Some(Duration::from_secs(2)));
     }
+
     use crate::{
         dto::{CreateNoteRequest, UpdateNoteRequest},
         fixture::{FIXTURE_TOKEN, Scenario, SequenceServer},
         models::Workspace,
     };
+
+    #[test]
+    fn anonymous_checks_stay_on_the_site_the_api_serves() {
+        let parse = |url: &str| url::Url::parse(url).expect("URL should parse");
+        let serves = |api: &str, link: &str| super::serves(&parse(api), &parse(link));
+        let api = "https://api.hackmd.io/v1";
+        assert!(serves(api, "https://hackmd.io/_uploads/a.png"));
+        assert!(serves(api, "https://api.hackmd.io/_uploads/a.png"));
+        assert!(!serves(api, "http://hackmd.io/_uploads/a.png"));
+        assert!(!serves(api, "https://hackmd.io:8443/_uploads/a.png"));
+        assert!(!serves(api, "https://evil.example/_uploads/a.png"));
+        assert!(!serves(
+            api,
+            "https://hackmd.io.evil.example/_uploads/a.png"
+        ));
+        assert!(!serves(api, "https://io/_uploads/a.png"));
+        assert!(!serves(api, "https://user:secret@hackmd.io/_uploads/a.png"));
+        assert!(!serves(api, "https://user@hackmd.io/_uploads/a.png"));
+        assert!(serves(api, "https://HackMD.io:443/_uploads/a.png"));
+
+        // An API on the site's own origin serves only that origin.
+        let same = "https://md.example/api/v1";
+        assert!(serves(same, "https://md.example/uploads/a.png"));
+        assert!(!serves(same, "https://example/uploads/a.png"));
+    }
 
     #[tokio::test]
     async fn a_fresh_note_list_is_reused_until_a_write_invalidates_it() {

@@ -2,7 +2,7 @@ use clap::Parser;
 
 /// Local-first MCP server for the `HackMD` API.
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version = hackmd_mcp::VERSION_TEXT, about)]
 struct Cli {
     /// Print a JSON startup/configuration health report and exit.
     #[arg(long)]
