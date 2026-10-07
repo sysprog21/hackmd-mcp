@@ -49,6 +49,9 @@ pub(crate) struct Config {
     workspace_root: Option<PathBuf>,
     workspace_root_trusted: bool,
     list_cache_ttl: Duration,
+    /// Whether `image_url` fetches go to the plain-HTTP loopback fixture
+    /// instead of public `https` hosts. Only the test constructors set it.
+    loopback_images: bool,
 }
 
 impl Config {
@@ -126,6 +129,7 @@ impl Config {
             workspace_root,
             workspace_root_trusted: true,
             list_cache_ttl: LIST_CACHE_TTL,
+            loopback_images: false,
         })
     }
 
@@ -175,6 +179,10 @@ impl Config {
         self.list_cache_ttl
     }
 
+    pub(crate) const fn loopback_images(&self) -> bool {
+        self.loopback_images
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
         Self::from_getter(|_| None).expect("hard-coded defaults must remain valid")
@@ -199,6 +207,7 @@ impl Config {
         // Off by default in tests: request-count assertions are the point of
         // the fixtures, and a cache hit would silently swallow one.
         config.list_cache_ttl = Duration::ZERO;
+        config.loopback_images = true;
         config
     }
 

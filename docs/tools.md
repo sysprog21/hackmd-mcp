@@ -143,8 +143,8 @@ like any other unrecorded file.
   so check `folder_ids` from `hackmd_get_note` first if that matters.
 - `hackmd_delete_note` with `restore: true` brings a personal note back from
   trash. Team notes cannot be restored through the API.
-- `hackmd_upload_note_image` uploads a local image to a personal or team note
-  and returns its CDN link. The link is public whenever the note is
+- `hackmd_upload_note_image` uploads an image, from a local file or a public
+  URL, to a personal or team note and returns its CDN link. The link is public whenever the note is
   guest-readable; an anonymous fetch of an image on an owner-only note was
   refused when measured, but treat that as observed, not promised. So the
   result also reports `publicly_readable`: right after the upload the server
@@ -155,9 +155,29 @@ like any other unrecorded file.
   such as to a login page, counts as nothing). It is always `null` when the
   API is neither on the site's own host nor on its `api.` subdomain. A
   `false` usually means the note is not guest-readable, and signed-out
-  readers will not see the image until it is. It needs a workspace root (see
-  [configuration.md](configuration.md#workspace-root)); files over 5 MiB need
-  `confirm_large_file: true` and files over 10 MiB are refused.
+  readers will not see the image until it is. A local `image_path` needs a
+  workspace root (see [configuration.md](configuration.md#workspace-root)).
+  Instead of a local file, `image_url` re-hosts an image from a public URL,
+  which is how a note's imgur links move to HackMD without a download step.
+  The server fetches it only over `https` on the default port, only from a
+  host whose every resolved address is public (loopback, private, link-local,
+  CGNAT and reserved ranges are refused, and the checked addresses are pinned
+  for the connection), and re-checks each of at most 5 redirects the same way.
+  An address check cannot see translation beyond the server: on an IPv6-only
+  network whose NAT64 gateway uses its own prefix, a private IPv4 address can
+  arrive looking public, so such a network must filter that at its egress.
+  Nor can it see whom a public host serves: one that answers only your
+  network, by source address, passes, and its image is republished like any
+  other. A `rate_limited` or `upstream` error from an `image_url` fetch is
+  about the image host, not HackMD, and so is a `network` error naming a host
+  that does not resolve (the server cannot tell a missing host from DNS being
+  down). The
+  size an image host declares is checked before the download, and without
+  `confirm_large_file` an undeclared one stops at 5 MiB. A URL upload is named
+  after the URL's last path segment, with the extension of the type its bytes
+  show. Either source must be a PNG, JPEG, GIF, or WebP by its leading bytes;
+  files over 5 MiB need `confirm_large_file: true` and files over 10 MiB are
+  refused.
 
 ## Errors
 
