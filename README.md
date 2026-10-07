@@ -92,7 +92,7 @@ mkdir -p "$HACKMD_MCP_WORKSPACE_ROOT"
 ```
 
 The workspace root is optional but recommended: it confines every local file
-operation and enables image upload. The server reads both at startup, so
+operation and enables uploading local images. The server reads both at startup, so
 restart your agent after changing them. Keep the token out of chat, logs, and
 shared config files; [docs/configuration.md](docs/configuration.md) has the
 details.

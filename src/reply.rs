@@ -89,11 +89,13 @@ pub(crate) enum ErrorKind {
     /// as a permalink in use, or the body changed since the caller read it.
     /// Re-read before trying again.
     Conflict,
-    /// Out of quota; wait for the reset before retrying.
+    /// Out of quota, at `HackMD` or, for an `image_url`, at the image host;
+    /// wait for the reset the message names, or a while when it names none.
     RateLimited,
     /// A connection failure or timeout; retrying may succeed.
     Network,
-    /// `HackMD` failed or answered with something unusable; retry later.
+    /// `HackMD`, or for an `image_url` the image host, failed or answered
+    /// with something unusable; retry later.
     Upstream,
     /// `HackMD` rejected the request for another reason.
     Api,

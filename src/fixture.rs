@@ -1,7 +1,7 @@
 use std::{
     fmt::Write as _,
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -172,6 +172,7 @@ fn assert_scenarios(requests: &[String], expected: &[ExpectedRequest]) {
 
 pub(crate) struct SequenceServer {
     pub(crate) api_url: String,
+    address: SocketAddr,
     requests: Receiver<Vec<String>>,
     shutdown: Sender<()>,
     thread: Option<JoinHandle<()>>,
@@ -183,11 +184,7 @@ impl SequenceServer {
     /// response, producing a deterministic transport error without releasing a
     /// port that another parallel fixture could claim.
     pub(crate) fn spawn_disconnect() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture should bind");
-        listener
-            .set_nonblocking(true)
-            .expect("fixture listener should be nonblocking");
-        let address = listener.local_addr().expect("fixture address should exist");
+        let (listener, address) = bind_loopback();
         let (sender, requests) = mpsc::channel();
         let (shutdown, shutdown_rx) = mpsc::channel();
         let (ready, ready_rx) = mpsc::sync_channel(0);
@@ -202,6 +199,7 @@ impl SequenceServer {
         ready_rx.recv().expect("fixture thread should become ready");
         Self {
             api_url: format!("http://{address}/v1"),
+            address,
             requests,
             shutdown,
             thread: Some(thread),
@@ -241,11 +239,7 @@ impl SequenceServer {
         repeating: bool,
         expected: Option<Vec<ExpectedRequest>>,
     ) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("fixture should bind");
-        listener
-            .set_nonblocking(true)
-            .expect("fixture listener should be nonblocking");
-        let address = listener.local_addr().expect("fixture address should exist");
+        let (listener, address) = bind_loopback();
 
         // A body can name a link on the fixture itself, whose port is known
         // only now: `{origin}` stands for it.
@@ -328,11 +322,23 @@ impl SequenceServer {
         ready_rx.recv().expect("fixture thread should become ready");
         Self {
             api_url: format!("http://{address}/v1"),
+            address,
             requests,
             shutdown,
             thread: Some(thread),
             expected,
         }
+    }
+
+    /// Where the fixture listens, for tests that connect without a URL.
+    pub(crate) const fn addr(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// The fixture's origin, without the API's `/v1`: where a test serves
+    /// anything that is not an API route, such as an image to fetch.
+    pub(crate) fn origin(&self) -> String {
+        format!("http://{}", self.address)
     }
 
     /// A client pointed at this fixture.
@@ -431,6 +437,70 @@ fn accept_next(
             }
             Err(error) => panic!("fixture accept failed: {error}"),
         }
+    }
+}
+
+/// A listener on a free loopback port, nonblocking for [`accept_next`].
+fn bind_loopback() -> (TcpListener, SocketAddr) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fixture should bind");
+    listener
+        .set_nonblocking(true)
+        .expect("fixture listener should be nonblocking");
+    let address = listener.local_addr().expect("fixture address should exist");
+    (listener, address)
+}
+
+/// A fixture serving one raw `200`, from [`spawn_raw_body`].
+pub(crate) struct RawServer {
+    pub(crate) origin: String,
+}
+
+impl RawServer {
+    /// A client pointed at this fixture, with `request_timeout` as its stall
+    /// bound.
+    pub(crate) fn client(&self, request_timeout: Duration) -> HackmdClient {
+        HackmdClient::new(Config::for_loopback_test_with_timeout(
+            &format!("{}/v1", self.origin),
+            FIXTURE_TOKEN,
+            request_timeout,
+        ))
+        .expect("fixture client should build")
+    }
+}
+
+/// Serves one `200` whose body is `chunks`, each written after its delay,
+/// declaring `length` if given, or else no length, so the body ends when the
+/// connection closes. This stages what [`SequenceServer`] cannot: a declared
+/// length the body never delivers, or a body of undeclared length that
+/// stalls or trickles. The thread is left to end on its own, once the client
+/// hangs up, the chunks run out, or no client connects within the fixture
+/// deadline.
+pub(crate) fn spawn_raw_body(length: Option<u64>, chunks: Vec<(Duration, Vec<u8>)>) -> RawServer {
+    let (listener, address) = bind_loopback();
+    thread::spawn(move || {
+        // Nothing ever asks this fixture to shut down; only the deadline does.
+        let (_, shutdown) = mpsc::channel();
+        let deadline = Instant::now() + FIXTURE_DEADLINE;
+        let Some(mut stream) = accept_next(&listener, &shutdown, deadline) else {
+            return;
+        };
+        read_request(&mut stream, deadline);
+        let length = length.map_or_else(String::new, |length| {
+            format!("Content-Length: {length}\r\n")
+        });
+        let head = format!("HTTP/1.1 200 Fixture\r\n{length}Connection: close\r\n\r\n");
+        if stream.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        for (delay, chunk) in chunks {
+            thread::sleep(delay);
+            if stream.write_all(&chunk).is_err() {
+                return;
+            }
+        }
+    });
+    RawServer {
+        origin: format!("http://{address}"),
     }
 }
 

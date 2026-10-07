@@ -19,12 +19,14 @@ use crate::{
 mod cache;
 mod error;
 mod readback;
+mod remote;
 
 use cache::{AccountCache, CacheFill, CacheLookup, NotesCache, fresh, store};
 pub(crate) use error::HackmdError;
 use error::{RateLimitHeaders, map_status_error, parse_header, request_error, transport_error};
 pub(crate) use readback::Readback;
 use readback::{poll_readback_sized, transfer_allowance};
+pub(crate) use remote::{ImageUrl, RemoteImageError};
 
 /// HTTP client shared by all `HackMD` tool handlers.
 #[derive(Debug)]
@@ -33,6 +35,8 @@ pub(crate) struct HackmdClient {
     http: reqwest::Client,
     notes: NotesCache,
     account: AccountCache,
+    /// Built on the first `image_url` fetch; see [`remote::Fetcher`].
+    images: std::sync::OnceLock<remote::Fetcher>,
 }
 
 impl HackmdClient {
@@ -54,6 +58,7 @@ impl HackmdClient {
             http,
             notes,
             account,
+            images: std::sync::OnceLock::new(),
         })
     }
 
@@ -346,7 +351,7 @@ impl HackmdClient {
         note_id: &str,
         file_name: &str,
         mime: &str,
-        image: tokio::fs::File,
+        image: impl Into<reqwest::Body>,
         size_bytes: u64,
     ) -> Result<ImageUploadResponse, HackmdError> {
         let (url, path, token) = self.authorized("POST", &["notes", note_id, "images"])?;

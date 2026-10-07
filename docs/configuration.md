@@ -68,7 +68,8 @@ an agent reads the tree you pull into.
 
 `hackmd_upload_note_image` puts a local file behind a HackMD link, public
 whenever the note is guest-readable, so it requires a root set in the server's
-own environment, not only in `.env`, and refuses every upload otherwise. As
+own environment, not only in `.env`, and refuses every local upload otherwise. An
+`image_url` upload reads no local file, so it needs no root. As
 with every setting, a change takes effect only when the server restarts; in
 Claude Code, reconnect it with `/mcp`.
 
