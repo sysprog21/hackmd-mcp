@@ -284,12 +284,23 @@ mod tests {
             image_path: image.path().to_path_buf(),
             confirm_large_file: false,
         };
-        assert!(matches!(
-            upload_note_image(&client, &crate::fixture::scratch_files(), input).await,
-            Err(UploadNoteImageError::Access(
-                crate::local::LocalAccessError::Unconfined { .. }
-            ))
-        ));
+        let error = upload_note_image(&client, &crate::fixture::scratch_files(), input)
+            .await
+            .expect_err("an upload without a root should be refused");
+        assert!(
+            matches!(
+                error,
+                UploadNoteImageError::Access(crate::local::LocalAccessError::Unconfined { .. })
+            ),
+            "{error:?}"
+        );
+
+        // The refusal names a root that would admit this very file, and says
+        // the server has to restart to read it.
+        let message = error.to_string();
+        let parent = image.path().parent().expect("temp file has a parent");
+        assert!(message.contains(&parent.display().to_string()), "{message}");
+        assert!(message.contains("restart"), "{message}");
     }
 
     #[tokio::test]
