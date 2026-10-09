@@ -567,10 +567,6 @@ impl LocalFiles {
         }
     }
 
-    /// Reads at most `limit` bytes, so a caller that only compares or bounds a
-    /// file never loads more of it than it can use; a result exactly `limit`
-    /// long may be the start of a larger file. The stamp comes from the handle
-    /// the bytes came through, for `write_atomic` to compare against later.
     /// The stamp of the file at `path` now, from its metadata alone, so even
     /// a file that cannot be read has one; `None` when nothing is there.
     pub(crate) fn stamp(&self, path: &Path) -> Result<Option<Stamp>, LocalAccessError> {
@@ -584,6 +580,10 @@ impl LocalFiles {
         })
     }
 
+    /// Reads at most `limit` bytes, so a caller that only compares or bounds a
+    /// file never loads more of it than it can use; a result exactly `limit`
+    /// long may be the start of a larger file. The stamp comes from the handle
+    /// the bytes came through, for `write_atomic` to compare against later.
     pub(crate) fn read_stamped(
         &self,
         path: &Path,
