@@ -89,17 +89,23 @@ fn heading_title(heading: &str) -> Option<String> {
 /// lines of a key other than `title` are read: any other line breaks with
 /// none, since it may hide a title or make the whole block something else.
 fn front_matter_title<'a>(front: impl Iterator<Item = &'a str>) -> ControlFlow<Option<String>> {
-    // Indented and `-` lines belong to the key above, unless it is the title.
-    let (mut continuable, mut title) = (false, ControlFlow::Continue(()));
+    let (mut follows, mut title) = (Follows::Nothing, ControlFlow::Continue(()));
     for line in front {
         let content = line.trim_start();
         if content.is_empty() || content.starts_with('#') {
             continue;
         }
         if line.starts_with([' ', '\t', '-']) {
-            // A title continued this way is folded, multi-line, or a list; with
-            // no key above, the line is not a mapping at all.
-            if !continuable {
+            // A title continued this way is folded, multi-line, or a list;
+            // after anything else that cannot take it, or with no key above,
+            // the block is YAML that does not parse.
+            let fits = match follows {
+                Follows::Nested => true,
+                Follows::Block => !line.starts_with('-'),
+                Follows::Plain => !line.starts_with('-') && plain_text(content).is_some(),
+                Follows::Nothing => false,
+            };
+            if !fits {
                 return ControlFlow::Break(None);
             }
             continue;
@@ -117,7 +123,7 @@ fn front_matter_title<'a>(front: impl Iterator<Item = &'a str>) -> ControlFlow<O
         {
             return ControlFlow::Break(None);
         }
-        continuable = key != "title";
+        follows = Follows::after(key, value);
         if key == "title" {
             if title.is_break() {
                 return ControlFlow::Break(None);
@@ -126,6 +132,34 @@ fn front_matter_title<'a>(front: impl Iterator<Item = &'a str>) -> ControlFlow<O
         }
     }
     title
+}
+
+/// What may follow a key's line: nested lines under an empty value, a block
+/// scalar's indented text, a plain scalar's folded continuation, or nothing
+/// (after the title, a closed quote, or a flow collection).
+#[derive(Clone, Copy)]
+enum Follows {
+    Nested,
+    Block,
+    Plain,
+    Nothing,
+}
+
+impl Follows {
+    fn after(key: &str, value: &str) -> Self {
+        let value = value.trim();
+        if key == "title" {
+            Self::Nothing
+        } else if value.is_empty() || value.starts_with('#') {
+            Self::Nested
+        } else if value.starts_with(['|', '>']) {
+            Self::Block
+        } else if value.starts_with(['"', '\'', '[', '{']) {
+            Self::Nothing
+        } else {
+            Self::Plain
+        }
+    }
 }
 
 /// Whether a value is one this reads for certain to end on its line: empty,
@@ -477,6 +511,22 @@ mod tests {
             None,
         ),
         ("---\nkey: - a\ntitle: Wrong\n---\n", None),
+        // Only what YAML lets follow a value may follow it.
+        (
+            "---\ndescription: \"ok\"\n  more\ntitle: Wrong\n---\n# Right\n",
+            None,
+        ),
+        ("---\ntags: [a]\n  more\ntitle: Wrong\n---\n# Right\n", None),
+        ("---\nkey: a\n  b: c\ntitle: Wrong\n---\n# Right\n", None),
+        ("---\nkey: a\n- b\ntitle: Wrong\n---\n# Right\n", None),
+        (
+            "---\nkey: plain\n  folded on\ntitle: Kept\n---\n",
+            Some("Kept"),
+        ),
+        (
+            "---\nlist:\n- a\nmap:\n  b: c\ntitle: Kept\n---\n",
+            Some("Kept"),
+        ),
         ("---\ntags: # none\ntitle: Kept\n---\n", Some("Kept")),
         (
             "---\ndescription: >-\n  folded\ntitle: Kept\n---\n",
