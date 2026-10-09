@@ -196,7 +196,7 @@ pub(crate) enum LocalAccessError {
     #[error("{}", unconfined_message(path, *from_dotenv))]
     Unconfined { path: PathBuf, from_dotenv: bool },
     #[error(
-        "{} changed after it was read, so nothing was written; read it again and redo the step",
+        "{} is no longer what this call saw there (it changed after it was read, or a dangling symlink stands where nothing was expected), so nothing was written; check the path and redo the step",
         path.display()
     )]
     Changed { path: PathBuf },
