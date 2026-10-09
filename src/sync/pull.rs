@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::{
     client::{HackmdClient, HackmdError},
     hash::body_hash,
-    local::{Entry, LocalAccessError, LocalFiles},
+    local::{Entry, Expect, LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
     sync::state::{StateError, TrackedNoteState},
@@ -66,6 +66,16 @@ pub(crate) struct PullNoteOutput {
     /// bytes just written locally, so a caller can confirm the file landed
     /// intact and anchor later verification without reading the sync sidecar.
     pub(crate) body_hash: String,
+    /// A bounded unified diff from the file this pull replaced to the pulled
+    /// body; absent when the old file was unreadable, oversized, not UTF-8,
+    /// missing, or already matched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) changes: Option<String>,
+    /// The title the body itself gives (front-matter `title:`, or an H1 that
+    /// is its first line of text) when it differs from the note's listed
+    /// `title`; see `hackmd_push_note`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) title_drift: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -158,10 +168,43 @@ pub(crate) async fn pull_note(
     // holds exactly the remote body has nothing to lose, which is what a push
     // whose state could not be saved leaves behind.
     let exists = validate_destination(files, &input)?;
-    if exists && !input.discard_local_changes {
-        local_loss(files, &input, &body)?;
+    // One byte past the maximum is enough to tell an oversized file apart.
+    let read = exists.then(|| files.read_stamped(&input.local_path, BODY_MAX_BYTES + 1));
+    let (previous, stamp) = match read {
+        Some(Ok((bytes, stamp))) => (Some(bytes), Some(stamp)),
+        // Reading is only for the optional diff when discarding the file, so
+        // one that cannot be read is still guarded, by its metadata.
+        Some(Err(_)) if input.discard_local_changes => (None, files.stamp(&input.local_path)?),
+        Some(Err(error)) => return Err(error.into()),
+        None => (None, None),
+    };
+    // When the write lands, the file must still be the one seen here, or still
+    // be absent, so an editor's save meanwhile is not lost.
+    let expect = stamp.map_or(Expect::Absent, Expect::Stamp);
+
+    // The replaced file in the form HackMD stores, judged once. `changes` shows
+    // what the pull changed in it, so a remote edit (a renamed heading that
+    // in-text references still name, say) is visible without a separate diff.
+    let (local, same, changes, title_drift) = crate::local::offload(|| {
+        let local = previous.and_then(super::stored_text);
+        let same = local.as_deref() == Some(body.as_str());
+        let changes = local
+            .as_deref()
+            .filter(|_| !same)
+            .map(|local| super::push::change_diff(local, &body));
+        let title_drift = crate::note::body::title_drift(&remote.title, &body);
+        (local, same, changes, title_drift)
+    });
+    if exists && !same && !input.discard_local_changes {
+        local_loss(files, &input, local.as_deref())?;
     }
-    files.write_atomic(&input.local_path, body.as_bytes(), input.create_parent_dirs)?;
+    drop(local);
+    files.write_atomic(
+        &input.local_path,
+        body.as_bytes(),
+        input.create_parent_dirs,
+        expect,
+    )?;
     let state = crate::local::offload(|| {
         TrackedNoteState::capture(
             note.note_id.clone(),
@@ -180,6 +223,8 @@ pub(crate) async fn pull_note(
         // The canonical path the record keeps, which is what push reports back.
         local_path: state.local_path,
         bytes: size_bytes,
+        changes,
+        title_drift,
     }))
 }
 
@@ -212,26 +257,20 @@ fn validate_destination(files: &LocalFiles, input: &PullNoteInput) -> Result<boo
     }
 }
 
-/// Refuses a pull that would lose the existing file at `local_path`. A file
-/// already identical to `remote` passes in every case: the pull would rewrite
-/// the same bytes, and that is how a broken record is repaired. Otherwise a
-/// tracked file that differs from the body last synced to it has unpushed
-/// edits, judged against the hash in its record, so no baseline is read. A file
-/// with no usable record is refused too: nothing shows it was ever pushed, and
-/// `overwrite_local`, which its existence demands, says nothing about its
-/// content (a file fetched some other way and edited since is exactly this).
-/// An I/O failure stops the pull rather than waving it on.
+/// Refuses a pull that would lose the existing file at `local_path`, which
+/// differs from the note (a file identical to it is never asked about: the
+/// pull would rewrite the same text, and that is how a broken record is
+/// repaired). A tracked file that differs from the body last synced to it has
+/// unpushed edits, judged against the hash in its record, so no baseline is
+/// read. A file with no usable record is refused too: nothing shows it was
+/// ever pushed, and `overwrite_local`, which its existence demands, says
+/// nothing about its content (a file fetched some other way and edited since
+/// is exactly this). An I/O failure stops the pull rather than waving it on.
 fn local_loss(
     files: &LocalFiles,
     input: &PullNoteInput,
-    remote: &str,
+    local: Option<&str>,
 ) -> Result<(), PullNoteError> {
-    // One byte past the maximum is enough to tell an oversized file apart.
-    let local = files.read_capped(&input.local_path, BODY_MAX_BYTES + 1)?;
-    if local == remote.as_bytes() {
-        return Ok(());
-    }
-
     // Two records naming the file are still tracking it, but there is no single
     // baseline to judge against. Any other failure, now or added later, refuses
     // rather than overwrite.
@@ -262,9 +301,7 @@ fn local_loss(
         return Err(refusal);
     };
     // A body that is not UTF-8 was never a synced baseline.
-    let unchanged = crate::local::offload(|| {
-        std::str::from_utf8(&local).is_ok_and(|body| body_hash(body) == baseline)
-    });
+    let unchanged = crate::local::offload(|| local.is_some_and(|body| body_hash(body) == baseline));
     if unchanged { Ok(()) } else { Err(refusal) }
 }
 
@@ -641,6 +678,36 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discarding_an_unreadable_file_does_not_need_a_diff() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "local").expect("local file should write");
+        fs::set_permissions(&local_path, fs::Permissions::from_mode(0o200))
+            .expect("permissions should set");
+
+        // A privileged process can still read mode 0200; this case needs a
+        // process subject to the file's permissions.
+        if fs::read(&local_path).is_ok() {
+            return;
+        }
+        let files = crate::fixture::unconfined_files(directory.path().join("state"));
+        let output = pull_with(&files, overwrite_input(&local_path, true), "remote")
+            .await
+            .expect("discarding pull should succeed")
+            .expect("note should resolve");
+        assert_eq!(output.changes, None);
+        fs::set_permissions(&local_path, fs::Permissions::from_mode(0o600))
+            .expect("permissions should restore");
+        assert_eq!(
+            fs::read_to_string(local_path).expect("file should read"),
+            "remote"
+        );
+    }
+
     /// A store that must not be trusted cannot vouch that a file has no
     /// unpushed edits, so the pull refuses rather than overwrite it.
     #[cfg(unix)]
@@ -699,8 +766,17 @@ mod tests {
         local_path: &std::path::Path,
         remote: &str,
     ) -> Result<Result<PullNoteOutput, NoteResolution>, PullNoteError> {
+        pull_with(files, overwrite_input(local_path, false), remote).await
+    }
+
+    /// Pulls `remote` with `input` against a server that serves only it.
+    async fn pull_with(
+        files: &LocalFiles,
+        input: PullNoteInput,
+        remote: &str,
+    ) -> Result<Result<PullNoteOutput, NoteResolution>, PullNoteError> {
         let fixture = crate::fixture::SequenceServer::spawn_scenarios([remote_note(remote)]);
-        let result = pull_note(&fixture.client(), files, overwrite_input(local_path, false)).await;
+        let result = pull_note(&fixture.client(), files, input).await;
         fixture.finish();
         result
     }
@@ -819,6 +895,65 @@ mod tests {
                 "edited offline"
             );
         }
+    }
+
+    /// A pull says what it changed in the file it replaced, and that the H1
+    /// no longer matches the listed title. The tracked file was saved with
+    /// CRLF, which is not an unpushed edit.
+    #[tokio::test]
+    async fn a_pull_reports_its_changes_and_a_drifted_title() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "# Note\r\n\r\nsee 「Old」\r\n").expect("local file should write");
+        let files = crate::fixture::tracked_files(
+            directory.path(),
+            "note-id",
+            &local_path,
+            "# Note\n\nsee 「Old」\n",
+        );
+
+        let output = pull_over(&files, &local_path, "# Renamed\n\nsee 「Old」\n")
+            .await
+            .expect("pull should succeed")
+            .expect("note should resolve");
+        let changes = output.changes.expect("a replaced file reports its changes");
+        assert!(
+            changes.starts_with("--- local\n+++ remote\n")
+                && changes.contains("-# Note")
+                && changes.contains("+# Renamed"),
+            "{changes}"
+        );
+        assert_eq!(output.title_drift.as_deref(), Some("Renamed"));
+
+        let output = pull_over(&files, &local_path, "# Renamed\n\nsee 「Old」\n")
+            .await
+            .expect("pull should succeed")
+            .expect("note should resolve");
+        assert_eq!(output.changes, None, "an unchanged file reports nothing");
+    }
+
+    /// A file past the size cap is read only in part. Its CRLF prefix may
+    /// normalize to exactly the remote body, but the unread rest is not, so
+    /// the pull must still refuse instead of replacing it.
+    #[tokio::test]
+    async fn an_oversized_crlf_file_is_never_taken_as_the_note() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        let lines = (super::BODY_MAX_BYTES + 1).div_ceil(3);
+        fs::write(
+            &local_path,
+            format!("{}unpushed suffix\n", "a\r\n".repeat(lines)),
+        )
+        .expect("local file should write");
+        let files = crate::fixture::unconfined_files(directory.path().join("state"));
+
+        let mut input = overwrite_input(&local_path, false);
+        input.confirm_large_file = true;
+        let result = pull_with(&files, input, &"a\n".repeat(lines)).await;
+        assert!(
+            matches!(result, Err(PullNoteError::UnverifiedLocalContent)),
+            "{result:?}"
+        );
     }
 
     /// An untracked file that already holds the note is adopted: the pull

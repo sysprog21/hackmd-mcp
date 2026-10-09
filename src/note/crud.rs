@@ -15,6 +15,7 @@ use crate::{
     },
     models::Workspace,
     note::{
+        body::into_stored,
         edit::{
             BodyChanged, EditNoteError, EditNoteInput, EditNoteOutput, edit_note, ensure_unchanged,
         },
@@ -30,8 +31,8 @@ pub(crate) struct CreateNoteInput {
     /// personal workspace.
     #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
-    /// Optional note title; `HackMD` content front matter or a leading H1 may
-    /// take precedence.
+    /// Optional note title. When omitted, `HackMD` derives one from the body
+    /// once: a front-matter `title:`, then the first H1, then "Untitled".
     pub(crate) title: Option<String>,
     /// Full Markdown note body.
     pub(crate) content: Option<String>,
@@ -79,8 +80,8 @@ pub(crate) struct UpdateNoteInput {
     /// `@owner/slug` URL.
     #[serde(default)]
     pub(crate) refresh: bool,
-    /// New title. A YAML `title:` in the body wins, then a leading H1, and
-    /// only then this field, so on a note with either it changes nothing.
+    /// New listed title. It always takes effect, whatever the body's
+    /// front-matter `title:` or H1 says; body edits never change the title.
     pub(crate) title: Option<String>,
     /// Explicit full-body replacement. Prefer `patch` for normal content
     /// edits: this overwrites the complete body, and nothing this server
@@ -282,10 +283,11 @@ impl crate::reply::ToolError for CrudError {
 /// PATCH is not reported as its result. Values are compared the way `HackMD`
 /// may normalize them, so a write that landed is not failed over a format:
 /// tags as a trimmed set without empties (as the official CLI sends them),
-/// a missing description as empty, a permalink ignoring case. Left out: the
-/// title, which `HackMD` may derive from the body, and the folder, whose read
-/// is an ancestor list of unverified order (and unmeasured for teams), so a
-/// move to an ancestor would match before it landed.
+/// a missing description as empty, a permalink ignoring case, a title ignoring
+/// surrounding whitespace (an explicit title always takes effect, measured
+/// 2026-10-08; a blank one is left to `HackMD`). Left out: the folder, whose
+/// read is an ancestor list of unverified order (and unmeasured for teams), so
+/// a move to an ancestor would match before it landed.
 fn shows_metadata(sent: &UpdateNoteRequest<'_>, note: &NoteResponse) -> bool {
     unshown_metadata(sent, note).is_empty()
 }
@@ -299,6 +301,13 @@ fn unshown_metadata(sent: &UpdateNoteRequest<'_>, note: &NoteResponse) -> Vec<&'
             .collect()
     }
     [
+        (
+            "title",
+            sent.title
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(|title| title.is_empty() || note.title.trim() == title),
+        ),
         (
             "tags",
             sent.tags
@@ -356,7 +365,7 @@ pub(crate) async fn create_note(
     let folder = input.parent_folder_id;
     let mut payload = CreateNoteRequest {
         title: input.title,
-        content: input.content,
+        content: crate::local::offload(|| input.content.map(into_stored)),
         tags: input.tags,
         description: input.description,
         read_permission: input.read_permission,
@@ -435,6 +444,7 @@ pub(crate) async fn create_note(
         written_bytes,
         // Compared, never sent: create's metadata in the shape update checks.
         &UpdateNoteRequest {
+            title: payload.title.clone(),
             tags: payload.tags.clone(),
             description: payload.description.clone(),
             permalink: payload.permalink.clone(),
@@ -537,7 +547,11 @@ pub(crate) async fn update_note(
     // saw; an edit landing between this read and the PATCH is still reverted,
     // since `HackMD` has no conditional write.
     let replacing = input.content.is_some();
-    let content = match (input.content, input.expected_hash.as_deref()) {
+
+    // A body converts only when the caller supplied it; a resent one goes back
+    // exactly as read.
+    let replacement = crate::local::offload(|| input.content.map(into_stored));
+    let content = match (replacement, input.expected_hash.as_deref()) {
         (Some(content), None) => content,
         (replacement, expected) => {
             let resending = replacement.is_none();
@@ -882,6 +896,93 @@ mod tests {
         };
         assert_eq!(note.title, "Updated");
         assert_eq!(note.patch_path, "notes/note/id.md");
+        server.finish();
+    }
+
+    #[tokio::test]
+    async fn a_title_change_waits_for_a_read_that_shows_it() {
+        // An explicit title always takes effect, so a read still showing the
+        // old one predates the PATCH and must not be returned as its result.
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/note%2Fid",
+                200,
+                r#"{"id":"note/id","title":"Old","content":"body"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/note%2Fid", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note%2Fid",
+                200,
+                r#"{"id":"note/id","title":"Old","content":"body"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note%2Fid",
+                200,
+                r#"{"id":"note/id","title":"New","content":"body"}"#,
+            ),
+        ]);
+        let input = serde_json::from_value(json!({"note_ref": "note/id", "title": " New "}))
+            .expect("update input should deserialize");
+        let output = update_note(&server.client(), input)
+            .await
+            .expect("update should be confirmed")
+            .expect("direct reference should resolve");
+        let super::UpdateNoteOutput::Updated { note, .. } = output else {
+            panic!("a title change should update the note");
+        };
+        assert_eq!(note.title, "New");
+        server.finish();
+    }
+
+    #[tokio::test]
+    async fn create_sends_content_with_lf() {
+        let server = SequenceServer::spawn_scenarios([Scenario::new(
+            "POST",
+            "/v1/notes",
+            201,
+            r#"{"id":"new-id","title":"New"}"#,
+        )
+        .expect_body("LF line endings", |body| {
+            body.contains(r#""content":"a\nb\nc""#)
+        })]);
+        let input: CreateNoteInput =
+            serde_json::from_value(json!({"title": "New", "content": "a\r\nb\rc"}))
+                .expect("create input should deserialize");
+        let output = create_note(&server.client(), input)
+            .await
+            .expect("create should succeed");
+        assert_eq!(output.unconfirmed_fields, Vec::<&str>::new());
+        server.finish();
+    }
+
+    #[tokio::test]
+    async fn a_crlf_replacement_is_sent_and_confirmed_with_lf() {
+        // HackMD stores `\n` (measured 2026-10-08); the read-back of the body
+        // as sent would never match, so the update would time out unconfirmed.
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("PATCH", "/v1/notes/note%2Fid", 202, "")
+                .expect_body("LF line endings, BOM and trailing newlines kept", |body| {
+                    body.contains(r#""content":"﻿a\nb\nc\n\n""#)
+                }),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note%2Fid",
+                200,
+                r#"{"id":"note/id","title":"T","content":"﻿a\nb\nc\n\n"}"#,
+            ),
+        ]);
+        let input = serde_json::from_value(json!({
+            "note_ref": "note/id",
+            "content": "\u{feff}a\r\nb\rc\n\n"
+        }))
+        .expect("update input should deserialize");
+        update_note(&server.client(), input)
+            .await
+            .expect("update should be confirmed")
+            .expect("direct reference should resolve");
         server.finish();
     }
 

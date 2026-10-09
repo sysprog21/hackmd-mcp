@@ -94,6 +94,64 @@ fn directory_identity(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
+/// A file's size and modification time: enough to tell that it was rewritten
+/// between two looks, short of a same-size write within the file system's
+/// timestamp resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Stamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl Stamp {
+    fn of(metadata: &fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+
+    fn of_confined(metadata: &cap_std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata
+                .modified()
+                .ok()
+                .map(cap_std::time::SystemTime::into_std),
+        }
+    }
+}
+
+/// What the file at a path must still be for `write_atomic` to replace it, so
+/// a save that lands while a caller judges the file is not lost: nothing at
+/// all, or the file seen earlier.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Expect {
+    Absent,
+    Stamp(Stamp),
+}
+
+impl Expect {
+    /// Whether the file still meets this, given `look(follow)`: its stamp now,
+    /// following a symlink or not. Absence is judged without following, so a
+    /// dangling symlink is something there, not nothing.
+    fn holds(self, look: impl FnOnce(bool) -> io::Result<Option<Stamp>>) -> io::Result<bool> {
+        Ok(match self {
+            Self::Absent => look(false)?.is_none(),
+            Self::Stamp(stamp) => look(true)? == Some(stamp),
+        })
+    }
+}
+
+/// `None` for a missing file, the error otherwise.
+fn found<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// What a caller-supplied path currently names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Entry {
@@ -137,6 +195,11 @@ pub(crate) enum LocalAccessError {
     StateDirectory { path: PathBuf },
     #[error("{}", unconfined_message(path, *from_dotenv))]
     Unconfined { path: PathBuf, from_dotenv: bool },
+    #[error(
+        "{} changed after it was read, so nothing was written; read it again and redo the step",
+        path.display()
+    )]
+    Changed { path: PathBuf },
     #[error("local file operation failed: {0}")]
     Io(#[from] io::Error),
 }
@@ -174,6 +237,7 @@ impl crate::reply::ToolError for LocalAccessError {
             | Self::StateDirectory { .. }
             | Self::Unconfined { .. } => ErrorKind::LocalAccess,
             Self::Relative { .. } | Self::NotRegular { .. } => ErrorKind::InvalidInput,
+            Self::Changed { .. } => ErrorKind::Conflict,
             Self::Io(_) => ErrorKind::LocalIo,
         }
     }
@@ -289,22 +353,25 @@ fn is_agent_instruction_path(path: &Path) -> bool {
             .any(|component| listed(AGENT_CONFIG_DIRS, component.as_os_str()))
 }
 
-/// Replaces `path` with `contents` through a temporary file beside it,
-/// readied by `prepare` (its permissions) before anything is written and
-/// synced before the rename, so a reader sees the old file or the new one,
-/// never a torn mix.
+/// Replaces `path` with `contents` through a temporary file beside it, synced
+/// before the rename, so a reader sees the old file or the new one, never a
+/// torn mix. `before_persist` runs on the written file just before the rename:
+/// to set its permissions, or to refuse.
 pub(crate) fn replace_atomic(
     path: &Path,
     contents: &[u8],
-    prepare: impl FnOnce(&fs::File) -> io::Result<()>,
+    before_persist: impl FnOnce(&fs::File) -> io::Result<()>,
 ) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
+    // Created private (0600 on unix) and invisible until persisted, so
+    // `before_persist` may set permissions after the write; it runs last so
+    // a check it makes is as close to the rename as it can be.
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    prepare(temporary.as_file())?;
     temporary.write_all(contents)?;
     temporary.as_file().sync_all()?;
+    before_persist(temporary.as_file())?;
     temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
@@ -501,19 +568,34 @@ impl LocalFiles {
     }
 
     /// Reads at most `limit` bytes, so a caller that only compares or bounds a
-    /// file never loads more of it than it can use. A result exactly `limit`
-    /// long may be the start of a larger file.
-    pub(crate) fn read_capped(
+    /// file never loads more of it than it can use; a result exactly `limit`
+    /// long may be the start of a larger file. The stamp comes from the handle
+    /// the bytes came through, for `write_atomic` to compare against later.
+    /// The stamp of the file at `path` now, from its metadata alone, so even
+    /// a file that cannot be read has one; `None` when nothing is there.
+    pub(crate) fn stamp(&self, path: &Path) -> Result<Option<Stamp>, LocalAccessError> {
+        crate::local::offload(|| {
+            Ok(match self.confined(path)? {
+                Some((dir, relative)) => found(dir.metadata(relative))?
+                    .as_ref()
+                    .map(Stamp::of_confined),
+                None => found(fs::metadata(path))?.as_ref().map(Stamp::of),
+            })
+        })
+    }
+
+    pub(crate) fn read_stamped(
         &self,
         path: &Path,
         limit: usize,
-    ) -> Result<Vec<u8>, LocalAccessError> {
+    ) -> Result<(Vec<u8>, Stamp), LocalAccessError> {
         crate::local::offload(|| {
+            let file = self.open_read(path)?;
+            let stamp = Stamp::of(&file.metadata()?);
             let mut bytes = Vec::new();
-            self.open_read(path)?
-                .take(u64::try_from(limit).unwrap_or(u64::MAX))
+            file.take(u64::try_from(limit).unwrap_or(u64::MAX))
                 .read_to_end(&mut bytes)?;
-            Ok(bytes)
+            Ok((bytes, stamp))
         })
     }
 
@@ -582,7 +664,11 @@ impl LocalFiles {
         path: &Path,
         contents: &[u8],
         create_parent_dirs: bool,
+        expect: Expect,
     ) -> Result<(), LocalAccessError> {
+        let changed = || LocalAccessError::Changed {
+            path: path.to_path_buf(),
+        };
         crate::local::offload(|| {
             // The same refusal `allow_write` gives up front, repeated where the
             // write happens so no caller can skip it.
@@ -593,9 +679,25 @@ impl LocalFiles {
                 }
                 // The user's own file keeps whatever permissions it had.
                 let existing = fs::metadata(path).ok().map(|meta| meta.permissions());
-                return Ok(replace_atomic(path, contents, |file| {
+                let mut held = true;
+                let written = replace_atomic(path, contents, |file| {
+                    held = expect.holds(|follow| {
+                        let metadata = if follow {
+                            fs::metadata(path)
+                        } else {
+                            fs::symlink_metadata(path)
+                        };
+                        Ok(found(metadata)?.as_ref().map(Stamp::of))
+                    })?;
+                    if !held {
+                        return Err(io::Error::other("changed"));
+                    }
                     existing.map_or(Ok(()), |permissions| file.set_permissions(permissions))
-                })?);
+                });
+                return match written {
+                    Err(_) if !held => Err(changed()),
+                    written => Ok(written?),
+                };
             };
             let parent = relative.parent().ok_or_else(|| {
                 LocalAccessError::Io(io::Error::new(
@@ -628,18 +730,37 @@ impl LocalFiles {
             options.write(true).create_new(true);
             let mut file = dir.open_with(&temporary, &options)?;
             let result = (|| {
+                file.write_all(contents)?;
+                file.sync_all()?;
+                let look = |follow| {
+                    let metadata = if follow {
+                        dir.metadata(&relative)
+                    } else {
+                        dir.symlink_metadata(&relative)
+                    };
+                    Ok(found(metadata)?.as_ref().map(Stamp::of_confined))
+                };
+                if !expect.holds(look)? {
+                    return Ok(false);
+                }
+                // Only now, so a refused temporary is never left read-only
+                // where it cannot be removed.
                 if let Some(permissions) = existing_permissions {
                     file.set_permissions(permissions)?;
                 }
-                file.write_all(contents)?;
-                file.sync_all()?;
-                dir.rename(&temporary, dir, &relative)
+                dir.rename(&temporary, dir, &relative).map(|()| true)
             })();
-            if let Err(error) = result {
-                let _ = dir.remove_file(&temporary);
-                return Err(LocalAccessError::Io(error));
+            match result {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    let _ = dir.remove_file(&temporary);
+                    Err(changed())
+                }
+                Err(error) => {
+                    let _ = dir.remove_file(&temporary);
+                    Err(LocalAccessError::Io(error))
+                }
             }
-            Ok(())
         })
     }
 
@@ -698,13 +819,80 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use super::{LocalAccessError, LocalFiles};
+    use super::{Expect, LocalAccessError, LocalFiles};
 
     /// `path` made absolute on this platform. A leading `/` is not enough on
     /// Windows, where a path without a drive is relative to the current one.
     fn abs(path: &str) -> PathBuf {
         let root = if cfg!(windows) { r"C:\" } else { "/" };
         Path::new(root).join(path)
+    }
+
+    /// A write that expects the file read earlier, or none, refuses once an
+    /// editor has saved there meanwhile, and leaves that save in place.
+    #[test]
+    fn a_write_refuses_a_file_changed_since_it_was_read() {
+        for confined in [false, true] {
+            let directory = tempfile::tempdir().expect("temp directory should create");
+            let root = directory
+                .path()
+                .canonicalize()
+                .expect("root should resolve");
+            let path = root.join("note.md");
+            let files = LocalFiles::new(root.join("state"), confined.then(|| root.clone()));
+
+            fs::write(&path, "first").expect("file should write");
+            let (_, stamp) = files.read_stamped(&path, 64).expect("file should read");
+            fs::write(&path, "an editor's save").expect("file should rewrite");
+            for expect in [Expect::Stamp(stamp), Expect::Absent] {
+                assert!(matches!(
+                    files.write_atomic(&path, b"pull", false, expect),
+                    Err(LocalAccessError::Changed { .. })
+                ));
+            }
+            assert_eq!(
+                fs::read_to_string(&path).expect("file should read"),
+                "an editor's save"
+            );
+
+            let (_, stamp) = files.read_stamped(&path, 64).expect("file should read");
+            files
+                .write_atomic(&path, b"pull", false, Expect::Stamp(stamp))
+                .expect("an unchanged file should be replaced");
+            assert_eq!(fs::read_to_string(&path).expect("file should read"), "pull");
+            let leftovers = fs::read_dir(&root)
+                .expect("root should list")
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .is_ok_and(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                })
+                .count();
+            assert_eq!(leftovers, 0, "a refused write leaves no temporary file");
+        }
+    }
+
+    /// A dangling symlink is something there: a write that expects nothing
+    /// refuses rather than replace it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_not_absent() {
+        for confined in [false, true] {
+            let directory = tempfile::tempdir().expect("temp directory should create");
+            let root = directory
+                .path()
+                .canonicalize()
+                .expect("root should resolve");
+            let path = root.join("note.md");
+            std::os::unix::fs::symlink(root.join("missing.md"), &path)
+                .expect("symlink should create");
+            let files = LocalFiles::new(root.join("state"), confined.then(|| root.clone()));
+            assert!(matches!(
+                files.write_atomic(&path, b"pull", false, Expect::Absent),
+                Err(LocalAccessError::Changed { .. })
+            ));
+            assert!(fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()));
+        }
     }
 
     #[test]
@@ -1028,10 +1216,16 @@ mod tests {
 
         let files = LocalFiles::new(directory.path().join("state"), Some(root));
         for _ in 0..500 {
-            if let Ok(contents) = files.read_capped(&link.join("note.md"), 64) {
+            if let Ok(contents) = files
+                .read_stamped(&link.join("note.md"), 64)
+                .map(|(bytes, _)| bytes)
+            {
                 assert_eq!(contents, b"inside");
             }
-            let _ = files.write_atomic(&link.join("written.md"), b"confined", false);
+            let written = link.join("written.md");
+            let current = files.stamp(&written).ok().flatten();
+            let expect = current.map_or(Expect::Absent, Expect::Stamp);
+            let _ = files.write_atomic(&written, b"confined", false, expect);
         }
         stop.store(true, Ordering::Relaxed);
         worker.join().expect("symlink swapper should stop");
@@ -1066,7 +1260,7 @@ mod tests {
                 .allow(&path)
                 .expect("either spelling is inside the root");
             files
-                .write_atomic(&path, b"body", false)
+                .write_atomic(&path, b"body", false, Expect::Absent)
                 .expect("either spelling writes through the pinned root");
         }
         assert_eq!(
@@ -1091,7 +1285,7 @@ mod tests {
             Err(LocalAccessError::ReplacedRoot { .. })
         ));
         assert!(matches!(
-            files.write_atomic(&root.join("note.md"), b"body", false),
+            files.write_atomic(&root.join("note.md"), b"body", false, Expect::Absent),
             Err(LocalAccessError::ReplacedRoot { .. })
         ));
     }
