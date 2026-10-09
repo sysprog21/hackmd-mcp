@@ -4,6 +4,7 @@ use thiserror::Error;
 use crate::{
     client::{HackmdClient, HackmdError},
     models::Workspace,
+    note::body::into_stored,
     note::patch::PatchError,
     note::reference::{NoteRefError, NoteResolution},
 };
@@ -110,7 +111,9 @@ pub(crate) async fn edit_note(
     let patch_path = crate::note::patch::patch_path(&note.workspace, &note.note_id);
     // Matching hunks against a large body is CPU work, kept off the runtime.
     let (updated, changed) = crate::local::offload(|| {
-        let updated = crate::note::patch::apply_note_patch(&content, &input.patch, &patch_path)?;
+        // An added line may carry a lone `\r`; HackMD would store it as `\n`.
+        let updated = crate::note::patch::apply_note_patch(&content, &input.patch, &patch_path)
+            .map(into_stored)?;
         let changed = updated != content;
         Ok::<_, PatchError>((updated, changed))
     })?;
@@ -174,6 +177,35 @@ mod tests {
             edit_note(&client, input).await,
             Err(EditNoteError::Api(HackmdError::ReadbackMismatch { .. }))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_patched_lone_cr_is_written_as_lf() {
+        // `str::lines` keeps a `\r` inside a line; HackMD would store `\n`, so
+        // the body as patched could never be confirmed.
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Title","content":"old\n"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, "")
+                .expect_body("LF line endings", |body| body == r#"{"content":"a\nb\n"}"#),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Title","content":"a\nb\n"}"#,
+            ),
+        ]);
+        let patch =
+            "*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-old\n+a\rb\n*** End Patch";
+        edit_note(&server.client(), input(patch))
+            .await
+            .expect("edit should be confirmed")
+            .expect("direct reference should resolve");
+        server.finish();
     }
 
     #[tokio::test]

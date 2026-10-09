@@ -179,7 +179,12 @@ fn bounded_body(body: &[u8], token: &str) -> String {
     // so a token that begins within them is still found and replaced.
     let cut = body.len().min(MAX_CHARS * 4 + token.len());
     let truncated = cut < body.len();
-    let mut text = String::from_utf8_lossy(&body[..cut]).replace(token, "[REDACTED]");
+    let text = String::from_utf8_lossy(&body[..cut]);
+    let mut text = if token.is_empty() {
+        text.into_owned()
+    } else {
+        text.replace(token, "[REDACTED]")
+    };
 
     // Each replacement shortens the text, which can pull a token split by the
     // cut into the characters shown. Whatever prefix of it the cut left at the
@@ -596,6 +601,19 @@ mod tests {
         );
         assert!(conflict("/v1/teams/t/folders/f").ends_with("folder name taken"));
         assert!(conflict("/v1/teams/notes/folders/f").ends_with("folder name taken"));
+    }
+
+    #[test]
+    fn error_details_without_a_token_are_preserved_and_bounded() {
+        assert_eq!(
+            super::bounded_body(b"upstream failure", ""),
+            "upstream failure"
+        );
+        assert_eq!(super::bounded_body(b"", ""), "");
+        assert_eq!(
+            super::bounded_body("é".repeat(301).as_bytes(), ""),
+            format!("{}…", "é".repeat(300))
+        );
     }
 
     #[test]

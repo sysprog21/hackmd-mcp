@@ -187,20 +187,6 @@ impl ListOutput {
     }
 }
 
-pub(crate) async fn list_notes(
-    client: &HackmdClient,
-    files: &LocalFiles,
-    input: ListNotesInput,
-) -> Result<ListOutput, ListNotesError> {
-    let source = match input.source {
-        NoteSource::Workspace => RemoteSource::Workspace,
-        NoteSource::History => RemoteSource::History,
-        NoteSource::Trash => RemoteSource::Trash,
-        NoteSource::Tracked => return list_tracked(files, &input).map(ListOutput::Tracked),
-    };
-    Ok(ListOutput::Notes(list_remote(client, source, input).await?))
-}
-
 fn list_tracked(
     files: &LocalFiles,
     input: &ListNotesInput,
@@ -223,20 +209,14 @@ fn list_tracked(
     )?)
 }
 
-/// The sources `HackMD` itself lists.
-#[derive(Debug, Clone, Copy)]
-enum RemoteSource {
-    Workspace,
-    History,
-    Trash,
-}
-
-async fn list_remote(
+pub(crate) async fn list_notes(
     client: &HackmdClient,
-    source: RemoteSource,
+    files: &LocalFiles,
     input: ListNotesInput,
-) -> Result<ListNotesOutput, ListNotesError> {
-    validate_limit(input.limit)?;
+) -> Result<ListOutput, ListNotesError> {
+    if !matches!(input.source, NoteSource::Tracked) {
+        validate_limit(input.limit)?;
+    }
     // History and trash are account-wide and never cached.
     let account_wide = |name| {
         if input.workspace != Workspace::Personal {
@@ -250,19 +230,20 @@ async fn list_remote(
 
     // Only a workspace list has a default order; history and trash keep the
     // order `HackMD` returns unless a sort is asked for.
-    let sort = match source {
-        RemoteSource::Workspace => Some(input.sort.unwrap_or(NoteSort::LastChangedDesc)),
-        RemoteSource::History | RemoteSource::Trash => input.sort,
+    let sort = if matches!(input.source, NoteSource::Workspace) {
+        Some(input.sort.unwrap_or(NoteSort::LastChangedDesc))
+    } else {
+        input.sort
     };
     let site = client.site_url();
-    match source {
-        RemoteSource::Workspace => {
+    match input.source {
+        NoteSource::Workspace => {
             let notes = client.list_notes(&input.workspace, input.refresh).await?;
             Ok(filter_sort_page(site, &notes, &input, sort, |_| {
                 input.workspace.clone()
             }))
         }
-        RemoteSource::History => {
+        NoteSource::History => {
             account_wide("history")?;
             let notes = client.get_history().await?;
             Ok(filter_sort_page(site, &notes, &input, sort, |note| {
@@ -273,7 +254,8 @@ async fn list_remote(
                     })
             }))
         }
-        RemoteSource::Trash => {
+        NoteSource::Tracked => return list_tracked(files, &input).map(ListOutput::Tracked),
+        NoteSource::Trash => {
             account_wide("trash")?;
             let notes = client.list_trash().await?;
             // A trashed note's link answers 404, so it gets none.
@@ -282,6 +264,7 @@ async fn list_remote(
             }))
         }
     }
+    .map(ListOutput::Notes)
 }
 
 /// Filters, optionally sorts, and pages `notes`. `sort` is the resolved order,

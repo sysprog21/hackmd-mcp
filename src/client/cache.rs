@@ -246,11 +246,11 @@ impl NotesCache {
         workspace: &Workspace,
         notes: &Arc<[NoteResponse]>,
     ) {
-        let size_bytes = cached_note_bytes(workspace, notes);
         evict(state, workspace, "replacement");
         if self.ttl.is_zero() {
             return;
         }
+        let size_bytes = cached_note_bytes(workspace, notes);
         if self.max_entries == 0 || size_bytes > self.max_bytes {
             tracing::debug!(
                 cache_event = "skip",

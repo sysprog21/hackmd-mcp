@@ -70,9 +70,18 @@ folder) still sends the body: HackMD is believed to blank a body the PATCH
 omits, so the server reads the current one and sends it back. That moves the
 whole body twice more than a metadata change used to: one download before the
 write and one upload with it. An edit landing between that read and the write
-is reverted; `expected_hash` works here too and catches any made before it. A
-title rarely shows through, because a YAML `title:` in the body wins, then a
-leading H1, and only then the `title` field. A folder move is not waited on:
+is reverted; `expected_hash` works here too and catches any made before it. The
+`title` field always takes effect. The body sets a title only when a note is
+created without one (a front-matter `title:`, then the first H1, then
+"Untitled"), and later body edits never change it, so `hackmd_pull_note` and
+`hackmd_push_note` report `title_drift` when the body's own title no longer
+matches the listed one. They report it only when they can read that title for
+certain (plain front matter, or an H1 that is the body's first line of text),
+and push only on a push or a no-op, so a missing `title_drift` does not mean the
+titles match. Bodies are stored with `\n` line endings: `\r\n` and a
+lone `\r` read back as `\n`, so every body you supply, and every local file read
+for sync, is converted before it is written or hashed; a body the server reads
+back and resends goes as it was read. A folder move is not waited on:
 the result's `folder_placement_confirmed` says whether the read-back already
 shows the note there (`null` when no folder was asked for).
 
@@ -100,6 +109,9 @@ repository can work with:
 1. `hackmd_pull_note` writes the note to an absolute `.md` path and records a
    baseline: the exact body as it was at pull time. It returns that body's
    `body_hash`, in the same form `hackmd_get_note` and a successful push report.
+   When it replaced a file it could read, `changes` is a bounded diff of what
+   the pull changed in it; `title_drift` names the title the body gives when
+   the listed one differs (see above).
 2. You or the agent edit the file locally.
 3. `hackmd_get_note` with `local_path` reports where things stand by comparing
    the file, the baseline, and the remote note:

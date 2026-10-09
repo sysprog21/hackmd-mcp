@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::{
     client::{HackmdClient, HackmdError},
     hash::{body_digest, body_hash, body_hash_from_digest},
-    local::{LocalAccessError, LocalFiles},
+    local::{Expect, LocalAccessError, LocalFiles},
     models::Workspace,
     note::reference::{NoteRefError, NoteResolution},
     sync::state::{StateError, TrackedNoteState, timestamp_text},
@@ -112,6 +112,12 @@ pub(crate) struct PushNoteOutput {
     pub(crate) snapshot_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) instructions: Option<String>,
+    /// The title the body itself gives (front-matter `title:`, or an H1 that
+    /// is its first line of text) when it differs from the note's listed
+    /// title. `HackMD` never renames a note after its body changes; pass this
+    /// as `title` to `hackmd_update_note` if the listing should follow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) title_drift: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -234,6 +240,7 @@ pub(crate) async fn push_note(
         note,
         Remote {
             body: remote,
+            title: remote_note.title,
             last_changed_at: remote_note.last_changed_at,
         },
         local,
@@ -244,6 +251,7 @@ pub(crate) async fn push_note(
 /// The remote body a push is judged against, and when it last changed.
 struct Remote {
     body: String,
+    title: String,
     last_changed_at: Option<i64>,
 }
 
@@ -283,8 +291,14 @@ async fn push_resolved(
 ) -> Result<Result<PushNoteOutput, NoteResolution>, PushNoteError> {
     let Remote {
         body: remote,
+        title,
         last_changed_at: remote_timestamp,
     } = remote;
+
+    // Reported only where the remote ends up holding the local body, so it is
+    // worked out only there.
+    let drift =
+        |title: &str| crate::local::offload(|| crate::note::body::title_drift(title, &local));
 
     // Every result reports the tracked canonical path, not the caller's
     // spelling of it, and the conflict snapshot is written beside that path.
@@ -315,6 +329,7 @@ async fn push_resolved(
                     PushStatus::NothingToPush,
                     tracked.state.baseline_body_hash.clone(),
                     remote_timestamp,
+                    drift(&title),
                 )));
             }
 
@@ -362,13 +377,14 @@ async fn push_resolved(
     drop(remote);
     drop(tracked.baseline_body);
 
-    let (status, timestamp) = if write {
+    let (status, timestamp, title) = if write {
         let written = client
             .write_note_body(&note.workspace, &note.note_id, &local)
             .await?;
-        (PushStatus::Pushed, written.last_changed_at)
+        // The read-back's title, which a rename made meanwhile has changed.
+        (PushStatus::Pushed, written.last_changed_at, written.title)
     } else {
-        (PushStatus::NothingToPush, remote_timestamp)
+        (PushStatus::NothingToPush, remote_timestamp, title)
     };
     // Written or not, the baseline moves to the body both sides now hold.
     let hash =
@@ -382,7 +398,7 @@ async fn push_resolved(
                 source.into()
             }
         })?;
-    Ok(Ok(synced(&target, status, hash, timestamp)))
+    Ok(Ok(synced(&target, status, hash, timestamp, drift(&title))))
 }
 
 /// What a push may overwrite: the strategy, and for a safe push the remote
@@ -416,6 +432,7 @@ fn output(target: &Target<'_>, status: PushStatus) -> PushNoteOutput {
         snapshot_path: None,
         snapshot_error: None,
         instructions: None,
+        title_drift: None,
     }
 }
 
@@ -427,10 +444,12 @@ fn synced(
     status: PushStatus,
     body_hash: String,
     remote_timestamp: Option<i64>,
+    title_drift: Option<String>,
 ) -> PushNoteOutput {
     PushNoteOutput {
         body_hash: Some(body_hash),
         remote_timestamp: Some(timestamp_text(remote_timestamp)),
+        title_drift,
         ..output(target, status)
     }
 }
@@ -451,16 +470,26 @@ fn write_snapshot(
 ) -> Result<PathBuf, PushNoteError> {
     let snapshot_path = state.local_path.with_extension("remote.md");
     files.allow_write(&snapshot_path)?;
-    if files.entry(&snapshot_path)?.is_some() {
-        let existing = files.read_capped(&snapshot_path, BODY_MAX_BYTES + 1)?;
-        let ours = crate::local::offload(|| std::str::from_utf8(&existing).ok().map(body_hash));
+    // Replaced only while it is still the snapshot read here, or still absent.
+    let expect = if files.entry(&snapshot_path)?.is_some() {
+        let (existing, stamp) = files.read_stamped(&snapshot_path, BODY_MAX_BYTES + 1)?;
+
+        // Compared in stored form, so an editor that only rewrote its line
+        // endings has not made it someone else's file. Reject a capped prefix
+        // first: normalization must not hide unread merge edits.
+        let ours = crate::local::offload(|| {
+            crate::sync::stored_text(existing).map(|text| body_hash(&text))
+        });
         if ours.is_none() || ours != state.remote_snapshot_hash {
             return Err(PushNoteError::SnapshotNotOurs {
                 path: snapshot_path,
             });
         }
-    }
-    files.write_atomic(&snapshot_path, remote.as_bytes(), false)?;
+        Expect::Stamp(stamp)
+    } else {
+        Expect::Absent
+    };
+    files.write_atomic(&snapshot_path, remote.as_bytes(), false, expect)?;
     state.remote_snapshot_hash = Some(remote_hash.to_owned());
 
     // A snapshot whose hash never reached the record would read as someone
@@ -477,9 +506,26 @@ fn conflict_diff(baseline: &str, local: &str, remote: &str) -> String {
     let baseline = bounded_diff_input(baseline);
     let local = bounded_diff_input(local);
     let remote = bounded_diff_input(remote);
-    let local_diff = bounded_unified_diff(&baseline, &local, "local", DIFF_BYTES);
-    let remote_diff = bounded_unified_diff(&baseline, &remote, "remote", DIFF_BYTES);
+    let local_diff = bounded_unified_diff(&baseline, &local, ("baseline", "local"), DIFF_BYTES);
+    let remote_diff = bounded_unified_diff(&baseline, &remote, ("baseline", "remote"), DIFF_BYTES);
     format!("LOCAL CHANGES\n{local_diff}\nREMOTE CHANGES\n{remote_diff}")
+}
+
+/// A bounded unified diff from `before` to `after`, for a pull to report what
+/// it changed in the file it replaced.
+pub(super) fn change_diff(before: &str, after: &str) -> String {
+    const DIFF_BYTES: usize = 3_800;
+    let diff = bounded_unified_diff(
+        &bounded_diff_input(before),
+        &bounded_diff_input(after),
+        ("local", "remote"),
+        DIFF_BYTES,
+    );
+    if diff.is_empty() {
+        // Both ends match, so every change lies in the part left out.
+        return "[changes lie in the middle of a large body, outside the ends compared]".to_owned();
+    }
+    diff
 }
 
 fn bounded_diff_input(value: &str) -> Cow<'_, str> {
@@ -507,13 +553,18 @@ fn bounded_diff_input(value: &str) -> Cow<'_, str> {
     ))
 }
 
-fn bounded_unified_diff(baseline: &str, changed: &str, label: &str, limit: usize) -> String {
+fn bounded_unified_diff(
+    baseline: &str,
+    changed: &str,
+    (from, to): (&str, &str),
+    limit: usize,
+) -> String {
     let diff = TextDiff::from_lines(baseline, changed);
     let mut writer = BoundedWriter::new(limit);
     let _ = diff
         .unified_diff()
         .context_radius(2)
-        .header("baseline", label)
+        .header(from, to)
         .to_writer(&mut writer);
     writer.finish()
 }
@@ -681,6 +732,7 @@ mod tests {
             },
             super::Remote {
                 body: "baseline".to_owned(),
+                title: "Note".to_owned(),
                 last_changed_at: None,
             },
             "local edit".to_owned(),
@@ -727,6 +779,7 @@ mod tests {
             },
             super::Remote {
                 body: "baseline".to_owned(),
+                title: "Note".to_owned(),
                 last_changed_at: None,
             },
             "local edit".to_owned(),
@@ -743,6 +796,101 @@ mod tests {
             "baseline"
         );
         fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn a_crlf_file_is_pushed_in_the_form_hackmd_stores() {
+        // HackMD reads `\r\n` back as `\n` (measured 2026-10-08), so sending
+        // the file's own bytes could never be confirmed by the read-back.
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "# Renamed\r\n\r\nedit\r\n").expect("local fixture should write");
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"baseline"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, "")
+                .expect_body("LF line endings", |body| {
+                    body == r##"{"content":"# Renamed\n\nedit\n"}"##
+                }),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r##"{"id":"note-id","title":"Note","content":"# Renamed\n\nedit\n"}"##,
+            ),
+        ]);
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        let output = push_note(
+            &fixture.client(),
+            &files,
+            input(&local_path, PushStrategy::Safe, false),
+        )
+        .await
+        .expect("push should succeed")
+        .expect("direct note should resolve");
+        fixture.finish();
+        assert_eq!(output.status, PushStatus::Pushed);
+        // The listing keeps "Note"; HackMD never renames a note for its H1.
+        assert_eq!(output.title_drift.as_deref(), Some("Renamed"));
+
+        // The CRLF file now matches its baseline: a second push writes nothing.
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/note-id",
+            200,
+            r##"{"id":"note-id","title":"Renamed","content":"# Renamed\n\nedit\n"}"##,
+        )]);
+        let output = push_note(
+            &fixture.client(),
+            &files,
+            input(&local_path, PushStrategy::Safe, false),
+        )
+        .await
+        .expect("push should succeed")
+        .expect("direct note should resolve");
+        fixture.finish();
+        assert_eq!(output.status, PushStatus::NothingToPush);
+        assert_eq!(output.title_drift, None);
+    }
+
+    #[tokio::test]
+    async fn drift_follows_a_rename_made_during_the_push() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "# Renamed\n").expect("local fixture should write");
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Old","content":"baseline"}"#,
+            ),
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r##"{"id":"note-id","title":"Renamed","content":"# Renamed\n"}"##,
+            ),
+        ]);
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        let output = push_note(
+            &fixture.client(),
+            &files,
+            input(&local_path, PushStrategy::Safe, false),
+        )
+        .await
+        .expect("push should succeed")
+        .expect("direct note should resolve");
+        fixture.finish();
+        assert_eq!(output.status, PushStatus::Pushed);
+        assert_eq!(output.title_drift, None, "the read-back already shows it");
     }
 
     #[tokio::test]
@@ -795,6 +943,99 @@ mod tests {
             .expect("advanced state should load");
         assert_eq!(loaded.baseline_body, "local edit");
         assert_eq!(loaded.state.last_observed_remote_timestamp, "2");
+    }
+
+    #[test]
+    fn an_oversized_snapshot_preserves_unread_merge_edits() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "local").expect("local fixture should write");
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        let mut state = files
+            .state()
+            .load_for_local_path(&local_path)
+            .expect("tracked state should load")
+            .state;
+        let snapshot = state.local_path.with_extension("remote.md");
+
+        // The capped read ends exactly at a CRLF boundary. Normalizing that
+        // prefix matches the recorded hash but hides the unread merge edits.
+        let lines = (super::BODY_MAX_BYTES + 1) / 3;
+        assert_eq!(lines * 3, super::BODY_MAX_BYTES + 1);
+        state.remote_snapshot_hash = Some(crate::hash::body_hash(&"a\n".repeat(lines)));
+        let existing = format!("{}merge edits\n", "a\r\n".repeat(lines));
+        fs::write(&snapshot, &existing).expect("snapshot should write");
+        let result = super::write_snapshot(
+            &files,
+            state,
+            "new remote",
+            &crate::hash::body_hash("new remote"),
+        );
+        assert!(
+            matches!(result, Err(PushNoteError::SnapshotNotOurs { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(snapshot).expect("snapshot should read"),
+            existing
+        );
+    }
+
+    /// A snapshot an editor only resaved with CRLF line endings is still the
+    /// one this tool wrote, so the next conflict may replace it.
+    #[tokio::test]
+    async fn a_snapshot_resaved_with_crlf_is_still_ours() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory
+            .path()
+            .canonicalize()
+            .expect("temp directory should resolve")
+            .join("note.md");
+        let snapshot = local_path.with_extension("remote.md");
+        fs::write(&local_path, "local edit").expect("local fixture should write");
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"remote\nedit\n"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"Note","content":"newer remote"}"#,
+            ),
+        ]);
+        let client = fixture.client();
+        let files =
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+        let push = || {
+            push_note(
+                &client,
+                &files,
+                input(&local_path, PushStrategy::Safe, false),
+            )
+        };
+
+        let output = push()
+            .await
+            .expect("comparison should succeed")
+            .expect("direct note should resolve");
+        assert_eq!(output.snapshot_path.as_deref(), Some(snapshot.as_path()));
+        fs::write(&snapshot, "remote\r\nedit\r\n").expect("snapshot should resave");
+
+        let output = push()
+            .await
+            .expect("comparison should succeed")
+            .expect("direct note should resolve");
+        assert_eq!(output.snapshot_error, None);
+        assert_eq!(
+            fs::read_to_string(&snapshot).expect("snapshot should read"),
+            "newer remote"
+        );
+        fixture.finish();
     }
 
     #[tokio::test]
@@ -1052,6 +1293,13 @@ mod tests {
             "same edit"
         );
         fixture.finish();
+    }
+
+    #[test]
+    fn a_change_outside_the_compared_ends_is_still_reported() {
+        let before = format!("{}middle-a{}", "x".repeat(20_000), "y".repeat(20_000));
+        let after = format!("{}middle-b{}", "x".repeat(20_000), "y".repeat(20_000));
+        assert!(super::change_diff(&before, &after).contains("middle of a large body"));
     }
 
     #[test]

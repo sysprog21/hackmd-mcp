@@ -7,6 +7,7 @@ pub(crate) mod push;
 pub(crate) mod state;
 pub(crate) mod tracking;
 
+use crate::note::body::into_stored;
 use std::{io::Read, path::Path};
 
 use thiserror::Error;
@@ -117,8 +118,25 @@ pub(crate) fn read_local_body(
             .read_to_end(&mut bytes)
             .map_err(LocalAccessError::Io)?;
         check_body_size("local file", bytes.len(), confirmed)?;
-        String::from_utf8(bytes).map_err(|_| LocalBodyError::NotUtf8)
+
+        // Compared and hashed in the form HackMD keeps, so a file saved with
+        // CRLF line endings neither fails its read-back nor looks changed
+        // again.
+        String::from_utf8(bytes)
+            .map(into_stored)
+            .map_err(|_| LocalBodyError::NotUtf8)
     })
+}
+
+/// A local file's bytes, read capped one byte past the maximum, as text in
+/// the form `HackMD` keeps; none when they are not text. A file past the cap
+/// was read only in part, so it has no text and never counts as equal to
+/// anything: shrinking its CRLF prefix must not let the unread rest be lost.
+pub(crate) fn stored_text(bytes: Vec<u8>) -> Option<String> {
+    if bytes.len() > BODY_MAX_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok().map(into_stored)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
