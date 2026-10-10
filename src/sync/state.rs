@@ -656,7 +656,7 @@ fn valid_state_key(key: &str) -> bool {
 fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<(), StateError> {
     let parent = path.parent().ok_or(StateError::InvalidStatePath)?;
     create_private_dir_all(parent)?;
-    crate::local::replace_atomic(path, contents, set_private_permissions)?;
+    crate::local::replace_atomic(path, contents, true, set_private_permissions)?;
     Ok(())
 }
 
