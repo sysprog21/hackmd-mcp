@@ -10,13 +10,14 @@ pub(crate) fn into_stored(body: String) -> String {
     if !body.contains('\r') {
         return body;
     }
-    // A lone `\r` (old Mac files) is rare, so it alone costs a second copy.
-    let body = body.replace("\r\n", "\n");
-    if body.contains('\r') {
-        body.replace('\r', "\n")
-    } else {
-        body
+    let mut normalized = String::with_capacity(body.len());
+    let mut parts = body.split('\r');
+    normalized.push_str(parts.next().unwrap_or_default());
+    for part in parts {
+        normalized.push('\n');
+        normalized.push_str(part.strip_prefix('\n').unwrap_or(part));
     }
+    normalized
 }
 
 /// The title `body` implies when it differs from the note's listed `title`.
@@ -373,6 +374,10 @@ mod tests {
     fn line_endings_take_the_stored_form() {
         assert_eq!(into_stored("a\r\nb\rc\n".to_owned()), "a\nb\nc\n");
         assert_eq!(into_stored("\u{feff}x\n\n".to_owned()), "\u{feff}x\n\n");
+        for body in ["", "\r", "\r\n", "\r\r\n", "\n\r", "台\r\n灣\r\r末\r"] {
+            let expected = body.replace("\r\n", "\n").replace('\r', "\n");
+            assert_eq!(into_stored(body.to_owned()), expected);
+        }
     }
 
     /// A heading or front matter past its cap is never compared or looked
