@@ -273,12 +273,13 @@ async fn personal_crud_folder_order_trash_and_restore() {
         fixtures.child_folder = Some(child_id.clone());
 
         let content = format!("# Codex live {suffix}\n\ninitial\n");
+        let created_title = format!("codex-live-{suffix}");
         let created = api
             .json(
                 Method::POST,
                 &["notes"],
                 Some(&json!({
-                    "title": format!("codex-live-{suffix}"),
+                    "title": created_title,
                     "content": content,
                     "parentFolderId": child_id
                 })),
@@ -328,6 +329,38 @@ async fn personal_crud_folder_order_trash_and_restore() {
         .await;
         let unchanged = api.json(Method::GET, &["notes", &note_id], None).await;
         assert_eq!(unchanged["content"], edited);
+
+        // The title read-back and title_drift ignore runs of whitespace, since
+        // whether HackMD collapses them is unmeasured. The body is sent too, as
+        // the server always does. A refusal is an answer too, so it is printed
+        // rather than asserted, and the rest of the test still runs.
+        let spaced = format!("codex  live\t{suffix}");
+        let patched = api
+            .request(
+                Method::PATCH,
+                &["notes", &note_id],
+                Some(&json!({"title": spaced, "content": edited})),
+            )
+            .await
+            .status;
+        let shown = if patched.is_success() {
+            api.poll_json(&["notes", &note_id], |read| {
+                read["title"] != created_title.as_str()
+            })
+            .await
+        } else {
+            None
+        };
+        let verdict = match shown.as_ref().and_then(|read| read["title"].as_str()) {
+            None if !patched.is_success() => format!("is refused ({patched})"),
+            None => "is inconclusive, the new title never showed".to_owned(),
+            Some(title) if title == spaced => "keeps whitespace runs".to_owned(),
+            Some(title) if title.split_whitespace().eq(spaced.split_whitespace()) => {
+                format!("collapses whitespace runs (read {title:?})")
+            }
+            Some(title) => format!("changes the title otherwise (read {title:?})"),
+        };
+        eprintln!("measured (personal): a title with repeated spaces and a tab {verdict}");
 
         probe_partial_note_patch(&api, &["notes", &note_id], &edited, "personal", suffix).await;
 
