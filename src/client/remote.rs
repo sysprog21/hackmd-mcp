@@ -246,10 +246,10 @@ async fn resolve(
 /// entry passed the same check.
 ///
 /// A pin is needed only until its connection is made, so past
-/// [`Pinned::MAX_HOSTS`] the others are dropped rather than kept for the life
-/// of the server. A concurrent fetch whose pin was dropped before it
-/// connected fails to connect, never connects unchecked; pooled connections
-/// are unaffected.
+/// [`Pinned::MAX_HOSTS`] one other is dropped for each new host rather than
+/// all kept for the life of the server. A concurrent fetch whose pin was
+/// dropped before it connected fails to connect, never connects unchecked;
+/// pooled connections are unaffected.
 #[derive(Debug, Default)]
 struct Pinned(Mutex<HashMap<String, Vec<SocketAddr>>>);
 
@@ -258,8 +258,11 @@ impl Pinned {
 
     fn set(&self, host: String, addrs: Vec<SocketAddr>) {
         if let Ok(mut pins) = self.0.lock() {
-            if pins.len() >= Self::MAX_HOSTS && !pins.contains_key(&host) {
-                pins.clear();
+            if pins.len() >= Self::MAX_HOSTS
+                && !pins.contains_key(&host)
+                && let Some(other) = pins.keys().next().cloned()
+            {
+                pins.remove(&other);
             }
             pins.insert(host, addrs);
         }
@@ -325,21 +328,49 @@ impl ImageUrl {
 /// A fetched image whose headers have arrived and whose body is unread.
 pub(crate) struct RemoteImage {
     response: reqwest::Response,
+    /// The length the headers declared, kept as it was: reading the body
+    /// changes what the response reports.
+    declared: Option<u64>,
     stall: Duration,
+    /// The start of the body, read by [`RemoteImage::head`].
+    head: Vec<u8>,
 }
 
 impl RemoteImage {
     pub(crate) fn declared_len(&self) -> Option<u64> {
-        self.response.content_length()
+        self.declared
+    }
+
+    /// The first `len` bytes of the body, or all of it if shorter, so its
+    /// type can be checked before the rest is downloaded. [`RemoteImage::read`]
+    /// still returns the whole body. A host that takes longer than one stall
+    /// to send them is timed out.
+    pub(crate) async fn head(&mut self, len: usize) -> Result<&[u8], RemoteImageError> {
+        let until = Instant::now() + self.stall;
+        while self.head.len() < len {
+            let next = tokio::time::timeout_at(until, self.response.chunk())
+                .await
+                .map_err(|_| RemoteImageError::TimedOut)?;
+            match next.map_err(|_| RemoteImageError::ConnectionFailed)? {
+                Some(chunk) => self.head.extend_from_slice(&chunk),
+                None => break,
+            }
+        }
+        Ok(&self.head[..self.head.len().min(len)])
     }
 
     /// Reads the body, refusing more than `limit` bytes. A stall ends the
     /// read; a slow but steady transfer does not, down to the slowest rate the
     /// client accepts anywhere.
     pub(crate) async fn read(self, limit: u64) -> Result<Vec<u8>, RemoteImageError> {
+        // Checked here against the whole declared length, since the bytes
+        // `head` read are already part of it.
+        if self.declared.is_some_and(|declared| declared > limit) {
+            return Err(RemoteImageError::TooLarge);
+        }
         let cap = usize::try_from(limit).unwrap_or(usize::MAX);
         let ceiling = self.stall + transfer_allowance(cap);
-        let read = read_body_capped(self.response, cap, self.stall);
+        let read = read_body_capped(self.response, self.head, cap, self.stall);
         match tokio::time::timeout(ceiling, read).await {
             Ok(Ok(bytes)) => Ok(bytes),
             Ok(Err(BodyError::TooLarge)) => Err(RemoteImageError::TooLarge),
@@ -382,6 +413,11 @@ impl HackmdClient {
         let policy = self.image_policy();
         let fetcher = self.fetcher()?;
         let stall = self.config.request_timeout();
+
+        // One deadline from the first lookup to the image's headers, across
+        // every hop, so a chain of slow redirects costs no more than one slow
+        // response.
+        let until = Instant::now() + stall;
         let mut url = link.0.clone();
         for hop in 0..=MAX_REDIRECTS {
             if hop > 0 {
@@ -389,9 +425,17 @@ impl HackmdClient {
                     target: origin_of(&url),
                 })?;
             }
-            let (host, addrs) = resolve(&url, policy, self.config.connect_timeout()).await?;
+
+            // A lookup cut short by the chain's deadline is a timeout, not a
+            // host that does not resolve.
+            let (host, addrs) = tokio::time::timeout_at(
+                until,
+                resolve(&url, policy, self.config.connect_timeout()),
+            )
+            .await
+            .map_err(|_| RemoteImageError::TimedOut)??;
             fetcher.pinned.set(host.clone(), addrs);
-            let response = tokio::time::timeout(stall, fetcher.http.get(url.clone()).send())
+            let response = tokio::time::timeout_at(until, fetcher.http.get(url.clone()).send())
                 .await
                 .map_err(|_| RemoteImageError::TimedOut)?
                 .map_err(|error| transport(&error, &host))?;
@@ -416,7 +460,12 @@ impl HackmdClient {
                     status: status.as_u16(),
                 });
             }
-            return Ok(RemoteImage { response, stall });
+            return Ok(RemoteImage {
+                declared: response.content_length(),
+                response,
+                stall,
+                head: Vec::new(),
+            });
         }
         Err(RemoteImageError::TooManyRedirects)
     }
@@ -436,13 +485,15 @@ fn transport(error: &reqwest::Error, host: &str) -> RemoteImageError {
     }
 }
 
-/// Whether a certificate failure is anywhere in `error`'s chain. reqwest
+/// Whether a certificate failure is anywhere beneath `error`. reqwest
 /// reports one as a connect error and does not expose the TLS library's
 /// types, so the text is the only signal: rustls says "invalid peer
 /// certificate". Retrying would never fix it, unlike a refused connection.
+/// reqwest's own text names the URL, which may hold the same words, so the
+/// search starts below it.
 fn names_certificate(error: &(dyn std::error::Error + 'static)) -> bool {
-    std::iter::successors(Some(error), |error| error.source())
-        .any(|error| error.to_string().contains("certificate"))
+    std::iter::successors(error.source(), |error| error.source())
+        .any(|error| error.to_string().contains("invalid peer certificate"))
 }
 
 #[cfg(test)]
@@ -626,11 +677,14 @@ mod tests {
 
     #[test]
     fn a_certificate_failure_is_found_anywhere_in_the_chain() {
+        /// Worded as reqwest words it, URL included.
         #[derive(Debug)]
         struct Outer(std::io::Error);
         impl std::fmt::Display for Outer {
             fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("error sending request")
+                formatter.write_str(
+                    "error sending request for url (https://cdn.example/invalid peer certificate.png)",
+                )
             }
         }
         impl std::error::Error for Outer {
@@ -662,12 +716,12 @@ mod tests {
         assert_eq!(addrs, [addr]);
         assert!(pinned.resolve(name("other.example")).await.is_err());
 
-        // Past the bound, older hosts go and the newest stays.
+        // Past the bound, one host goes for each new one and the newest stays.
         for index in 0..Pinned::MAX_HOSTS {
             pinned.set(format!("host{index}.example"), vec![addr]);
         }
         let pins = pinned.0.lock().expect("pins lock");
-        assert!(pins.len() <= Pinned::MAX_HOSTS, "{}", pins.len());
+        assert_eq!(pins.len(), Pinned::MAX_HOSTS);
         assert!(pins.contains_key(&format!("host{}.example", Pinned::MAX_HOSTS - 1)));
     }
 
@@ -717,6 +771,71 @@ mod tests {
             assert!(!request.contains(FIXTURE_TOKEN), "{request}");
             assert!(request.contains("user-agent: hackmd-mcp/"), "{request}");
         }
+    }
+
+    /// Redirects share one deadline: two hops that each answer in time
+    /// still time out together.
+    #[tokio::test]
+    async fn redirects_share_one_deadline() {
+        let fixture = SequenceServer::spawn_scenarios([
+            redirect("/a.png", "/b.png").delay(Duration::from_millis(1000)),
+            image("/b.png").delay(Duration::from_millis(1000)),
+        ]);
+        let client = fixture.client_with_timeout(Duration::from_millis(1500));
+
+        // Each hop alone answers within the bound, so only a shared deadline
+        // times this chain out. The first hop leaves half a second to spare, so
+        // a slow runner still reaches the second, which `finish` checks.
+        let error = open(&client, &format!("{}/a.png", fixture.origin()))
+            .await
+            .err()
+            .expect("the chain should time out");
+        assert!(matches!(error, RemoteImageError::TimedOut), "{error:?}");
+        fixture.finish();
+    }
+
+    /// The bytes `head` read count toward the cap: a declared length that,
+    /// with them, is over it is refused before the rest is waited for.
+    #[tokio::test]
+    async fn a_declared_length_counts_the_bytes_already_read() {
+        let server = spawn_raw_body(
+            Some(16),
+            vec![
+                (Duration::ZERO, b"GIF89a1234".to_vec()),
+                (Duration::from_secs(3), b"567890".to_vec()),
+            ],
+        );
+        let mut opened = open(
+            &server.client(Duration::from_secs(5)),
+            &format!("{}/x", server.origin),
+        )
+        .await
+        .expect("the image opens");
+        opened.head(4).await.expect("the signature arrives");
+        let read = tokio::time::timeout(Duration::from_secs(1), opened.read(12)).await;
+        assert!(
+            matches!(read, Ok(Err(RemoteImageError::TooLarge))),
+            "refused without waiting for the rest"
+        );
+    }
+
+    /// The signature shares one deadline: a host that sends it a byte at a
+    /// time, each in time, still times out.
+    #[tokio::test]
+    async fn a_signature_sent_slowly_times_out() {
+        let chunks = b"GIF89a"
+            .iter()
+            .map(|byte| (Duration::from_millis(150), vec![*byte]))
+            .collect();
+        let server = spawn_raw_body(None, chunks);
+        let mut opened = open(
+            &server.client(Duration::from_millis(400)),
+            &format!("{}/x", server.origin),
+        )
+        .await
+        .expect("the image opens");
+        let error = opened.head(12).await.expect_err("the signature times out");
+        assert!(matches!(error, RemoteImageError::TimedOut), "{error:?}");
     }
 
     #[tokio::test]
@@ -839,12 +958,7 @@ mod tests {
     async fn a_host_that_never_answers_times_out() {
         let fixture =
             SequenceServer::spawn_scenarios([image("/x.png").delay(Duration::from_millis(150))]);
-        let client = HackmdClient::new(Config::for_loopback_test_with_timeout(
-            &fixture.api_url,
-            FIXTURE_TOKEN,
-            Duration::from_millis(50),
-        ))
-        .expect("client builds");
+        let client = fixture.client_with_timeout(Duration::from_millis(50));
         let error = open(&client, &format!("{}/x.png", fixture.origin()))
             .await
             .err()
