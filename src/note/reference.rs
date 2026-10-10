@@ -159,12 +159,16 @@ fn percent_decode(segment: &str) -> Result<String, NoteRefError> {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' {
-            let hex = bytes
-                .get(index + 1..index + 3)
-                .and_then(|hex| std::str::from_utf8(hex).ok())
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-                .ok_or(NoteRefError::InvalidUrl)?;
-            decoded.push(hex);
+            // Exactly two hex digits: `from_str_radix` would also take a sign.
+            let digit = |at: usize| {
+                bytes
+                    .get(at)
+                    .and_then(|&byte| char::from(byte).to_digit(16))
+            };
+            let (Some(high), Some(low)) = (digit(index + 1), digit(index + 2)) else {
+                return Err(NoteRefError::InvalidUrl);
+            };
+            decoded.push(u8::try_from(high * 16 + low).map_err(|_| NoteRefError::InvalidUrl)?);
             index += 3;
         } else {
             decoded.push(bytes[index]);
@@ -264,6 +268,8 @@ mod tests {
         for value in [
             "https://hackmd.io/@core/%E4%B8",
             "https://hackmd.io/@core/%zz",
+            "https://hackmd.io/@core/%+1",
+            "https://hackmd.io/@core/%+A",
         ] {
             assert!(parse_note_ref(value).is_err(), "accepted {value:?}");
         }
