@@ -303,10 +303,9 @@ fn unshown_metadata(sent: &UpdateNoteRequest<'_>, note: &NoteResponse) -> Vec<&'
     [
         (
             "title",
-            sent.title
-                .as_deref()
-                .map(str::trim)
-                .is_none_or(|title| title.is_empty() || note.title.trim() == title),
+            sent.title.as_deref().is_none_or(|title| {
+                title.trim().is_empty() || crate::note::body::same_title(&note.title, title)
+            }),
         ),
         (
             "tags",
@@ -1041,6 +1040,18 @@ mod tests {
             shows_metadata(&cleared, &read(json!({"id": "n", "title": "T"}))),
             "a cleared permalink may read back as null"
         );
+        let spaced = UpdateNoteRequest {
+            title: Some("A  B\t".to_owned()),
+            ..UpdateNoteRequest::new("body")
+        };
+        assert!(
+            shows_metadata(&spaced, &read(json!({"id": "n", "title": "A B"}))),
+            "a title may read back with its spaces collapsed"
+        );
+        assert!(!shows_metadata(
+            &spaced,
+            &read(json!({"id": "n", "title": "A C"}))
+        ));
         for stale in [
             json!({"id": "n", "title": "T", "tags": ["a"], "permalink": "my-note",
                    "readPermission": "guest", "writePermission": "owner"}),

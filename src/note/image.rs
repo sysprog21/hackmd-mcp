@@ -259,7 +259,7 @@ pub(crate) async fn upload_note_image(
             size_bytes,
         ),
         ImageSource::Remote(link) => {
-            let remote = client.open_image(&link).await?;
+            let mut remote = client.open_image(&link).await?;
 
             // A declared size is checked before the body is read, and with none
             // the read stops at the limit, so an image that needs
@@ -267,6 +267,10 @@ pub(crate) async fn upload_note_image(
             if let Some(declared) = remote.declared_len() {
                 check_size(ImageSize::Exact(declared), input.confirm_large_file)?;
             }
+
+            // Its type is checked on the first bytes, so a page that is not an
+            // image is refused before the rest of it is downloaded.
+            let mime = image_mime(remote.head(12).await?)?;
             let limit = size_limit(input.confirm_large_file);
             let bytes = match remote.read(limit).await {
                 Ok(bytes) => bytes,
@@ -278,7 +282,6 @@ pub(crate) async fn upload_note_image(
                 }
                 Err(error) => return Err(error.into()),
             };
-            let mime = image_mime(bytes.get(..12).unwrap_or(&bytes))?;
             let size_bytes = bytes.len() as u64;
             (
                 Cow::Owned(remote_file_name(link.url(), mime)),
@@ -683,13 +686,15 @@ mod tests {
     }
 
     /// With no declared size, an unconfirmed read stops at the threshold
-    /// rather than downloading up to the hard limit.
+    /// rather than downloading up to the hard limit. The signature arrives
+    /// split, and the bytes read to check it still count toward the limit.
     #[tokio::test]
     async fn an_undeclared_large_image_needs_confirmation_at_the_threshold() {
         let server = crate::fixture::spawn_raw_body(
             None,
             vec![
-                (std::time::Duration::ZERO, b"GIF89a".to_vec()),
+                (std::time::Duration::ZERO, b"GIF".to_vec()),
+                (std::time::Duration::ZERO, b"89a".to_vec()),
                 (
                     std::time::Duration::ZERO,
                     vec![b'x'; usize::try_from(IMAGE_WARNING_BYTES).expect("fits")],
@@ -705,6 +710,30 @@ mod tests {
                 error,
                 UploadNoteImageError::ConfirmationRequired { size } if size == ImageSize::Over(IMAGE_WARNING_BYTES)
             ),
+            "{error:?}"
+        );
+    }
+
+    /// A large page that is not an image is refused on its first bytes, not
+    /// read up to the size limit first.
+    #[tokio::test]
+    async fn a_large_page_is_refused_before_it_is_downloaded() {
+        let server = crate::fixture::spawn_raw_body(
+            None,
+            vec![
+                (std::time::Duration::ZERO, b"<html>".to_vec()),
+                (
+                    std::time::Duration::ZERO,
+                    vec![b'x'; usize::try_from(IMAGE_WARNING_BYTES).expect("fits")],
+                ),
+            ],
+        );
+        let client = server.client(std::time::Duration::from_secs(5));
+        let error = upload_url(&client, format!("{}/x.gif", server.origin), false)
+            .await
+            .expect_err("HTML is not an image");
+        assert!(
+            matches!(error, UploadNoteImageError::UnsupportedFormat),
             "{error:?}"
         );
     }

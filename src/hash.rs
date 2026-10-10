@@ -3,8 +3,6 @@
 //! `expected_hash`, and recorded in sync state. It is part of the tool
 //! contract, so it lives on its own rather than inside either user.
 
-use std::fmt::Write as _;
-
 use sha2::{Digest, Sha256};
 
 /// The single hash format written to sidecars and reported by the sync tools.
@@ -38,8 +36,10 @@ pub(crate) fn body_hash_from_digest(digest: &[u8; 32]) -> String {
 }
 
 pub(crate) fn push_hex(out: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in bytes {
-        write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
 }
 
@@ -49,6 +49,28 @@ pub(crate) fn body_digest(body: &str) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hex_encoding_appends_every_byte_as_two_lowercase_digits() {
+        let prefix = "prefix:";
+        let mut encoded = String::from(prefix);
+        let bytes = (0..=u8::MAX).collect::<Vec<_>>();
+        super::push_hex(&mut encoded, &bytes);
+        assert!(encoded.starts_with(prefix));
+        assert_eq!(encoded.len(), prefix.len() + 256 * 2);
+        for (hex, byte) in encoded.as_bytes()[prefix.len()..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(bytes)
+        {
+            assert_eq!(hex, format!("{byte:02x}").as_bytes());
+        }
+        assert_eq!(
+            super::body_hash(""),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
     #[test]
     fn only_the_format_body_hash_writes_is_a_body_hash() {
         assert!(super::is_body_hash(&super::body_hash("any body")));

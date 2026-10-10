@@ -85,6 +85,11 @@ impl From<TrackedNoteState> for StoredState {
 }
 
 impl TrackedNoteState {
+    /// Whether this records the note `internal_id` in `workspace`.
+    pub(crate) fn is_note(&self, workspace: &Workspace, internal_id: &str) -> bool {
+        self.workspace == *workspace && self.internal_id == internal_id
+    }
+
     /// Records the note as tracked at the moment `baseline_body` is what both
     /// `local_path` and `HackMD` hold. Every sync tool goes through here so the
     /// stored hash and file identity can never disagree with the baseline.
@@ -259,10 +264,8 @@ impl StateStore {
             let key = state_key(&state.workspace, &state.internal_id);
             let paths = self.paths_for_key(&key);
             let canonical = &state.local_path;
-            let is_this_note = |record: &StoredRecord| {
-                record.state.workspace == state.workspace
-                    && record.state.internal_id == state.internal_id
-            };
+            let is_this_note =
+                |record: &StoredRecord| record.state.is_note(&state.workspace, &state.internal_id);
 
             // One pass over the store finds this note's record, under its
             // current key or one an older build wrote, and every other note
@@ -656,7 +659,7 @@ fn valid_state_key(key: &str) -> bool {
 fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<(), StateError> {
     let parent = path.parent().ok_or(StateError::InvalidStatePath)?;
     create_private_dir_all(parent)?;
-    crate::local::replace_atomic(path, contents, set_private_permissions)?;
+    crate::local::replace_atomic(path, contents, true, set_private_permissions)?;
     Ok(())
 }
 

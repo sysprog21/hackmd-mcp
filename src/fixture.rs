@@ -361,6 +361,17 @@ impl SequenceServer {
             .expect("fixture client should build")
     }
 
+    /// A client with `request_timeout` as its stall bound, for tests about
+    /// timeouts.
+    pub(crate) fn client_with_timeout(&self, request_timeout: Duration) -> HackmdClient {
+        HackmdClient::new(Config::for_loopback_test_with_timeout(
+            &self.api_url,
+            FIXTURE_TOKEN,
+            request_timeout,
+        ))
+        .expect("fixture client should build")
+    }
+
     /// A client whose note-list cache is on, for tests about caching.
     pub(crate) fn client_with_cache(&self) -> HackmdClient {
         HackmdClient::new(Config::for_loopback_test_with_cache(&self.api_url))

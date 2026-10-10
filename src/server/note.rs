@@ -18,7 +18,7 @@ use crate::{
 impl HackmdServer {
     #[tool(
         name = "hackmd_list_notes",
-        description = "List HackMD notes with metadata filtering, sorting, and pagination. source picks the list: workspace (default; a personal or team workspace's notes), history (the account's view history, in HackMD's order), trash (trashed personal notes), or tracked (local files synced by hackmd_pull_note, read without a request; team_path narrows it to one team). This never searches note bodies. refresh=true bypasses the 60-second workspace cache.",
+        description = "List HackMD notes with metadata filtering, sorting, and pagination. source picks the list: workspace (default; a personal or team workspace's notes), history (the account's history list, in HackMD's order), trash (trashed personal notes), or tracked (local files synced by hackmd_pull_note, read without a request; team_path narrows it to one team). This never searches note bodies. refresh=true bypasses the 60-second workspace cache.",
         annotations(
             title = "List HackMD Notes",
             read_only_hint = true,

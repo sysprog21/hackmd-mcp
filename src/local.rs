@@ -132,6 +132,11 @@ pub(crate) enum Expect {
 }
 
 impl Expect {
+    /// Whether the write may replace a file it finds: only one it expected.
+    fn replaces(self) -> bool {
+        matches!(self, Self::Stamp(_))
+    }
+
     /// Whether the file still meets this, given `look(follow)`: its stamp now,
     /// following a symlink or not. Absence is judged without following, so a
     /// dangling symlink is something there, not nothing.
@@ -353,13 +358,162 @@ fn is_agent_instruction_path(path: &Path) -> bool {
             .any(|component| listed(AGENT_CONFIG_DIRS, component.as_os_str()))
 }
 
+/// Moves the written `temporary` to `relative`, both beneath `dir`. Unless
+/// `replace`, a file created there since the caller's check is kept and the
+/// result is `false`: a link fails if the name exists, where a rename would
+/// replace it.
+fn place(dir: &Dir, temporary: &Path, relative: &Path, replace: bool) -> io::Result<bool> {
+    if !replace {
+        match dir.hard_link(temporary, dir, relative) {
+            Ok(()) => {
+                // The note is in place either way; a leftover is only a second
+                // name for it, so it is reported, not treated as a failure.
+                if let Err(error) = dir.remove_file(temporary) {
+                    tracing::warn!(
+                        path = %temporary.display(),
+                        %error,
+                        "a temporary file linked to the written note was left behind"
+                    );
+                }
+                return Ok(true);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+
+            // No link here: FAT and exFAT have none, and macOS answers them
+            // with an ENOTSUP std leaves uncategorized (measured 2026-10-10).
+            // The caller's check is then all there is, as before links were
+            // tried; refusing would break a write that works.
+            Err(_) => {}
+        }
+    }
+    dir.rename(temporary, dir, relative).map(|()| true)
+}
+
+/// [`LocalFiles::write_atomic`] without a root. `false` when the file no
+/// longer meets `expect`; it is left as it was.
+fn write_unconfined(
+    path: &Path,
+    contents: &[u8],
+    create_parent_dirs: bool,
+    expect: Expect,
+) -> io::Result<bool> {
+    if create_parent_dirs && let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // The user's own file keeps whatever permissions it had. A new one stays as
+    // private as its temporary, whatever briefly stood at the path.
+    let existing = expect
+        .replaces()
+        .then(|| fs::metadata(path).ok().map(|meta| meta.permissions()))
+        .flatten();
+    let mut held = true;
+    let written = replace_atomic(path, contents, expect.replaces(), |file| {
+        held = expect.holds(|follow| {
+            let metadata = if follow {
+                fs::metadata(path)
+            } else {
+                fs::symlink_metadata(path)
+            };
+            Ok(found(metadata)?.as_ref().map(Stamp::of))
+        })?;
+        if !held {
+            return Err(io::Error::other("changed"));
+        }
+        existing.map_or(Ok(()), |permissions| file.set_permissions(permissions))
+    });
+    match written {
+        Err(_) if !held => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        written => written.map(|()| true),
+    }
+}
+
+/// [`LocalFiles::write_atomic`] beneath `dir`, the pinned root. `false` when
+/// the file no longer meets `expect`; it is left as it was.
+fn write_confined(
+    dir: &Dir,
+    relative: &Path,
+    contents: &[u8],
+    create_parent_dirs: bool,
+    expect: Expect,
+) -> io::Result<bool> {
+    let parent = relative
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
+    if create_parent_dirs {
+        dir.create_dir_all(parent)?;
+    }
+    let file_name = relative
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing filename"))?;
+
+    // As in `write_unconfined`: only a file the write expected lends its
+    // permissions.
+    let existing_permissions = expect
+        .replaces()
+        .then(|| {
+            dir.metadata(relative)
+                .ok()
+                .map(|metadata| metadata.permissions())
+        })
+        .flatten();
+
+    // A random 64-bit name, opened create-new: a collision is not a case worth
+    // retrying for, so any failure is reported as itself.
+    let temporary = parent.join(format!(
+        ".{}.hackmd-mcp-{:016x}.tmp",
+        file_name.to_string_lossy(),
+        fastrand::u64(..)
+    ));
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+
+    // Private until renamed, as `replace_atomic`'s temporary is: it holds the
+    // new contents before the destination's own permissions are applied, and
+    // stays behind if the process dies first.
+    #[cfg(unix)]
+    cap_std::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = dir.open_with(&temporary, &options)?;
+    let placed = (|| {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        let look = |follow| {
+            let metadata = if follow {
+                dir.metadata(relative)
+            } else {
+                dir.symlink_metadata(relative)
+            };
+            Ok(found(metadata)?.as_ref().map(Stamp::of_confined))
+        };
+        if !expect.holds(look)? {
+            return Ok(false);
+        }
+
+        // Only now, so a refused temporary is never left read-only where it
+        // cannot be removed.
+        if let Some(permissions) = existing_permissions {
+            file.set_permissions(permissions)?;
+        }
+        drop(file);
+        place(dir, &temporary, relative, expect.replaces())
+    })();
+    if !matches!(placed, Ok(true)) {
+        let _ = dir.remove_file(&temporary);
+    }
+    placed
+}
+
 /// Replaces `path` with `contents` through a temporary file beside it, synced
 /// before the rename, so a reader sees the old file or the new one, never a
 /// torn mix. `before_persist` runs on the written file just before the rename:
-/// to set its permissions, or to refuse.
+/// to set its permissions, or to refuse. With `replace` false, a file that
+/// appeared at `path` after that check is kept and the write fails with
+/// `AlreadyExists`.
 pub(crate) fn replace_atomic(
     path: &Path,
     contents: &[u8],
+    replace: bool,
     before_persist: impl FnOnce(&fs::File) -> io::Result<()>,
 ) -> io::Result<()> {
     let parent = path
@@ -372,8 +526,22 @@ pub(crate) fn replace_atomic(
     temporary.write_all(contents)?;
     temporary.as_file().sync_all()?;
     before_persist(temporary.as_file())?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    Ok(())
+    if replace {
+        temporary.persist(path).map_err(|error| error.error)?;
+        return Ok(());
+    }
+    match temporary.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Err(error.error),
+
+        // A filesystem that can neither rename without replacing nor link, as
+        // exFAT on macOS: the check `before_persist` just made is all there is.
+        Err(error) => error
+            .file
+            .persist(path)
+            .map(drop)
+            .map_err(|error| error.error),
+    }
 }
 
 impl LocalFiles {
@@ -555,16 +723,19 @@ impl LocalFiles {
     /// What `path` names, or `None` when nothing is there: one lookup where
     /// callers would otherwise ask "does it exist" and then "what is it".
     pub(crate) fn entry(&self, path: &Path) -> Result<Option<Entry>, LocalAccessError> {
-        let is_dir = match self.confined(path)? {
-            Some((dir, relative)) => dir.metadata(relative).map(|metadata| metadata.is_dir()),
-            None => fs::metadata(path).map(|metadata| metadata.is_dir()),
-        };
-        match is_dir {
-            Ok(true) => Ok(Some(Entry::Directory)),
-            Ok(false) => Ok(Some(Entry::Other)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        crate::local::offload(|| {
+            let is_dir = match self.confined(path)? {
+                Some((dir, relative)) => found(dir.metadata(relative))?.map(|meta| meta.is_dir()),
+                None => found(fs::metadata(path))?.map(|meta| meta.is_dir()),
+            };
+            Ok(is_dir.map(|is_dir| {
+                if is_dir {
+                    Entry::Directory
+                } else {
+                    Entry::Other
+                }
+            }))
+        })
     }
 
     /// The stamp of the file at `path` now, from its metadata alone, so even
@@ -656,9 +827,10 @@ impl LocalFiles {
         })
     }
 
-    /// Atomically replaces a confined file through a directory capability.
-    /// Every pathname lookup from the root through the final rename stays
-    /// beneath the opened root even if another process swaps symlinks.
+    /// Atomically replaces a file, through the root's directory capability
+    /// when there is one: every pathname lookup from the root through the
+    /// final rename then stays beneath the opened root even if another
+    /// process swaps symlinks.
     pub(crate) fn write_atomic(
         &self,
         path: &Path,
@@ -666,100 +838,22 @@ impl LocalFiles {
         create_parent_dirs: bool,
         expect: Expect,
     ) -> Result<(), LocalAccessError> {
-        let changed = || LocalAccessError::Changed {
-            path: path.to_path_buf(),
-        };
         crate::local::offload(|| {
             // The same refusal `allow_write` gives up front, repeated where the
             // write happens so no caller can skip it.
             self.allow_write(path)?;
-            let Some((dir, relative)) = self.confined(path)? else {
-                if create_parent_dirs && let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
+            let written = match self.confined(path)? {
+                Some((dir, relative)) => {
+                    write_confined(dir, &relative, contents, create_parent_dirs, expect)
                 }
-                // The user's own file keeps whatever permissions it had.
-                let existing = fs::metadata(path).ok().map(|meta| meta.permissions());
-                let mut held = true;
-                let written = replace_atomic(path, contents, |file| {
-                    held = expect.holds(|follow| {
-                        let metadata = if follow {
-                            fs::metadata(path)
-                        } else {
-                            fs::symlink_metadata(path)
-                        };
-                        Ok(found(metadata)?.as_ref().map(Stamp::of))
-                    })?;
-                    if !held {
-                        return Err(io::Error::other("changed"));
-                    }
-                    existing.map_or(Ok(()), |permissions| file.set_permissions(permissions))
-                });
-                return match written {
-                    Err(_) if !held => Err(changed()),
-                    written => Ok(written?),
-                };
+                None => write_unconfined(path, contents, create_parent_dirs, expect),
             };
-            let parent = relative.parent().ok_or_else(|| {
-                LocalAccessError::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "missing parent",
-                ))
-            })?;
-            if create_parent_dirs {
-                dir.create_dir_all(parent)?;
-            }
-            let file_name = relative.file_name().ok_or_else(|| {
-                LocalAccessError::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "missing filename",
-                ))
-            })?;
-            let existing_permissions = dir
-                .metadata(&relative)
-                .ok()
-                .map(|metadata| metadata.permissions());
-
-            // A random 64-bit name, opened create-new: a collision is not a
-            // case worth retrying for, so any failure is reported as itself.
-            let temporary = parent.join(format!(
-                ".{}.hackmd-mcp-{:016x}.tmp",
-                file_name.to_string_lossy(),
-                fastrand::u64(..)
-            ));
-            let mut options = cap_std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            let mut file = dir.open_with(&temporary, &options)?;
-            let result = (|| {
-                file.write_all(contents)?;
-                file.sync_all()?;
-                let look = |follow| {
-                    let metadata = if follow {
-                        dir.metadata(&relative)
-                    } else {
-                        dir.symlink_metadata(&relative)
-                    };
-                    Ok(found(metadata)?.as_ref().map(Stamp::of_confined))
-                };
-                if !expect.holds(look)? {
-                    return Ok(false);
-                }
-                // Only now, so a refused temporary is never left read-only
-                // where it cannot be removed.
-                if let Some(permissions) = existing_permissions {
-                    file.set_permissions(permissions)?;
-                }
-                dir.rename(&temporary, dir, &relative).map(|()| true)
-            })();
-            match result {
-                Ok(true) => Ok(()),
-                Ok(false) => {
-                    let _ = dir.remove_file(&temporary);
-                    Err(changed())
-                }
-                Err(error) => {
-                    let _ = dir.remove_file(&temporary);
-                    Err(LocalAccessError::Io(error))
-                }
+            if written? {
+                Ok(())
+            } else {
+                Err(LocalAccessError::Changed {
+                    path: path.to_path_buf(),
+                })
             }
         })
     }
@@ -893,6 +987,78 @@ mod tests {
             ));
             assert!(fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()));
         }
+    }
+
+    /// The new contents are never readable by other users on the way in: a
+    /// file the write creates is as private as its temporary was.
+    #[cfg(unix)]
+    #[test]
+    fn a_created_file_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for confined in [false, true] {
+            let directory = tempfile::tempdir().expect("temp directory should create");
+            let root = directory
+                .path()
+                .canonicalize()
+                .expect("root should resolve");
+            let path = root.join("note.md");
+            let files = LocalFiles::new(root.join("state"), confined.then(|| root.clone()));
+            files
+                .write_atomic(&path, b"pull", false, Expect::Absent)
+                .expect("an absent file should be created");
+            let mode = fs::metadata(&path)
+                .expect("file should exist")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "confined: {confined}, mode {mode:o}");
+        }
+    }
+
+    /// A file that appears after the last check is kept: a write that expected
+    /// none fails instead of replacing it.
+    #[test]
+    fn a_file_created_after_the_check_is_not_replaced() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let path = directory.path().join("note.md");
+        let error = super::replace_atomic(&path, b"pull", false, |_| {
+            fs::write(&path, "an editor's save")
+        })
+        .expect_err("an existing file should not be replaced");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(&path).expect("file should read"),
+            "an editor's save"
+        );
+    }
+
+    /// The confined placement keeps a file that appeared after the check, and
+    /// places the temporary where nothing is.
+    #[test]
+    fn a_confined_placement_never_replaces_what_appeared() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let dir =
+            cap_std::fs::Dir::open_ambient_dir(directory.path(), cap_std::ambient_authority())
+                .expect("directory should open");
+        dir.write("temp", "pull").expect("temporary should write");
+        dir.write("note.md", "an editor's save")
+            .expect("file should write");
+        let placed = super::place(&dir, Path::new("temp"), Path::new("note.md"), false)
+            .expect("placement should not fail");
+        assert!(!placed);
+        assert_eq!(
+            dir.read_to_string("note.md").expect("file should read"),
+            "an editor's save"
+        );
+
+        assert!(
+            super::place(&dir, Path::new("temp"), Path::new("new.md"), false)
+                .expect("placement should not fail")
+        );
+        assert_eq!(
+            dir.read_to_string("new.md").expect("file should read"),
+            "pull"
+        );
+        assert!(!dir.exists("temp"), "the temporary is gone");
     }
 
     #[test]

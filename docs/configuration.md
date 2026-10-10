@@ -105,7 +105,10 @@ package version, the source commit the binary was built from (`commit`, with
 `-dirty` when that checkout had uncommitted edits to `src/`, `build.rs`, or the
 Cargo manifest or lockfile, absent when the build had no git checkout), whether
 a token is present, the API origin, whether the state directory is writable,
-and whether the workspace root is configured and accessible. Adding
+and whether the workspace root is configured and accessible. `--version` prints
+the same `commit`; if it is not the one you expect, the installed binary is
+stale (two dirty builds of one commit look alike): install the new one and
+restart your agent, since a running agent keeps the server it started. Adding
 `--probe-api` makes one read-only `GET /me`, which reports only success or a
 bounded error, never profile data; without it the checks stay local. A failed
 check exits nonzero and still prints valid JSON, so editor integrations can

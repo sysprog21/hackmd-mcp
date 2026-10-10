@@ -709,7 +709,13 @@ impl HackmdClient {
     /// up when no data arrives for the request timeout: a stall ends a read,
     /// a slow but steady transfer does not.
     async fn read_body(&self, response: reqwest::Response) -> Result<Vec<u8>, BodyError> {
-        read_body_capped(response, RESPONSE_MAX_BYTES, self.config.request_timeout()).await
+        read_body_capped(
+            response,
+            Vec::new(),
+            RESPONSE_MAX_BYTES,
+            self.config.request_timeout(),
+        )
+        .await
     }
 
     /// The outer bound on a whole request carrying `body_len` bytes, should
@@ -874,21 +880,23 @@ impl BodyError {
     }
 }
 
-/// Reads a response body of at most `cap` bytes. A declared length over the
-/// cap is refused before anything is read, and a body without one is
-/// refused as soon as it passes the cap.
+/// Reads a response body of at most `cap` bytes, after `body`, the bytes
+/// already read from it (usually none), which count toward the cap. A
+/// declared length over the cap is refused before anything more is read, and
+/// a body is refused as soon as it passes the cap.
 async fn read_body_capped(
     mut response: reqwest::Response,
+    mut body: Vec<u8>,
     cap: usize,
     stall: Duration,
 ) -> Result<Vec<u8>, BodyError> {
     let declared = response
         .content_length()
-        .map(|length| usize::try_from(length).unwrap_or(usize::MAX));
-    if declared.is_some_and(|length| length > cap) {
+        .map_or(0, |length| usize::try_from(length).unwrap_or(usize::MAX));
+    if declared > cap || body.len() > cap {
         return Err(BodyError::TooLarge);
     }
-    let mut body = Vec::with_capacity(declared.unwrap_or(0));
+    body.reserve(declared);
     loop {
         let next = tokio::time::timeout(stall, response.chunk())
             .await
@@ -1697,13 +1705,7 @@ mod tests {
             r#"{"ok":true}"#,
         )
         .delay(Duration::from_millis(100))]);
-        let timeout_config = Config::for_loopback_test_with_timeout(
-            &server.api_url,
-            "fixture-token",
-            Duration::from_millis(20),
-        );
-        let timeout_client =
-            HackmdClient::new(timeout_config).expect("timeout fixture client should build");
+        let timeout_client = server.client_with_timeout(Duration::from_millis(20));
         assert!(matches!(
             timeout_client
                 .request_json::<Value>(Method::GET, &["me"], NO_BODY)
@@ -1724,12 +1726,7 @@ mod tests {
             r#"{"id":"late"}"#,
         )
         .delay(Duration::from_millis(100))]);
-        let client = HackmdClient::new(Config::for_loopback_test_with_timeout(
-            &server.api_url,
-            "fixture-token",
-            Duration::from_millis(20),
-        ))
-        .expect("timeout fixture client should build");
+        let client = server.client_with_timeout(Duration::from_millis(20));
         let error = client
             .request_json::<Value>(Method::POST, &["notes"], Some(&json!({})))
             .await
@@ -1856,12 +1853,12 @@ mod tests {
         let url = format!("{}/big", server.api_url);
         let response = reqwest::get(&url).await.expect("fixture should answer");
         assert!(matches!(
-            super::read_body_capped(response, 4, Duration::from_secs(5)).await,
+            super::read_body_capped(response, Vec::new(), 4, Duration::from_secs(5)).await,
             Err(super::BodyError::TooLarge)
         ));
         let response = reqwest::get(&url).await.expect("fixture should answer");
         assert!(matches!(
-            super::read_body_capped(response, 10, Duration::from_secs(5)).await,
+            super::read_body_capped(response, Vec::new(), 10, Duration::from_secs(5)).await,
             Ok(body) if body == b"0123456789"
         ));
         server.finish();

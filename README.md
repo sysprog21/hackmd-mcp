@@ -1,70 +1,143 @@
 # hackmd-mcp
 
-An [MCP](https://modelcontextprotocol.io/) server that lets an AI agent read,
-write, and organize your [HackMD](https://hackmd.io/) notes, and keep them in
-sync with Markdown files on your own disk.
+An [MCP](https://modelcontextprotocol.io/) server written in Rust and released
+under the [MIT license](LICENSE). It lets an AI agent read, edit, and organize
+[HackMD](https://hackmd.io/) notes, and sync them with local Markdown files.
+It runs on your machine, communicates with the agent over standard input and
+output (stdio), and accesses HackMD with an API token.
 
-## Why put an agent on HackMD
+## Why this server exists
 
-HackMD is where meeting notes, lecture handouts, and team specs end up. Working
-on them with an agent usually means copying a note into a chat, copying the
-answer back, and hoping nobody edited the note in between. This server removes
-that loop and the risks that come with it:
+HackMD already provides an [official hosted MCP
+server](https://hackmd.io/@docs/hackmd-mcp-setup), with OAuth sign-in and tools
+for personal and team notes. It is a convenient choice for accessing HackMD
+from an agent without installing a local server.
 
-- Ask in plain language. "Summarize this week's meeting notes in the `ops`
-  team", "fix the broken links in https://hackmd.io/@me/syllabus", or "move the
-  action items into a new note under `Projects`". The agent finds notes by ID or
-  by the URL you paste, across your personal and team workspaces.
-- Body edits touch only the lines they mean to. The agent changes a note with a
-  context-checked patch, not by rewriting the whole body, so a typo fix stays a
-  typo fix, and it can pass along the hash it read to refuse the write if the
-  note changed in between. See [patch editing](docs/tools.md#editing-a-note).
-- Notes become local files. Pull a note into a `.md` file, then edit it with
-  your editor, grep it, diff it, or commit it to git. Push sends it back, and if
-  the note also changed on HackMD the push stops and hands you both versions
-  instead of overwriting either. See
-  [sync](docs/tools.md#pull-edit-locally-push).
-- Edits are confirmed, not assumed. HackMD may show a write
-  only after a delay, so body edits and folder changes are read back before they
-  are reported as done. A write whose outcome is unknown is reported as such
-  and never retried blindly, so you do not get duplicate notes.
-- Local file access can be fenced in. Set a workspace root and every local path
-  stays inside it; without one, a pull still refuses to write the files agents
-  load as instructions. Your API token never appears in any output. See
-  [configuration](docs/configuration.md#workspace-root).
+This project serves workflows where documents need the same care as code:
+small, reviewable edits, checks for collaborators' changes, local tooling,
+and confirmation that a write took effect. These matter when an agent edits
+a lecture handout, a shared meeting record, or a technical procedure that
+others are still updating.
 
-The server runs on your machine as a child process of your agent and talks to
-it over stdio. Nothing listens on a network port.
+### Controlled edits for shared documents
+
+Fixing one command in a long handout should preserve the surrounding examples
+and explanations. Asking a model to regenerate the entire document can omit
+unrelated content; writing an older copy can overwrite a collaborator's work.
+
+As of October 2026, the official setup guide lists `content` as the body
+input for both note update tools and describes the personal update as a full
+overwrite. The guide does not list patch inputs, expected-content hashes, or a
+local sync workflow. This comparison concerns the documented tool interface;
+it does not assume how the hosted server handles writes internally.
+
+`hackmd-mcp` makes the intended edit checkable:
+
+- A patch must name the exact target note, and every hunk's context must match
+  the current body exactly once (after its `@@` anchor, if any). Missing or
+  ambiguous context stops the edit.
+- The agent can pass the `body_hash` from its read as `expected_hash`. If the
+  body has changed before the check, the server refuses the write so the agent
+  can read again and revise its edit.
+
+Patches are checked locally before the resulting body is sent to HackMD;
+this is not an atomic patch API. Hash checks are optional, and an edit landing
+between the check and the write can still be overwritten. `content` replaces
+the whole body instead. See [patch editing](docs/tools.md#editing-a-note).
+
+### Local sync for development and review
+
+Pull a note into a Markdown file, edit it with your editor, search it, run
+checks, or review its diff in Git, then push it back. A handout's code,
+commands, and experiment steps can be maintained alongside the programs they
+describe, while collaborators continue using HackMD.
+
+The server saves a sync baseline and compares local and remote content with
+it. With the default safe strategy, conflicting changes stop the push and
+produce a diff and a remote snapshot for merging. After merging, the agent
+passes the conflict's `remote_body_hash` back as `expected_remote_hash`, so the
+push proceeds only if the remote has not changed again. This gives the
+workflow a defined conflict-resolution step. See
+[pull, edit, and push](docs/tools.md#pull-edit-locally-push).
+
+### Confirmation before another write
+
+A successful request does not always mean the new state is visible yet.
+Body edits, folder updates, and a new note's folder placement are read back to
+confirm their results. When a dropped connection, a 5xx, or an unreadable
+success reply leaves a write's outcome uncertain, the tool reports it as
+unconfirmed and tells the agent to look, not retry. This helps avoid duplicate
+notes or another overwrite. See
+[confirmation details](docs/tools.md#editing-a-note) for operation-specific
+limits and the image-upload exception.
+
+### Local deployment with explicit boundaries
+
+The server runs as a local stdio process and opens no network listening port.
+You choose the binary version and can confine local file operations to a
+workspace root.
+
+Notes still live on HackMD, and the agent may send their content to your
+chosen model service. Local execution gives you deployment and file-access
+control; the workflow still depends on those services.
+
+Choose the official hosted server for convenient remote access with OAuth.
+Choose `hackmd-mcp` when your workflow needs context-checked edits, local
+Markdown sync, conflict handling, and explicit write confirmation.
 
 ## Quick start
 
-### 1. Install
+### 1. Download a prebuilt binary
 
-Every push to `main` that passes CI replaces a rolling [`latest`
-release](https://github.com/sysprog21/hackmd-mcp/releases/tag/latest).
-Pick the archive for your platform:
+Download from [GitHub Releases](https://github.com/sysprog21/hackmd-mcp/releases);
+no Rust installation is needed. The rolling `latest` release is updated after
+CI passes on `main`.
 
-| Platform | Archive |
-|----------|---------|
-| Linux x86_64, glibc 2.17 or newer | `hackmd-mcp-x86_64-unknown-linux-gnu.tar.gz` |
-| macOS Apple silicon | `hackmd-mcp-aarch64-apple-darwin.tar.gz` |
-| Windows x86_64 | `hackmd-mcp-x86_64-pc-windows-msvc.zip` |
+| Platform | Download |
+|----------|----------|
+| Linux x86_64 (glibc 2.17+) | [`.tar.gz`](https://github.com/sysprog21/hackmd-mcp/releases/download/latest/hackmd-mcp-x86_64-unknown-linux-gnu.tar.gz) |
+| macOS Apple silicon | [`.tar.gz`](https://github.com/sysprog21/hackmd-mcp/releases/download/latest/hackmd-mcp-aarch64-apple-darwin.tar.gz) |
+| Windows x86_64 | [`.zip`](https://github.com/sysprog21/hackmd-mcp/releases/download/latest/hackmd-mcp-x86_64-pc-windows-msvc.zip) |
 
-On Linux or macOS, set `asset` to the archive from the table above (where
-`sha256sum` is missing, as on older macOS, use `shasum -a 256` in its place):
+On Linux or macOS, the commands below download, verify, and install the binary
+into `~/.local/bin`. On macOS, change `asset` to
+`hackmd-mcp-aarch64-apple-darwin.tar.gz` and use `shasum -a 256 -c -` in place
+of `sha256sum -c -`.
 
 ```sh
 asset=hackmd-mcp-x86_64-unknown-linux-gnu.tar.gz
 base=https://github.com/sysprog21/hackmd-mcp/releases/download/latest
-curl -sSfLO "$base/$asset" -O "$base/SHA256SUMS"
-grep " $asset\$" SHA256SUMS | sha256sum -c - &&
+curl -fLO "$base/$asset" &&
+    curl -fLO "$base/SHA256SUMS" &&
+    grep " $asset\$" SHA256SUMS | sha256sum -c - &&
     tar xzf "$asset" &&
     mkdir -p ~/.local/bin &&
     install -m 755 hackmd-mcp ~/.local/bin/
 ```
 
-The checksum catches a corrupt download. To also confirm the archive was built
-by this repository's CI from a commit on `main`, run:
+On Windows, the PowerShell commands below download the ZIP and print `True`
+when its checksum matches; then extract `hackmd-mcp.exe` to a permanent
+location.
+
+```powershell
+$zip = 'hackmd-mcp-x86_64-pc-windows-msvc.zip'
+$base = 'https://github.com/sysprog21/hackmd-mcp/releases/download/latest'
+Invoke-WebRequest "$base/$zip" -OutFile $zip -UseBasicParsing
+Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS -UseBasicParsing
+$want = ((Select-String -SimpleMatch " $zip" SHA256SUMS).Line -split ' ')[0]
+(Get-FileHash $zip -Algorithm SHA256).Hash -eq $want
+```
+
+Use the full path to `hackmd-mcp.exe` in your
+[client configuration](docs/clients.md); the examples below use the
+Linux/macOS install path.
+
+<details>
+<summary>Verify build provenance or build from source</summary>
+
+Checksums detect corrupt downloads. To also verify the archive came from this
+repository's CI on `main`, use the GitHub CLI (on Windows, replace `$asset`
+with the ZIP's name):
 
 ```sh
 gh attestation verify "$asset" --repo sysprog21/hackmd-mcp \
@@ -72,12 +145,17 @@ gh attestation verify "$asset" --repo sysprog21/hackmd-mcp \
     --signer-workflow sysprog21/hackmd-mcp/.github/workflows/ci.yml
 ```
 
-On Windows, download the zip from the release page and extract
-`hackmd-mcp.exe`. Other platforms build from source with Rust 1.88 or newer:
+For other platforms, build with Rust 1.88 or newer:
 
 ```sh
 cargo install --git https://github.com/sysprog21/hackmd-mcp --locked
 ```
+
+Cargo installs into `~/.cargo/bin` by default, so replace `~/.local/bin` with
+`~/.cargo/bin` in the steps below.
+See [development](docs/development.md) for building a checkout.
+
+</details>
 
 ### 2. Set up the environment
 
@@ -103,13 +181,9 @@ details.
 ~/.local/bin/hackmd-mcp --self-check --probe-api
 ```
 
-It prints a JSON report and exits nonzero if anything is wrong, without ever
-printing the token. Its `commit` field, also shown by `--version`, names the
-commit the binary was built from, with `-dirty` when that checkout had
-uncommitted edits to its sources (so two dirty builds of one commit look
-alike); it is absent for a build made outside a git checkout. If it is not the
-commit you expect, the installed binary is stale: install the new one and
-restart your agent, since a running agent keeps the server it started.
+The check reports configuration and API access errors without printing the
+token. After updating the binary or environment, restart your agent to load
+the changes. See [self-check details](docs/configuration.md#self-check).
 
 ### 4. Connect your agent
 
@@ -125,7 +199,8 @@ agent something like "list my recent HackMD notes".
 
 ## What the agent can do
 
-Fourteen tools, kept few on purpose so they cost the agent little context:
+Fourteen tools cover account access, notes, folders, and local sync, kept few
+on purpose so they cost the agent little context:
 
 | Area | Tools |
 |------|-------|
