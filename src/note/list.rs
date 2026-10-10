@@ -63,7 +63,7 @@ pub(crate) enum NoteSource {
     /// The live notes of `workspace`.
     #[default]
     Workspace,
-    /// Recently viewed notes from every workspace, with `last_visit`.
+    /// The account's history list, from every workspace, with `last_visit`.
     History,
     /// Trashed personal notes; `hackmd_delete_note` with `restore: true`
     /// brings one back.

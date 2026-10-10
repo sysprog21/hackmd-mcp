@@ -25,7 +25,7 @@ teams you belong to.
 | `source` | Lists |
 |----------|-------|
 | `workspace` (default) | notes in a personal or team workspace |
-| `history` | the account's view history, in the order HackMD returns it |
+| `history` | the account's history list, in the order HackMD returns it |
 | `trash` | trashed personal notes |
 | `tracked` | local files synced by `hackmd_pull_note`, read without any request |
 
