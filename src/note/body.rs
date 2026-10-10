@@ -96,7 +96,12 @@ fn front_matter_title<'a>(front: impl Iterator<Item = &'a str>) -> ControlFlow<O
         if content.is_empty() || content.starts_with('#') {
             continue;
         }
-        if line.starts_with([' ', '\t', '-']) {
+        // YAML indents with spaces only, so a tab there leaves the block
+        // unparsed, title and all.
+        if line[..line.len() - content.len()].contains('\t') {
+            return ControlFlow::Break(None);
+        }
+        if line.starts_with([' ', '-']) {
             // A title continued this way is folded, multi-line, or a list;
             // after anything else that cannot take it, or with no key above,
             // the block is YAML that does not parse.
@@ -442,6 +447,12 @@ mod tests {
         ("---\n  title: Real\n---\n# Wrong\n", None),
         ("---\ntitle : Real\n---\n# Wrong\n", None),
         ("---\ntitle: First\n  Second\n---\n", None),
+        ("---\ntitle: Proposed\nother:\n\tbad: value\n---\n", None),
+        ("---\ntitle: Proposed\nother:\n \tbad: value\n---\n", None),
+        (
+            "---\ntitle: Proposed\nother:\n  nested: value\n---\n",
+            Some("Proposed"),
+        ),
         ("---\ntitle: Real\ntags: x\n---\n# H1\n", Some("Real")),
         ("---\ntitleImage: x\n---\n# H1\n", Some("H1")),
         ("> > # Hidden\n\n# Real\n", None),
