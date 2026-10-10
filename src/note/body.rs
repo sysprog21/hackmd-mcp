@@ -20,15 +20,29 @@ pub(crate) fn into_stored(body: String) -> String {
     normalized
 }
 
-/// The title `body` implies when it differs from the note's listed `title`.
-/// `HackMD` derives a title from the body only when a note is created without
-/// one (front-matter `title:`, then the first H1, then "Untitled"); later body
-/// edits never change it, and an explicit `title` always wins (measured
-/// 2026-10-08). So an edited H1 leaves the listing showing the old title.
-pub(crate) fn title_drift(title: &str, body: &str) -> Option<String> {
-    // Whether `HackMD` collapses runs of spaces or tabs is unmeasured, so a
-    // difference in those alone is never reported.
-    body_title(body).filter(|implied| !implied.split_whitespace().eq(title.split_whitespace()))
+/// The title `body` implies when it no longer matches the note's listed
+/// `title`, judged against `synced`, which gives the [`body_title`] of the body
+/// as last synced and is asked only when the titles differ. `HackMD` derives a
+/// title from the body only when a note is created without one (front-matter
+/// `title:`, then the first H1, then "Untitled"); later body edits never change
+/// it, and an explicit `title` always wins (measured 2026-10-08). So an edited
+/// H1 leaves the listing showing the old title. It is drift only if the synced
+/// title matched the listing: a body whose title always differed was given
+/// another one on purpose, and with no synced title nothing says which, so
+/// neither is reported.
+pub(crate) fn title_drift(
+    title: &str,
+    body: &str,
+    synced: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let implied = body_title(body).filter(|implied| !same_title(implied, title))?;
+    same_title(&synced()?, title).then_some(implied)
+}
+
+/// Whether two titles match. Whether `HackMD` collapses runs of spaces or tabs
+/// is unmeasured, so a difference in those alone never counts.
+pub(crate) fn same_title(a: &str, b: &str) -> bool {
+    a.split_whitespace().eq(b.split_whitespace())
 }
 
 /// A longer title is not compared at all, which also bounds the work a
@@ -45,7 +59,7 @@ const FRONT_MATTER_MAX_LINES: usize = 256;
 /// definition, a setext heading) may hold or hide the title in ways this does
 /// not parse, so it gives none, as does any YAML or inline markup this does
 /// not decode. A missed drift costs nothing; a wrong one renames a note.
-fn body_title(body: &str) -> Option<String> {
+pub(crate) fn body_title(body: &str) -> Option<String> {
     let body = body.strip_prefix('\u{feff}').unwrap_or(body);
     let mut lines = body.lines().peekable();
     if lines.next_if_eq(&"---").is_some() {
@@ -375,6 +389,12 @@ fn closing(text: &str, open: u8, close: u8) -> Option<usize> {
 mod tests {
     use super::{body_title, into_stored, title_drift};
 
+    /// Drift for a note whose last-synced body gave the listed title, which
+    /// is the case where a different one now is drift.
+    fn drift(title: &str, body: &str) -> Option<String> {
+        title_drift(title, body, || Some(title.to_owned()))
+    }
+
     #[test]
     fn line_endings_take_the_stored_form() {
         assert_eq!(into_stored("a\r\nb\rc\n".to_owned()), "a\nb\nc\n");
@@ -391,7 +411,7 @@ mod tests {
     fn what_is_past_a_cap_gives_no_title() {
         let long = format!("# {}\n", "x".repeat(1025));
         assert_eq!(body_title(&long), None);
-        assert_eq!(title_drift(&"x".repeat(1025), &long), None);
+        assert_eq!(drift(&"x".repeat(1025), &long), None);
         assert_eq!(body_title(&format!("# {}\n", "[".repeat(1 << 20))), None);
         let front = format!("---\n{}title: T\n---\n", "key: v\n".repeat(300));
         assert_eq!(body_title(&front), None);
@@ -578,29 +598,44 @@ mod tests {
             let body = format!(
                 "# {heading}\n\n[ref]: https://example.com\n[Title]: https://example.com\n"
             );
-            assert_eq!(title_drift("Title", &body), None, "{heading}");
+            assert_eq!(drift("Title", &body), None, "{heading}");
         }
-        assert_eq!(
-            title_drift("Old", "# [Title](url)\n").as_deref(),
-            Some("Title")
-        );
+        assert_eq!(drift("Old", "# [Title](url)\n").as_deref(), Some("Title"));
     }
 
     #[test]
     fn drift_is_reported_only_when_the_titles_differ() {
-        assert_eq!(title_drift("Old", "# New\n").as_deref(), Some("New"));
-        assert_eq!(title_drift("Same", "# Same\n"), None);
-        assert_eq!(title_drift("Alpha Beta", "# Alpha  Beta\n"), None);
-        assert_eq!(title_drift("Alpha  Beta", "# Alpha\tBeta\n"), None);
+        assert_eq!(drift("Old", "# New\n").as_deref(), Some("New"));
+        assert_eq!(drift("Same", "# Same\n"), None);
+        assert_eq!(drift("Alpha Beta", "# Alpha  Beta\n"), None);
+        assert_eq!(drift("Alpha  Beta", "# Alpha\tBeta\n"), None);
         assert_eq!(
-            title_drift("Old", "# Alpha  Beta\n").as_deref(),
+            drift("Old", "# Alpha  Beta\n").as_deref(),
             Some("Alpha  Beta")
         );
-        assert_eq!(title_drift("Untitled", "no heading\n"), None);
-        assert_eq!(title_drift("  Alpha\u{2003}Beta  ", "# Alpha Beta\n"), None);
+        assert_eq!(drift("Untitled", "no heading\n"), None);
+        // A title the synced body already gave differently was chosen on
+        // purpose, and with no synced body nothing says otherwise.
         assert_eq!(
-            title_drift(&"x ".repeat(1 << 20), "# x\n").as_deref(),
-            Some("x")
+            title_drift("Weekly", "# Agenda\n", || Some("Agenda".to_owned())),
+            None
         );
+        assert_eq!(
+            title_drift("Weekly", "# Minutes\n", || Some("Agenda".to_owned())),
+            None
+        );
+        assert_eq!(title_drift("Weekly", "# Minutes\n", || None), None);
+        // The synced title costs a baseline read, so it is not asked for when
+        // the body's title already matches the listing.
+        assert_eq!(
+            title_drift("Same", "# Same\n", || panic!("the synced title was read")),
+            None
+        );
+        assert_eq!(
+            title_drift("Weekly", "# Minutes\n", || Some("Weekly".to_owned())).as_deref(),
+            Some("Minutes")
+        );
+        assert_eq!(drift("  Alpha\u{2003}Beta  ", "# Alpha Beta\n"), None);
+        assert_eq!(drift(&"x ".repeat(1 << 20), "# x\n").as_deref(), Some("x"));
     }
 }

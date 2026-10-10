@@ -192,7 +192,18 @@ pub(crate) async fn pull_note(
             .as_deref()
             .filter(|_| !same)
             .map(|local| super::push::change_diff(local, &body));
-        let title_drift = crate::note::body::title_drift(&remote.title, &body);
+
+        // The title of this note's last-synced body, if the file tracks it,
+        // tells a title the remote changed from one it always gave differently.
+        // Loaded only when the titles differ, which is rare.
+        let title_drift = crate::note::body::title_drift(&remote.title, &body, || {
+            files
+                .state()
+                .load_for_local_path(&input.local_path)
+                .ok()
+                .filter(|tracked| tracked.state.is_note(&note.workspace, &note.note_id))
+                .and_then(|tracked| crate::note::body::body_title(&tracked.baseline_body))
+        });
         (local, same, changes, title_drift)
     });
     if exists && !same && !input.discard_local_changes {
@@ -930,6 +941,11 @@ mod tests {
             .expect("pull should succeed")
             .expect("note should resolve");
         assert_eq!(output.changes, None, "an unchanged file reports nothing");
+
+        // The synced body now gives "Renamed" while the listing says "Note": a
+        // difference that may be deliberate, so it is reported once, not on
+        // every later pull.
+        assert_eq!(output.title_drift, None);
     }
 
     /// A file past the size cap is read only in part. Its CRLF prefix may

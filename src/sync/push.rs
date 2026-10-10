@@ -295,11 +295,6 @@ async fn push_resolved(
         last_changed_at: remote_timestamp,
     } = remote;
 
-    // Reported only where the remote ends up holding the local body, so it is
-    // worked out only there.
-    let drift =
-        |title: &str| crate::local::offload(|| crate::note::body::title_drift(title, &local));
-
     // Every result reports the tracked canonical path, not the caller's
     // spelling of it, and the conflict snapshot is written beside that path.
     let target = Target {
@@ -329,7 +324,9 @@ async fn push_resolved(
                     PushStatus::NothingToPush,
                     tracked.state.baseline_body_hash.clone(),
                     remote_timestamp,
-                    drift(&title),
+                    drift(&title, &local, || {
+                        crate::note::body::body_title(&tracked.baseline_body)
+                    }),
                 )));
             }
 
@@ -375,6 +372,9 @@ async fn push_resolved(
     // baseline through the write and its read-back would keep three copies of a
     // large note alive at once.
     drop(remote);
+    // All that drift needs of the baseline, taken before it goes.
+    let synced_title =
+        crate::local::offload(|| crate::note::body::body_title(&tracked.baseline_body));
     drop(tracked.baseline_body);
 
     let (status, timestamp, title) = if write {
@@ -398,7 +398,20 @@ async fn push_resolved(
                 source.into()
             }
         })?;
-    Ok(Ok(synced(&target, status, hash, timestamp, drift(&title))))
+    Ok(Ok(synced(
+        &target,
+        status,
+        hash,
+        timestamp,
+        drift(&title, &local, || synced_title),
+    )))
+}
+
+/// The `title_drift` a push reports, worked out only where the remote ends up
+/// holding the local body, and so only on those paths. `synced` gives the
+/// title of the baseline.
+fn drift(title: &str, local: &str, synced: impl FnOnce() -> Option<String>) -> Option<String> {
+    crate::local::offload(|| crate::note::body::title_drift(title, local, synced))
 }
 
 /// What a push may overwrite: the strategy, and for a safe push the remote
@@ -810,7 +823,7 @@ mod tests {
                 "GET",
                 "/v1/notes/note-id",
                 200,
-                r#"{"id":"note-id","title":"Note","content":"baseline"}"#,
+                r##"{"id":"note-id","title":"Note","content":"# Note\n"}"##,
             ),
             Scenario::new("PATCH", "/v1/notes/note-id", 202, "")
                 .expect_body("LF line endings", |body| {
@@ -823,8 +836,9 @@ mod tests {
                 r##"{"id":"note-id","title":"Note","content":"# Renamed\n\nedit\n"}"##,
             ),
         ]);
+        // The synced body's H1 gave the listed title, so a new one is drift.
         let files =
-            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "baseline");
+            crate::fixture::tracked_files(directory.path(), "note-id", &local_path, "# Note\n");
         let output = push_note(
             &fixture.client(),
             &files,
