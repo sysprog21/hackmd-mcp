@@ -69,6 +69,12 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --check
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-machete@0.9.1
+      - run: cargo machete
+      # Report duplicates across shipped platforms; duplicates alone do not fail CI.
+      - run: cargo tree --duplicates --all-features --target all --locked
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       # The default build compiles the non-otel observability path.
       - run: cargo clippy --all-targets --locked -- -D warnings
