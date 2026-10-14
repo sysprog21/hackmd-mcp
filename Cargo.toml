@@ -43,6 +43,7 @@ libc = "0.2"
 
 [dev-dependencies]
 futures-util = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 rmcp = { version = "3", default-features = false, features = ["client", "transport-worker"] }
 
 [lints.rust]

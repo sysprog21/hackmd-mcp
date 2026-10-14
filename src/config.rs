@@ -192,6 +192,12 @@ impl Config {
         self.loopback_images
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_public_images(mut self) -> Self {
+        self.loopback_images = false;
+        self
+    }
+
     /// Gives a loopback test config the public site, which only the public
     /// API would otherwise have.
     #[cfg(test)]
