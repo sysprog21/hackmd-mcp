@@ -16,6 +16,9 @@ use crate::{
     sync::state::TrackedNoteState,
 };
 
+mod tls;
+pub(crate) use tls::TlsServer;
+
 /// The token every fixture client presents. Nothing verifies it; it exists so
 /// requests carry an Authorization header the assertions can inspect.
 pub(crate) const FIXTURE_TOKEN: &str = "fixture-token";

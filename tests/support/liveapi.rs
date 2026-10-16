@@ -13,6 +13,8 @@ pub(crate) struct LiveResponse {
     pub(crate) status: StatusCode,
     pub(crate) headers: HeaderMap,
     pub(crate) value: Option<Value>,
+    /// HTTP body bytes transferred, before decompression and excluding headers.
+    pub(crate) body_len: usize,
 }
 
 impl LiveApi {
@@ -58,8 +60,16 @@ impl LiveApi {
                 && base.fragment().is_none(),
             "live API URL must not contain credentials, a query, or a fragment"
         );
+        Self::new(base, token)
+    }
+
+    fn new(base: Url, token: String) -> Self {
         Self {
             http: reqwest::Client::builder()
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd()
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -142,6 +152,7 @@ impl LiveApi {
             status,
             headers,
             value,
+            body_len: bytes.len(),
         }
     }
 
@@ -213,5 +224,87 @@ impl LiveApi {
             ),
             Err(error) => eprintln!("cleanup failed for {resource}: transport error: {error}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        time::{Duration, Instant},
+    };
+
+    #[tokio::test]
+    async fn compressed_probe_counts_raw_body_and_sends_requested_encoding() {
+        const PACKED: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 255, 171, 86, 202, 207, 86, 178, 42, 41, 42, 77, 173, 5,
+            0, 144, 95, 212, 167, 11, 0, 0, 0,
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("probe fixture bind");
+        let address = listener.local_addr().expect("probe fixture address");
+        listener.set_nonblocking(true).expect("nonblocking fixture");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("probe fixture accept: {error}"),
+                }
+            };
+            stream
+                .set_nonblocking(false)
+                .expect("blocking fixture stream");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("fixture timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("fixture timeout");
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).expect("probe request headers");
+                request.push(byte[0]);
+                assert!(request.len() < 16 * 1024, "fixture header limit");
+            }
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                PACKED.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .expect("fixture response headers");
+            stream.write_all(PACKED).expect("fixture compressed body");
+            String::from_utf8(request).expect("request header text")
+        });
+        let api = super::LiveApi::new(
+            reqwest::Url::parse(&format!("http://{address}/v1")).expect("fixture URL"),
+            "fixture-only-token".to_owned(),
+        );
+        let response = api
+            .get(&["notes", "id"], Some(("accept-encoding", "gzip, br")))
+            .await;
+        assert_eq!(response.body_len, PACKED.len());
+        assert_eq!(response.headers["content-encoding"], "gzip");
+        let request = server
+            .join()
+            .expect("probe fixture finished")
+            .to_ascii_lowercase();
+        assert!(
+            request.starts_with("get /v1/notes/id http/1.1"),
+            "{request}"
+        );
+        assert!(request.contains("accept-encoding: gzip, br"), "{request}");
+        assert!(
+            request.contains("authorization: bearer fixture-only-token"),
+            "{request}"
+        );
     }
 }

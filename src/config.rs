@@ -23,7 +23,9 @@ const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 /// a momentary annoyance, long enough to absorb an agent resolving several note
 /// URLs in a row.
 const LIST_CACHE_TTL: Duration = Duration::from_secs(60);
-const SUPPORTED_ENV_KEYS: [&str; 4] = [
+const SUPPORTED_ENV_KEYS: [&str; 6] = [
+    "HACKMD_MCP_SNAPSHOT_TTL_SECONDS",
+    "HACKMD_MCP_SNAPSHOT_MAX_BYTES",
     "HACKMD_API_TOKEN",
     "HACKMD_API_URL",
     "HACKMD_MCP_STATE_DIR",
@@ -53,6 +55,8 @@ pub(crate) struct Config {
     workspace_root: Option<PathBuf>,
     workspace_root_trusted: bool,
     list_cache_ttl: Duration,
+    snapshot_ttl: Duration,
+    snapshot_max_bytes: usize,
     /// Whether `image_url` fetches go to the plain-HTTP loopback fixture
     /// instead of public `https` hosts. Only the test constructors set it.
     loopback_images: bool,
@@ -120,6 +124,16 @@ impl Config {
             return Err(ConfigError::RelativeWorkspaceRoot);
         }
 
+        let snapshot_ttl = Duration::from_secs(config_number(
+            get("HACKMD_MCP_SNAPSHOT_TTL_SECONDS"),
+            "HACKMD_MCP_SNAPSHOT_TTL_SECONDS",
+            60,
+        )?);
+        let snapshot_max_bytes = config_number(
+            get("HACKMD_MCP_SNAPSHOT_MAX_BYTES"),
+            "HACKMD_MCP_SNAPSHOT_MAX_BYTES",
+            8 * 1024 * 1024,
+        )?;
         let api_url = Url::parse(&api_url).map_err(ConfigError::InvalidApiUrl)?;
         validate_api_url(&api_url, policy)?;
 
@@ -134,6 +148,8 @@ impl Config {
             workspace_root,
             workspace_root_trusted: true,
             list_cache_ttl: LIST_CACHE_TTL,
+            snapshot_ttl,
+            snapshot_max_bytes,
             loopback_images: false,
         })
     }
@@ -188,8 +204,29 @@ impl Config {
         self.list_cache_ttl
     }
 
+    pub(crate) const fn snapshot_ttl(&self) -> Duration {
+        self.snapshot_ttl
+    }
+
+    pub(crate) const fn snapshot_max_bytes(&self) -> usize {
+        self.snapshot_max_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_snapshots(mut self, ttl: Duration, max_bytes: usize) -> Self {
+        self.snapshot_ttl = ttl;
+        self.snapshot_max_bytes = max_bytes;
+        self
+    }
+
     pub(crate) const fn loopback_images(&self) -> bool {
         self.loopback_images
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_public_images(mut self) -> Self {
+        self.loopback_images = false;
+        self
     }
 
     /// Gives a loopback test config the public site, which only the public
@@ -224,6 +261,7 @@ impl Config {
         // Off by default in tests: request-count assertions are the point of
         // the fixtures, and a cache hit would silently swallow one.
         config.list_cache_ttl = Duration::ZERO;
+        config.snapshot_max_bytes = 0;
         config.loopback_images = true;
         config
     }
@@ -300,6 +338,18 @@ fn site_url(api: &Url) -> Option<Url> {
         return None;
     }
     Url::parse(SITE_URL).ok()
+}
+
+fn config_number<T: std::str::FromStr>(
+    value: Option<String>,
+    key: &'static str,
+    default: T,
+) -> Result<T, ConfigError> {
+    value.map_or(Ok(default), |value| {
+        value
+            .parse()
+            .map_err(|_| ConfigError::InvalidCacheLimit { key })
+    })
 }
 
 fn validate_api_url(url: &Url, policy: ApiUrlPolicy) -> Result<(), ConfigError> {
@@ -451,6 +501,8 @@ impl fmt::Debug for SecretToken {
 
 #[derive(Debug, Error)]
 pub(crate) enum ConfigError {
+    #[error("{key} must be a nonnegative integer within the supported range")]
+    InvalidCacheLimit { key: &'static str },
     #[error("HACKMD_API_URL must be a valid URL")]
     InvalidApiUrl(#[source] url::ParseError),
     #[error("HACKMD_API_URL must not contain credentials, a query, or a fragment")]
@@ -472,6 +524,35 @@ mod tests {
     use std::{collections::HashMap, fs, time::Duration};
 
     use super::{Config, DEFAULT_API_URL, load_dotenv, parse_dotenv_line};
+
+    #[test]
+    fn snapshot_limits_accept_zero_and_reject_invalid_values() {
+        let defaults = config_from(&[]).unwrap();
+        assert_eq!(defaults.snapshot_ttl(), Duration::from_secs(60));
+        assert_eq!(defaults.snapshot_max_bytes(), 8 * 1024 * 1024);
+        let disabled = config_from(&[
+            ("HACKMD_MCP_SNAPSHOT_TTL_SECONDS", "0"),
+            ("HACKMD_MCP_SNAPSHOT_MAX_BYTES", "0"),
+        ])
+        .unwrap();
+        assert!(disabled.snapshot_ttl().is_zero());
+        assert_eq!(disabled.snapshot_max_bytes(), 0);
+        for key in [
+            "HACKMD_MCP_SNAPSHOT_TTL_SECONDS",
+            "HACKMD_MCP_SNAPSHOT_MAX_BYTES",
+        ] {
+            for value in ["-1", "1.5", "no", "18446744073709551616"] {
+                assert!(matches!(
+                    config_from(&[(key, value)]),
+                    Err(super::ConfigError::InvalidCacheLimit { .. })
+                ));
+            }
+            assert_eq!(
+                parse_dotenv_line(&format!("{key}=123")),
+                Some((key.to_owned(), "123".to_owned()))
+            );
+        }
+    }
 
     fn config_from(entries: &[(&str, &str)]) -> Result<Config, super::ConfigError> {
         let values: HashMap<&str, &str> = entries.iter().copied().collect();

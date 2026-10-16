@@ -114,7 +114,7 @@ pub(crate) async fn edit_note(
         // An added line may carry a lone `\r`; HackMD would store it as `\n`.
         let updated = crate::note::patch::apply_note_patch(&content, &input.patch, &patch_path)
             .map(into_stored)?;
-        let changed = updated != content;
+        let changed = updated.as_str() != content.as_str();
         Ok::<_, PatchError>((updated, changed))
     })?;
 

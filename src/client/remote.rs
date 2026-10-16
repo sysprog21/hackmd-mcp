@@ -294,12 +294,22 @@ impl Resolve for Pinned {
 pub(super) struct Fetcher {
     http: reqwest::Client,
     pinned: Arc<Pinned>,
+    #[cfg(test)]
+    destinations: HashMap<String, SocketAddr>,
 }
 
 impl Fetcher {
     fn new(config: &Config, policy: Policy) -> Result<Self, RemoteImageError> {
+        Self::build(config, policy, reqwest::Client::builder())
+    }
+
+    fn build(
+        config: &Config,
+        policy: Policy,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self, RemoteImageError> {
         let pinned = Arc::new(Pinned::default());
-        let http = reqwest::Client::builder()
+        let http = builder
             .connect_timeout(config.connect_timeout())
             .redirect(reqwest::redirect::Policy::none())
             // `check_url` already refuses anything else on every hop; this
@@ -311,7 +321,12 @@ impl Fetcher {
             .dns_resolver(Arc::clone(&pinned))
             .build()
             .map_err(|_| RemoteImageError::ClientBuild)?;
-        Ok(Self { http, pinned })
+        Ok(Self {
+            http,
+            pinned,
+            #[cfg(test)]
+            destinations: HashMap::new(),
+        })
     }
 }
 
@@ -389,6 +404,28 @@ impl HackmdClient {
         }
     }
 
+    /// Only these fixture names bypass DNS; URL and TLS checks remain active.
+    #[cfg(test)]
+    pub(crate) fn with_tls_images(
+        mut self,
+        certificate: &[u8],
+        destinations: HashMap<String, SocketAddr>,
+    ) -> Self {
+        self.config = self.config.with_public_images();
+        let certificate = reqwest::Certificate::from_der(certificate).expect("fixture certificate");
+        let mut fetcher = Fetcher::build(
+            &self.config,
+            Policy::Public,
+            reqwest::Client::builder().tls_certs_only([certificate]),
+        )
+        .expect("TLS fixture client");
+        fetcher.destinations = destinations;
+        self.images
+            .set(fetcher)
+            .expect("images have not been fetched");
+        self
+    }
+
     fn fetcher(&self) -> Result<&Fetcher, RemoteImageError> {
         if let Some(fetcher) = self.images.get() {
             return Ok(fetcher);
@@ -428,14 +465,34 @@ impl HackmdClient {
 
             // A lookup cut short by the chain's deadline is a timeout, not a
             // host that does not resolve.
-            let (host, addrs) = tokio::time::timeout_at(
-                until,
-                resolve(&url, policy, self.config.connect_timeout()),
-            )
-            .await
-            .map_err(|_| RemoteImageError::TimedOut)??;
+            let lookup = async {
+                #[cfg(test)]
+                if let Some(address) = fetcher.destinations.get(url.host_str().unwrap_or_default())
+                {
+                    return Ok((
+                        url.host_str().unwrap_or_default().to_owned(),
+                        vec![*address],
+                    ));
+                }
+                resolve(&url, policy, self.config.connect_timeout()).await
+            };
+            let (host, addrs) = tokio::time::timeout_at(until, lookup)
+                .await
+                .map_err(|_| RemoteImageError::TimedOut)??;
             fetcher.pinned.set(host.clone(), addrs);
-            let response = tokio::time::timeout_at(until, fetcher.http.get(url.clone()).send())
+            let target = url.clone();
+            // Reqwest takes the port from the URL, not the DNS result.
+            #[cfg(test)]
+            let target = {
+                let mut target = target;
+                if let Some(address) = fetcher.destinations.get(&host) {
+                    target
+                        .set_port(Some(address.port()))
+                        .expect("HTTPS fixture port");
+                }
+                target
+            };
+            let response = tokio::time::timeout_at(until, fetcher.http.get(target).send())
                 .await
                 .map_err(|_| RemoteImageError::TimedOut)?
                 .map_err(|error| transport(&error, &host))?;

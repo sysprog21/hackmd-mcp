@@ -48,8 +48,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.PINNED_RUST }}
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test --all-targets --all-features --locked
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - run: cargo llvm-cov --all-targets --all-features --locked --remap-path-prefix --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-${{ runner.os }}
+          path: lcov.info
+          if-no-files-found: error
       # make install is a Unix path; macOS matters most, for its GNU Make 3.81
       # and codesign. The suite stubs cargo and claude itself.
       - if: runner.os != 'Windows'
@@ -69,9 +78,51 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --check
+      - run: python3 tests/coverage.py
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-machete@0.9.1
+      - run: cargo machete
+      # Report duplicates across shipped platforms; duplicates alone do not fail CI.
+      - run: cargo tree --duplicates --all-features --target all --locked
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       # The default build compiles the non-otel observability path.
       - run: cargo clippy --all-targets --locked -- -D warnings
+
+  coverage:
+    needs: test
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: coverage-*
+          path: coverage-reports
+      - name: Merge platform reports and check changed lines
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          coverage_base=""
+          if [ "$EVENT_NAME" = pull_request ]; then
+              coverage_base=$(git rev-parse HEAD^1)
+          elif [ "$PUSH_BEFORE_SHA" = 0000000000000000000000000000000000000000 ]; then
+              : # First push: no earlier floor exists.
+          elif git cat-file -e "$PUSH_BEFORE_SHA^{commit}" 2>/dev/null; then
+              coverage_base="$PUSH_BEFORE_SHA"
+          else
+              echo "The previous main commit is unavailable; cannot verify the coverage ratchet" >&2
+              exit 1
+          fi
+          if [ -n "$coverage_base" ]; then
+              python3 .ci/coverage.py coverage-reports --base "$coverage_base"
+          else
+              python3 .ci/coverage.py coverage-reports
+          fi
 
   msrv:
     # Turns the rust-version in Cargo.toml into a tested claim rather than an
@@ -202,7 +253,7 @@ jobs:
   # artifacts above are. It needs every other job, not only "build": shipping a
   # binary whose suite or audit went red is worse than shipping nothing.
   release:
-    needs: [test, lint, msrv, audit, build]
+    needs: [test, lint, coverage, msrv, audit, build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15

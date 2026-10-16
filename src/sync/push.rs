@@ -229,6 +229,9 @@ pub(crate) async fn push_note(
         }
     }
     let (remote_note, remote) = client.get_note_body(&note.workspace, &note.note_id).await?;
+    let title = remote_note.title.clone();
+    let last_changed_at = remote_note.last_changed_at;
+    drop(remote_note);
     push_resolved(
         client,
         files,
@@ -240,8 +243,8 @@ pub(crate) async fn push_note(
         note,
         Remote {
             body: remote,
-            title: remote_note.title,
-            last_changed_at: remote_note.last_changed_at,
+            title,
+            last_changed_at,
         },
         local,
     )
@@ -250,7 +253,7 @@ pub(crate) async fn push_note(
 
 /// The remote body a push is judged against, and when it last changed.
 struct Remote {
-    body: String,
+    body: std::sync::Arc<String>,
     title: String,
     last_changed_at: Option<i64>,
 }
@@ -365,7 +368,7 @@ async fn push_resolved(
             }
         }
     } else {
-        remote != local
+        remote.as_str() != local.as_str()
     };
 
     // Only the local body is needed from here on. Holding the remote and the
@@ -744,7 +747,7 @@ mod tests {
                 note_id: "note-id".to_owned(),
             },
             super::Remote {
-                body: "baseline".to_owned(),
+                body: std::sync::Arc::new("baseline".to_owned()),
                 title: "Note".to_owned(),
                 last_changed_at: None,
             },
@@ -791,7 +794,7 @@ mod tests {
                 note_id: "note-id".to_owned(),
             },
             super::Remote {
-                body: "baseline".to_owned(),
+                body: std::sync::Arc::new("baseline".to_owned()),
                 title: "Note".to_owned(),
                 last_changed_at: None,
             },

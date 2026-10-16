@@ -13,6 +13,8 @@ only command-line flags are `--self-check` with its optional `--probe-api`,
 | `HACKMD_API_URL` | no | yes, with a restriction | HTTPS API endpoint; defaults to `https://api.hackmd.io/v1`. Note URLs are parsed only for `hackmd.io`; elsewhere, pass note IDs |
 | `HACKMD_MCP_WORKSPACE_ROOT` | no, recommended | yes, with a restriction | Absolute directory that local file access is confined to |
 | `HACKMD_MCP_STATE_DIR` | no | never | Private directory for sync state |
+| `HACKMD_MCP_SNAPSHOT_TTL_SECONDS` | no | yes | Snapshot retention window in seconds; defaults to 60; zero disables |
+| `HACKMD_MCP_SNAPSHOT_MAX_BYTES` | no | yes | Snapshot byte budget including retained body and metadata; defaults to 8 MiB; zero disables |
 | `RUST_LOG` | no | no | Log filter for stderr; defaults to `info` |
 | `HACKMD_MCP_OTEL` | no | no | `1` exports spans over OTLP; needs a build with `--features otel` |
 
@@ -119,3 +121,21 @@ parse it.
 Diagnostics go to stderr as JSON lines; stdout belongs to the MCP protocol.
 Adjust verbosity with `RUST_LOG`, for example `RUST_LOG=hackmd_mcp=debug`. Most
 MCP clients save a server's stderr in their own log directory.
+
+## Note snapshots
+
+The default snapshot budget is 8 MiB. The isolated live probe on 2026-10-14
+verified that personal and team body/title edits reject their previous ETags;
+see [measured validation](development.md#measured-post-edit-validators-2026-10-14).
+
+With a nonzero budget, body reads revalidate with `If-None-Match` while an ETag-bearing snapshot is
+retained. A 304 reuses its body, title, timestamp and hash; a 200 replaces it.
+TTL bounds retention, never permission to serve stale content. Deployments
+without ETags keep full GETs. Full metadata tools also keep full GETs.
+
+The cache uses LRU eviction and shares concurrent reads of the same note.
+Note-affecting writes clear snapshots and note lists before I/O and on every
+exit, including errors and cancellation. Generations reject reads overtaken
+by a write. Successful write readbacks may seed snapshots; intermediate reads
+that do not confirm the write cannot. This saves transferred bodies, not GET
+requests, and retained bodies consume memory up to the configured budget.

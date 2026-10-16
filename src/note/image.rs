@@ -759,6 +759,231 @@ mod tests {
         fixture.finish();
     }
 
+    fn tls_response(status: u16, headers: &str, body: &[u8]) -> Vec<u8> {
+        let mut response =
+            format!("HTTP/1.1 {status} Fixture\r\n{headers}Connection: close\r\n\r\n").into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn tls_redirect(target: &str) -> Vec<u8> {
+        tls_response(
+            302,
+            &format!("Location: {target}\r\nContent-Length: 0\r\n"),
+            b"",
+        )
+    }
+
+    fn tls_image() -> Vec<u8> {
+        let body = b"GIF89a-fixture";
+        tls_response(200, &format!("Content-Length: {}\r\n", body.len()), body)
+    }
+
+    fn api_sentinel() -> SequenceServer {
+        SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/me",
+            200,
+            r#"{"id":"fixture","name":"Fixture","userPath":"fixture"}"#,
+        )])
+    }
+
+    /// The API's only expected request is a later read: any upload fails it.
+    async fn finish_without_upload(api: SequenceServer, client: &HackmdClient) {
+        client.get_me().await.expect("sentinel profile read");
+        assert_eq!(api.finish().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tls_certificate_rejection_is_not_a_retryable_network_failure() {
+        let mut tls =
+            crate::fixture::TlsServer::spawn(vec![tls_response(200, "", b"GIF89a-fixture")]);
+        let api = api_sentinel();
+        let client = tls.untrusted_client(api.client());
+        let error = upload_url(&client, "https://image.test/image.gif".to_owned(), false)
+            .await
+            .expect_err("untrusted CA");
+        assert!(
+            matches!(&error, UploadNoteImageError::Remote(RemoteImageError::Untrusted { host }) if host == "image.test"),
+            "{error:?}"
+        );
+        assert_eq!(
+            crate::reply::ToolError::kind(&error),
+            crate::reply::ErrorKind::InvalidInput
+        );
+        tls.finish();
+        finish_without_upload(api, &client).await;
+    }
+
+    #[tokio::test]
+    async fn tls_relative_and_cross_host_redirects_upload_without_leaking_auth() {
+        let tls = crate::fixture::TlsServer::spawn(vec![
+            tls_redirect("/relative"),
+            tls_redirect("https://other.test/final.gif"),
+            tls_image(),
+        ]);
+        let api = SequenceServer::spawn_scenarios([Scenario::new(
+            "POST",
+            "/v1/notes/id/images",
+            201,
+            r#"{"data":{"link":"https://unrelated.test/image.gif"}}"#,
+        )
+        .expect_header("authorization", "Bearer fixture-token")
+        .expect_body("fetched image", |body| {
+            body.contains("GIF89a-fixture")
+                && body
+                    .to_ascii_lowercase()
+                    .contains("content-type: image/gif")
+        })]);
+        let client = tls.client(api.client());
+        upload_url(&client, "https://image.test/start".to_owned(), false)
+            .await
+            .expect("TLS upload");
+        let requests = tls.finish();
+        for (request, path) in requests.iter().zip(["/start", "/relative", "/final.gif"]) {
+            assert!(
+                request.starts_with(&format!("GET {path} HTTP/1.1")),
+                "{request}"
+            );
+            assert!(
+                !request.to_ascii_lowercase().contains("authorization:"),
+                "{request}"
+            );
+            assert!(
+                !request.contains(crate::fixture::FIXTURE_TOKEN),
+                "{request}"
+            );
+        }
+        assert!(requests[2].contains("host: other.test:"), "{}", requests[2]);
+        api.finish();
+    }
+
+    #[tokio::test]
+    async fn tls_redirects_refuse_http_and_private_hosts_before_connecting() {
+        for target in [
+            "http://image.test/no",
+            "https://127.0.0.1/no",
+            "https://169.254.169.254/no",
+        ] {
+            let tls = crate::fixture::TlsServer::spawn(vec![tls_redirect(target)]);
+            let api = api_sentinel();
+            let client = tls.client(api.client());
+            let error = upload_url(&client, "https://image.test/start".to_owned(), false)
+                .await
+                .expect_err("unsafe redirect");
+            if target.starts_with("http:") {
+                assert!(
+                    matches!(
+                        error,
+                        UploadNoteImageError::Remote(RemoteImageError::RedirectRefused { .. })
+                    ),
+                    "{error:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        error,
+                        UploadNoteImageError::Remote(RemoteImageError::NotPublic { .. })
+                    ),
+                    "{error:?}"
+                );
+            }
+            tls.finish();
+            finish_without_upload(api, &client).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_five_redirects_pass_and_six_fail() {
+        for redirects in [5, 6] {
+            let mut responses = (1..=redirects)
+                .map(|hop| tls_redirect(&format!("/{hop}")))
+                .collect::<Vec<_>>();
+            let api = if redirects == 5 {
+                responses.push(tls_image());
+                SequenceServer::spawn_scenarios([Scenario::new(
+                    "POST",
+                    "/v1/notes/id/images",
+                    201,
+                    r#"{"data":{"link":"https://unrelated.test/image.gif"}}"#,
+                )])
+            } else {
+                api_sentinel()
+            };
+            let tls = crate::fixture::TlsServer::spawn(responses);
+            let client = tls.client(api.client());
+            let result = upload_url(&client, "https://image.test/0".to_owned(), false).await;
+            let requests = tls.finish();
+            assert_eq!(requests.len(), 6);
+            if redirects == 5 {
+                result.expect("five redirects pass");
+                api.finish();
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(UploadNoteImageError::Remote(
+                            RemoteImageError::TooManyRedirects
+                        ))
+                    ),
+                    "{result:?}"
+                );
+                finish_without_upload(api, &client).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_declared_and_streamed_images_over_ten_mib_never_upload() {
+        for declared in [true, false] {
+            let size = IMAGE_MAX_BYTES + 1;
+            let response = if declared {
+                tls_response(200, &format!("Content-Length: {size}\r\n"), b"")
+            } else {
+                let mut body = b"GIF89a".to_vec();
+                body.resize(usize::try_from(size).expect("size fits"), b'x');
+                tls_response(200, "", &body)
+            };
+            let tls = crate::fixture::TlsServer::spawn(vec![response]);
+            let api = api_sentinel();
+            let client = tls.client(api.client());
+            let error = upload_url(&client, "https://image.test/large.gif".to_owned(), true)
+                .await
+                .expect_err("hard size limit");
+            let expected = if declared {
+                ImageSize::Exact(size)
+            } else {
+                ImageSize::Over(IMAGE_MAX_BYTES)
+            };
+            assert!(
+                matches!(error, UploadNoteImageError::TooLarge { size } if size == expected),
+                "{error:?}"
+            );
+            tls.finish();
+            finish_without_upload(api, &client).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_non_image_body_never_uploads_even_with_an_image_content_type() {
+        let tls = crate::fixture::TlsServer::spawn(vec![tls_response(
+            200,
+            "Content-Type: image/png\r\nContent-Length: 19\r\n",
+            b"<html>secret</html>",
+        )]);
+        let api = api_sentinel();
+        let client = tls.client(api.client());
+        let error = upload_url(&client, "https://image.test/no.png".to_owned(), false)
+            .await
+            .expect_err("HTML refused");
+        assert!(
+            matches!(error, UploadNoteImageError::UnsupportedFormat),
+            "{error:?}"
+        );
+        tls.finish();
+        finish_without_upload(api, &client).await;
+    }
+
     /// A URL that could never be fetched is refused before the note is
     /// resolved. Resolving this `@owner/slug` reference would need the
     /// network, and this client has no token, so any other error would mean
