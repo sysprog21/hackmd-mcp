@@ -114,12 +114,26 @@ jobs:
               : # First push: no earlier floor exists.
           elif git cat-file -e "$PUSH_BEFORE_SHA^{commit}" 2>/dev/null; then
               coverage_base="$PUSH_BEFORE_SHA"
+          elif tag=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null); then
+              # A force-push dropped the previous commit: compare against the
+              # last release before this commit, which the ratchet already held
+              # at. HEAD's own tag would compare the push with itself.
+              echo "::warning::The previous main commit is unavailable; comparing coverage against $tag"
+              coverage_base=$(git rev-parse "$tag^{commit}")
           else
               echo "The previous main commit is unavailable; cannot verify the coverage ratchet" >&2
               exit 1
           fi
           if [ -n "$coverage_base" ]; then
-              python3 .ci/coverage.py coverage-reports --base "$coverage_base"
+              # The gate that judges a change is the one it is compared against,
+              # so a change cannot loosen its own check. A change to the gate
+              # takes effect from the next one.
+              gate=.ci/coverage.py
+              if git cat-file -e "$coverage_base:.ci/coverage.py" 2>/dev/null; then
+                  gate="$RUNNER_TEMP/coverage.py"
+                  git show "$coverage_base:.ci/coverage.py" > "$gate"
+              fi
+              python3 "$gate" coverage-reports --base "$coverage_base"
           else
               python3 .ci/coverage.py coverage-reports
           fi

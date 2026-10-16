@@ -54,6 +54,13 @@ mod tests {
         source = "#[cfg(test)]\nfn helper() -> Result<A,\n B> { fake(); }\nfn live() { recover(); }\n"
         self.assertEqual(GATE.excluded_lines(source), {1, 2, 3})
 
+    def test_a_test_match_arm_does_not_hide_the_arms_after_it(self):
+        for arm in ["0 => 9,", "y if y >= 1 => 9,", "y if y < 1 => 9,", "y if y <= 1 => 9,"]:
+            source = f"match x {{\n    #[cfg(test)]\n    {arm}\n    1 => live(),\n    _ => {{ recover() }}\n}}\n"
+            self.assertEqual(GATE.excluded_lines(source), {2, 3}, arm)
+        with self.assertRaisesRegex(ValueError, "cannot find the end"):
+            GATE.excluded_lines("#[cfg(test)]\nfield: A>,\nfn live() { recover(); }\n")
+
     def test_merge_preserves_uncovered_platform_and_error_lines(self):
         with tempfile.TemporaryDirectory() as temp:
             paths = []
@@ -91,6 +98,11 @@ mod tests {
 '''
         self.assertEqual(GATE.changed_lines(diff), {("src/a.rs", 1), ("src/a.rs", 2), ("src/b.rs", 1)})
 
+    def test_diff_names_with_spaces_are_read_and_quoted_names_refused(self):
+        self.assertEqual(GATE.changed_lines("+++ b/src/x y.rs\t\n@@ -0,0 +1 @@\n"), {("src/x y.rs", 1)})
+        with self.assertRaisesRegex(ValueError, "cannot read the changed file"):
+            GATE.changed_lines('+++ "b/src/q\\"x.rs"\n@@ -0,0 +1 @@\n')
+
     def test_floor_cannot_drop_or_round_an_uncovered_change_up(self):
         GATE.check_floor(80, 80, 4, 5)
         GATE.check_floor(90, 80, 0, 0)
@@ -101,30 +113,53 @@ mod tests {
         with self.assertRaises(ValueError):
             GATE.read_floor("101")
 
+    def repository(self, root):
+        """A git repository under `root` holding `src/a.rs` and a floor of 80, and a
+        runner for the gate against its first commit, both blind to the caller's
+        git config so signing or hooks there cannot break or prompt."""
+        env = {key: value for key, value in os.environ.items() if key != "GITHUB_STEP_SUMMARY"}
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        (root / "src").mkdir()
+        (root / ".ci").mkdir()
+        (root / "src/a.rs").write_text("fn f() { recover(); }\n")
+        (root / GATE.FLOOR).write_text("80\n")
+        def git(*args):
+            return subprocess.check_output(["git", *args], cwd=root, text=True, env=env).strip()
+        def commit(message):
+            git("add", "-A")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-qm", message)
+        git("init", "-q")
+        commit("base")
+        base = git("rev-parse", "HEAD")
+        def run():
+            return subprocess.run(["python3", str(ROOT / ".ci/coverage.py"), "reports", "--base", base],
+                                  cwd=root, capture_output=True, text=True, env=env)
+        return git, commit, run
+
+    def reports(self, root, path, hits):
+        for platform in GATE.PLATFORMS:
+            directory = root / "reports" / f"coverage-{platform}"
+            directory.mkdir(parents=True)
+            (directory / "lcov.info").write_text(f"SF:{path}\nDA:1,{hits}\nend_of_record\n")
+
+    def test_cli_counts_only_the_lines_a_move_edits(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            git, commit, run = self.repository(root)
+            git("mv", "src/a.rs", "src/b.rs")
+            commit("move")
+            self.reports(root, "src/b.rs", 0)
+            result = run()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Changed source lines: 0/0", result.stdout)
+
     def test_cli_requires_all_platforms_and_blocks_floor_removal(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            (root / "src").mkdir()
-            (root / ".ci").mkdir()
-            (root / "src/a.rs").write_text("fn f() { recover(); }\n")
-            (root / GATE.FLOOR).write_text("80\n")
-            def git(*args):
-                return subprocess.check_output(["git", *args], cwd=root, text=True).strip()
-            git("init", "-q")
-            git("add", ".")
-            git("-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-qm", "base")
-            base = git("rev-parse", "HEAD")
+            git, commit, run = self.repository(root)
             (root / GATE.FLOOR).unlink()
-            git("add", "-u")
-            git("-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "-qm", "remove floor")
-            for platform in GATE.PLATFORMS:
-                directory = root / "reports" / f"coverage-{platform}"
-                directory.mkdir(parents=True)
-                (directory / "lcov.info").write_text("SF:src/a.rs\nDA:1,1\nend_of_record\n")
-            def run():
-                return subprocess.run(["python3", str(ROOT / ".ci/coverage.py"), "reports", "--base", base],
-                                      cwd=root, capture_output=True, text=True,
-                                      env={key: value for key, value in os.environ.items() if key != "GITHUB_STEP_SUMMARY"})
+            commit("remove floor")
+            self.reports(root, "src/a.rs", 1)
             result = run()
             self.assertEqual(result.returncode, 1)
             self.assertIn("cannot be removed", result.stderr)

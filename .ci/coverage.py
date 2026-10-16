@@ -51,7 +51,7 @@ def excluded_lines(source):
             continue
         # A cfg(test) item can be a module, helper method, field or local block.
         braces = parens = brackets = angles = 0
-        block = False
+        block = arm = False
         while i < len(lines):
             line = lines[i]
             excluded.add(i + 1)
@@ -59,16 +59,23 @@ def excluded_lines(source):
             braces += line.count("{") - line.count("}")
             parens += line.count("(") - line.count(")")
             brackets += line.count("[") - line.count("]")
-            types = line.replace("->", "")
+            types = line.replace("->", "").replace("=>", "")
             angles += types.count("<") - types.count(">")
             block |= "{" in line
+            # A match arm ends at its comma; its guard may compare with < or >.
+            arm |= "=>" in line
             if block and braces == 0:
                 break
-            if not block and parens == brackets == 0 and (
-                line.rstrip().endswith(";")
-                or angles == 0 and line.rstrip().endswith(",")
-            ):
-                break
+            if not block and parens == brackets == 0:
+                if line.rstrip().endswith(";"):
+                    break
+                if line.rstrip().endswith(","):
+                    # A comparison reads as a closing angle; guessing where the
+                    # item ends could hide the production lines after it.
+                    if arm or angles == 0:
+                        break
+                    if angles < 0:
+                        raise ValueError(f"cannot find the end of the cfg(test) item at line {start + 1}")
     return excluded
 
 
@@ -110,9 +117,12 @@ def changed_lines(diff):
     name = None
     for row in diff.splitlines():
         if row.startswith("+++ b/"):
-            name = row[6:]
-        elif row.startswith("+++ "):
+            # git ends the name with a tab when it contains a space.
+            name = row[6:].removesuffix("\t")
+        elif row == "+++ /dev/null":
             name = None
+        elif row.startswith("+++ "):
+            raise ValueError(f"cannot read the changed file from {row!r}")
         elif name and (match := re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", row)):
             start = int(match[1])
             count = int(match[2]) if match[2] is not None else 1
@@ -156,7 +166,11 @@ def main():
         # Pass a full SHA, never an option or a revision supplied by a PR file.
         if not re.fullmatch(r"[0-9a-f]{40}", args.base):
             raise ValueError("base must be a full commit SHA")
-        diff = git("-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--unified=0", args.base, "HEAD", "--", "src")
+        # A move counts only the lines it edits; prefixes and color are pinned
+        # so local git config cannot make the parser miss every file.
+        diff = git("-c", "core.quotePath=false", "diff", "--no-ext-diff", "--no-textconv", "--no-color",
+                   "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", "--unified=0",
+                   args.base, "HEAD", "--", "src")
         measured = changed_lines(diff) & coverage.keys()
         covered = sum(coverage[line] for line in measured)
         summary += f"Changed source lines: {covered}/{len(measured)}; floor: {floor}%\n"
