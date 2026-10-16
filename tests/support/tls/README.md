@@ -10,10 +10,14 @@ store, and keeps certificate/hostname verification enabled. Other redirect
 hosts still pass through the normal public-address check.
 
 To regenerate them, for a new name or after expiry, run this from this
-directory; it mints a new CA, since the old CA key is gone, and deletes the CA
-key afterwards (checked against `cargo test --lib tls` and `image`):
+directory; it mints a new CA, since the old CA key is gone, stops at the first
+failure, and deletes the CA key and other temporaries however it exits
+(checked against `cargo test --lib tls` and `image`):
 
 ```sh
+(
+set -eu
+trap 'rm -f ca.key server.key server.csr server.ext' EXIT
 openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -days 36500 \
     -subj '/CN=HackMD fixture CA' \
     -addext 'basicConstraints=critical,CA:TRUE' \
@@ -25,5 +29,5 @@ printf '%s\n' 'basicConstraints=CA:FALSE' \
 openssl x509 -req -in server.csr -CA root.der -CAform der -CAkey ca.key -days 36500 \
     -extfile server.ext -outform der -out cert.der
 openssl pkcs8 -topk8 -nocrypt -in server.key -outform der -out key.der
-rm ca.key server.key server.csr server.ext
+)
 ```
