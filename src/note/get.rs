@@ -38,6 +38,16 @@ pub(crate) struct GetNoteInput {
     /// `in_sync`, `local_changed`, `remote_changed`, or `conflict`, with the
     /// SHA-256 of each body.
     pub(crate) local_path: Option<PathBuf>,
+    /// `false` leaves the body out of the result and keeps everything else,
+    /// `body_hash` included, for a caller that wants only the metadata or the
+    /// hash of many notes. `HackMD` still sends the whole note; this only
+    /// keeps the body out of the agent's context.
+    #[serde(default = "include_content_default")]
+    pub(crate) include_content: bool,
+}
+
+const fn include_content_default() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -87,7 +97,9 @@ pub(crate) struct NoteDetail {
 pub(crate) enum GetNoteError {
     #[error("give either note_ref or local_path")]
     NoteRefOrLocalPath,
-    #[error("local_path is looked up in the local sync records; omit team_path and refresh")]
+    #[error(
+        "local_path is looked up in the local sync records; omit team_path, refresh, and include_content"
+    )]
     SyncFilters,
     #[error(transparent)]
     Reference(#[from] NoteRefError),
@@ -128,7 +140,7 @@ pub(crate) async fn get_note(
         (None, Some(local_path)) => {
             // The record names the note, so a team or a cache bypass here would
             // only look like it mattered.
-            if input.workspace != Workspace::Personal || input.refresh {
+            if input.workspace != Workspace::Personal || input.refresh || !input.include_content {
                 return Err(GetNoteError::SyncFilters);
             }
             let sync = check_note_sync(client, files, &local_path).await?;
@@ -143,7 +155,10 @@ pub(crate) async fn get_note(
         return Ok(Err(resolution));
     };
     let response = client.get_note(&note.workspace, &note.note_id).await?;
-    let detail = crate::local::offload(|| normalize_note(client.site_url(), note, response));
+    let mut detail = crate::local::offload(|| normalize_note(client.site_url(), note, response));
+    if !input.include_content {
+        detail.content = None;
+    }
     Ok(Ok(GetNoteOutput::Note(Box::new(detail))))
 }
 
@@ -301,6 +316,7 @@ mod tests {
                 note_ref: Some("internal-id".to_owned()),
                 refresh: false,
                 local_path: None,
+                include_content: true,
             },
         )
         .await
@@ -310,6 +326,35 @@ mod tests {
             panic!("a note_ref should return the note");
         };
         assert_eq!(output.id, "internal-id");
+        fixture.finish();
+    }
+
+    /// Without the body the result still carries the hash of the body as read,
+    /// so a caller can check many notes for changes without holding them.
+    #[tokio::test]
+    async fn without_content_the_body_hash_stays() {
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/internal-id",
+            200,
+            r#"{"id":"internal-id","title":"T","content":"body","readPermission":"guest"}"#,
+        )]);
+        let input = serde_json::from_value(json!({
+            "note_ref": "internal-id",
+            "include_content": false
+        }))
+        .expect("input should deserialize");
+        let output = super::get_note(&fixture.client(), &crate::fixture::scratch_files(), input)
+            .await
+            .expect("get should succeed")
+            .expect("reference should resolve");
+        let super::GetNoteOutput::Note(output) = output else {
+            panic!("a note_ref should return the note");
+        };
+        let value = serde_json::to_value(&output).expect("detail should serialize");
+        assert!(value.get("content").is_none());
+        assert_eq!(value["body_hash"], crate::hash::body_hash("body"));
+        assert_eq!(value["read_permission"], "guest");
         fixture.finish();
     }
 
@@ -343,6 +388,7 @@ mod tests {
                 note_ref: Some("https://hackmd.io/@alice/slug".to_owned()),
                 refresh: false,
                 local_path: None,
+                include_content: true,
             },
         )
         .await
@@ -374,6 +420,7 @@ mod tests {
         for input in [
             serde_json::json!({"local_path": "/tmp/note.md", "refresh": true}),
             serde_json::json!({"local_path": "/tmp/note.md", "team_path": "core"}),
+            serde_json::json!({"local_path": "/tmp/note.md", "include_content": false}),
         ] {
             let input: GetNoteInput =
                 serde_json::from_value(input).expect("input should deserialize");

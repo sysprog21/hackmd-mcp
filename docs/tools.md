@@ -41,6 +41,11 @@ The safe edit is a patch:
    headed with that exact `patch_path`, and passes `body_hash` back as
    `expected_hash`.
 
+To check many notes for changes, or read their permissions, without holding
+their bodies, pass `include_content: false` to `hackmd_get_note`: the result
+keeps `body_hash` and every other field. HackMD still sends the whole note, so
+this saves context, not requests.
+
 ```text
 *** Begin Patch
 *** Update File: notes/<id>.md
