@@ -328,9 +328,15 @@ async fn personal_crud_folder_order_trash_and_restore() {
             Some(&json!({"content": edited})),
         )
         .await;
-        api.poll_json(&["notes", &note_id], |note| note["content"] == edited)
-            .await
-            .expect("resending the same body must leave it in place");
+        // The body already reads `edited`, so waiting for that proves nothing.
+        // Watch the whole read-back window for anything else instead.
+        let changed = api
+            .poll_json(&["notes", &note_id], |note| note["content"] != edited)
+            .await;
+        assert!(
+            changed.is_none(),
+            "resending the same body changed it: {changed:?}"
+        );
 
         // The title read-back and title_drift ignore runs of whitespace, since
         // whether HackMD collapses them is unmeasured. The body is sent too, as
