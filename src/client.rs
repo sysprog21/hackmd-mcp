@@ -248,12 +248,47 @@ impl HackmdClient {
         note_id: &str,
         body: &str,
     ) -> Result<NoteResponse, HackmdError> {
-        self.update_note(workspace, note_id, &UpdateNoteRequest::new(body))
-            .await?;
-        self.confirm_note_write(workspace, note_id, body.len(), |note| {
+        let sent = self
+            .update_note(workspace, note_id, &UpdateNoteRequest::new(body))
+            .await;
+        self.confirm_sent_note_write(sent, workspace, note_id, body.len(), |note| {
             note.content.as_deref() == Some(body)
         })
         .await
+    }
+
+    /// `confirm_note_write` for the outcome of a note PATCH. A PATCH whose
+    /// outcome is unknown (a 5xx, a timeout, a dropped connection) gets the
+    /// same read-back: a read that shows the note as sent settles it, so the
+    /// caller is not left to look for itself. A read that does not keeps the
+    /// original `WriteUnconfirmed`, since the write may still land; it is
+    /// never sent again from here.
+    pub(crate) async fn confirm_sent_note_write(
+        &self,
+        sent: Result<(), HackmdError>,
+        workspace: &Workspace,
+        note_id: &str,
+        written_bytes: usize,
+        accepted: impl Fn(&NoteResponse) -> bool,
+    ) -> Result<NoteResponse, HackmdError> {
+        match sent {
+            Ok(()) => {
+                self.confirm_note_write(workspace, note_id, written_bytes, accepted)
+                    .await
+            }
+            Err(unconfirmed @ HackmdError::WriteUnconfirmed { .. }) => match self
+                .poll_readback(
+                    written_bytes,
+                    || self.get_note(workspace, note_id),
+                    accepted,
+                )
+                .await
+            {
+                Ok(readback) if readback.confirmed => Ok(readback.value),
+                _ => Err(unconfirmed),
+            },
+            Err(error) => Err(error),
+        }
     }
 
     /// Reads a just-written note until `accepted` holds, returning that read.

@@ -99,7 +99,11 @@ are read back the same way; deletions, restores, folder creation, and image
 uploads are reported as HackMD acknowledged them. A write that may or may not
 have landed (the connection dropped, HackMD answered 5xx, or it answered
 success with a reply that could not be read) is reported as unconfirmed with
-kind `readback`, and the agent is told to look rather than retry. Image uploads
+kind `readback`, and the agent is told to look rather than retry. A note
+update, patch, or push looks first: it gets the same read-back as a write that
+succeeded, and a read showing the note as sent makes the call succeed. Only
+when no read shows it within the window is it reported unconfirmed, since the
+write may still land. The PATCH is never sent a second time. Image uploads
 are the exception: nothing can look for an uploaded image, and a second upload
 only leaves an unused copy, so an unreadable reply there is `upstream`.
 

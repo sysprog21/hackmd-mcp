@@ -577,23 +577,30 @@ pub(crate) async fn update_note(
         permalink: input.permalink,
         parent_folder_id: input.parent_folder_id.into_request(),
     };
-    client
+    let sent = client
         .update_note(&note.workspace, &note.note_id, &payload)
-        .await?;
+        .await;
 
     // A body replacement is compared, and only it is kept alive for the
     // read-back; a resent body is not, since an edit can land after the PATCH.
-    // The metadata sent is compared too (see `shows_metadata`).
+    // The metadata sent is compared too (see `shows_metadata`). A PATCH whose
+    // outcome is unknown is settled by the same read-back.
     let written_bytes = payload.content.len();
     let body = std::mem::take(&mut payload.content);
     let expected = replacing.then_some(body);
     let written = client
-        .confirm_note_write(&note.workspace, &note.note_id, written_bytes, |readback| {
-            shows_metadata(&payload, readback)
-                && expected
-                    .as_deref()
-                    .is_none_or(|body| readback.content.as_deref() == Some(body))
-        })
+        .confirm_sent_note_write(
+            sent,
+            &note.workspace,
+            &note.note_id,
+            written_bytes,
+            |readback| {
+                shows_metadata(&payload, readback)
+                    && expected
+                        .as_deref()
+                        .is_none_or(|body| readback.content.as_deref() == Some(body))
+            },
+        )
         .await?;
 
     // Judged from the read being returned, like create's flag, so it can never
@@ -1218,6 +1225,70 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "HackMD accepted the update for note note-id, but no read-back showed it; call hackmd_get_note and compare before writing again"
+        );
+    }
+
+    /// A gateway can fail a PATCH that `HackMD` applied. The read-back the
+    /// update makes anyway settles it, rather than leaving the caller to look.
+    #[tokio::test]
+    async fn a_failed_patch_the_read_back_shows_is_confirmed() {
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new("PATCH", "/v1/notes/note-id", 502, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"New","content":"new"}"#,
+            ),
+        ]);
+        let input = serde_json::from_value(json!({
+            "note_ref": "note-id",
+            "title": "New",
+            "content": "new"
+        }))
+        .expect("update input should deserialize");
+        let Ok(super::UpdateNoteOutput::Updated { note, .. }) =
+            update_note(&fixture.client(), input)
+                .await
+                .expect("a write the read-back shows should succeed")
+        else {
+            panic!("a content update should update the note");
+        };
+        assert_eq!(note.title, "New");
+        assert_eq!(fixture.finish().len(), 2, "the PATCH is never sent twice");
+    }
+
+    /// A read that does not show the write keeps the original error: the write
+    /// may still land, so the caller must look before sending it again.
+    #[tokio::test]
+    async fn a_failed_patch_the_read_back_does_not_show_stays_unconfirmed() {
+        let fixture = SequenceServer::spawn_repeating([
+            (502, ""),
+            (200, r#"{"id":"note-id","title":"T","content":"old"}"#),
+        ]);
+        let input = serde_json::from_value(json!({
+            "note_ref": "note-id",
+            "content": "new"
+        }))
+        .expect("update input should deserialize");
+        let error = update_note(&fixture.client(), input)
+            .await
+            .expect_err("an unconfirmed write should fail");
+        assert!(
+            matches!(
+                error,
+                CrudError::Api(crate::client::HackmdError::WriteUnconfirmed { .. })
+            ),
+            "{error}"
+        );
+        let requests = fixture.finish();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("PATCH"))
+                .count(),
+            1,
+            "the PATCH is never sent twice"
         );
     }
 
