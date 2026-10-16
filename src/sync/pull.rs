@@ -157,7 +157,10 @@ pub(crate) async fn pull_note(
     // Held from the fetch until the record is saved: a push finishing in
     // between would otherwise be overwritten by this older body.
     let _sync = files.sync_lock().await;
-    let (remote, body) = client.get_note_body(&note.workspace, &note.note_id).await?;
+    let remote = client
+        .get_note_snapshot(&note.workspace, &note.note_id)
+        .await?;
+    let body = std::sync::Arc::clone(&remote.content);
     let size_bytes = body.len();
     check_body_size("remote body", size_bytes, input.confirm_large_file)?;
 

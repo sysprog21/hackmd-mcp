@@ -136,18 +136,25 @@ impl Config {
             return Err(ConfigError::RelativeWorkspaceRoot);
         }
 
+        let api_url = Url::parse(&api_url).map_err(ConfigError::InvalidApiUrl)?;
+        validate_api_url(&api_url, policy)?;
         let snapshot_ttl = Duration::from_secs(config_number(
             get("HACKMD_MCP_SNAPSHOT_TTL_SECONDS"),
             "HACKMD_MCP_SNAPSHOT_TTL_SECONDS",
             60,
         )?);
+        // Snapshots are safe only where an edit changes the ETag, measured
+        // for the public API alone. Elsewhere they stay off unless the user
+        // sets a budget.
         let snapshot_max_bytes = config_number(
             get("HACKMD_MCP_SNAPSHOT_MAX_BYTES"),
             "HACKMD_MCP_SNAPSHOT_MAX_BYTES",
-            8 * 1024 * 1024,
+            if site_url(&api_url).is_some() {
+                8 * 1024 * 1024
+            } else {
+                0
+            },
         )?;
-        let api_url = Url::parse(&api_url).map_err(ConfigError::InvalidApiUrl)?;
-        validate_api_url(&api_url, policy)?;
 
         Ok(Self {
             api_token,
@@ -542,6 +549,11 @@ mod tests {
         let defaults = config_from(&[]).unwrap();
         assert_eq!(defaults.snapshot_ttl(), Duration::from_secs(60));
         assert_eq!(defaults.snapshot_max_bytes(), 8 * 1024 * 1024);
+        let custom = [("HACKMD_API_URL", "https://hackmd.example.test/api/v1")];
+        assert_eq!(config_from(&custom).unwrap().snapshot_max_bytes(), 0);
+        let opted_in =
+            config_from(&[custom[0], ("HACKMD_MCP_SNAPSHOT_MAX_BYTES", "1024")]).unwrap();
+        assert_eq!(opted_in.snapshot_max_bytes(), 1024);
         let disabled = config_from(&[
             ("HACKMD_MCP_SNAPSHOT_TTL_SECONDS", "0"),
             ("HACKMD_MCP_SNAPSHOT_MAX_BYTES", "0"),

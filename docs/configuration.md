@@ -14,7 +14,7 @@ only command-line flags are `--self-check` with its optional `--probe-api`,
 | `HACKMD_MCP_WORKSPACE_ROOT` | no, recommended | yes, with a restriction | Absolute directory that local file access is confined to |
 | `HACKMD_MCP_STATE_DIR` | no | never | Private directory for sync state |
 | `HACKMD_MCP_SNAPSHOT_TTL_SECONDS` | no | never | Snapshot retention window in seconds; defaults to 60; zero disables |
-| `HACKMD_MCP_SNAPSHOT_MAX_BYTES` | no | never | Snapshot byte budget including retained body and metadata; defaults to 8 MiB; zero disables |
+| `HACKMD_MCP_SNAPSHOT_MAX_BYTES` | no | never | Snapshot byte budget including retained body and metadata; defaults to 8 MiB for the public API and to zero for any other `HACKMD_API_URL`; zero disables |
 | `RUST_LOG` | no | no | Log filter for stderr; defaults to `info` |
 | `HACKMD_MCP_OTEL` | no | no | `1` exports spans over OTLP; needs a build with `--features otel` |
 
@@ -130,15 +130,25 @@ MCP clients save a server's stderr in their own log directory.
 The default snapshot budget is 8 MiB. The isolated live probe on 2026-10-14
 verified that personal and team body/title edits reject their previous ETags;
 see [measured validation](development.md#measured-post-edit-validators-2026-10-14).
+That was measured on the public API only, so with any other `HACKMD_API_URL`
+snapshots stay off unless `HACKMD_MCP_SNAPSHOT_MAX_BYTES` is set: an endpoint
+whose ETag does not change with every edit could otherwise serve a body older
+than a write.
 
 With a nonzero budget, body reads revalidate with `If-None-Match` while an ETag-bearing snapshot is
 retained. A 304 reuses its body, title, timestamp and hash; a 200 replaces it.
 TTL bounds retention, never permission to serve stale content. Deployments
-without ETags keep full GETs. Full metadata tools also keep full GETs.
+without ETags keep full GETs. `hackmd_get_note` itself always sends a full GET,
+but keeps the body it read, so an edit that follows revalidates it instead of
+downloading it again.
 
 The cache uses LRU eviction and shares concurrent reads of the same note.
 Note-affecting writes clear snapshots and note lists before I/O and on every
-exit, including errors and cancellation. Generations reject reads overtaken
-by a write. Successful write readbacks may seed snapshots; intermediate reads
-that do not confirm the write cannot. This saves transferred bodies, not GET
-requests, and retained bodies consume memory up to the configured budget.
+exit, including errors and cancellation. A read already in flight then still
+answers its caller but is not kept, and a read that starts afterwards sends its
+own request. A snapshot older than a write is never served after it anyway: it
+comes back only on a 304, and an edit changes the ETag. Successful write
+readbacks and `hackmd_get_note` reads may seed snapshots; intermediate reads that do
+not confirm the write cannot. This saves transferred bodies, not GET requests,
+and retained bodies consume memory up to the configured budget, which counts
+each body, its metadata, and its fixed per-entry structures.

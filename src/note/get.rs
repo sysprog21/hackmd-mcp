@@ -142,7 +142,9 @@ pub(crate) async fn get_note(
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
-    let response = client.get_note(&note.workspace, &note.note_id).await?;
+    let response = client
+        .get_note_retained(&note.workspace, &note.note_id)
+        .await?;
     let detail = crate::local::offload(|| normalize_note(client.site_url(), note, response));
     Ok(Ok(GetNoteOutput::Note(Box::new(detail))))
 }

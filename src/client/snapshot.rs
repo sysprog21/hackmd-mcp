@@ -1,9 +1,15 @@
-//! Conditional body snapshots. A cached value is never served without a GET.
+//! Conditional body snapshots. A cached value is never served without a GET:
+//! it comes back only on a 304 to the validator stored with it, and `HackMD`'s
+//! validator changes with any edit to the note, body or title (measured by
+//! `tests/live-validators.rs`). So a snapshot can be older than a write and
+//! still never be served after it; invalidating on a write only releases
+//! memory and starts later reads afresh.
 use super::HackmdError;
 use crate::models::Workspace;
 use reqwest::header::HeaderValue;
 use std::{
     collections::HashMap,
+    mem::size_of,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -14,23 +20,34 @@ type Outcome = Result<Arc<Snapshot>, HackmdError>;
 // No private note text appears in Debug output.
 pub(crate) struct Snapshot {
     pub(crate) content: Arc<String>,
-    pub(crate) digest: [u8; 32],
+    digest: OnceLock<[u8; 32]>,
     pub(crate) title: String,
     pub(crate) last_changed_at: Option<i64>,
     pub(super) validator: Option<HeaderValue>,
 }
 
 impl Snapshot {
-    fn retained_bytes(&self) -> usize {
-        self.content
-            .capacity()
-            .saturating_add(self.title.capacity())
-            .saturating_add(
-                self.validator
-                    .as_ref()
-                    .map_or(0, |value| value.as_bytes().len()),
-            )
-            .saturating_add(std::mem::size_of::<Self>())
+    pub(crate) fn new(
+        content: String,
+        title: String,
+        last_changed_at: Option<i64>,
+        validator: Option<HeaderValue>,
+    ) -> Self {
+        Self {
+            content: Arc::new(content),
+            digest: OnceLock::new(),
+            title,
+            last_changed_at,
+            validator,
+        }
+    }
+
+    /// The body's digest, computed on first use: a body read only to be
+    /// resent never needs one.
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        *self
+            .digest
+            .get_or_init(|| crate::local::offload(|| crate::hash::body_digest(&self.content)))
     }
 }
 
@@ -47,13 +64,11 @@ struct Entry {
     snapshot: Arc<Snapshot>,
     size_bytes: usize,
     inserted: tokio::time::Instant,
-    generation: u64,
     access: u64,
 }
 
 #[derive(Debug, Default)]
 struct State {
-    generation: u64,
     clock: u64,
     bytes: usize,
     entries: HashMap<Key, Entry>,
@@ -74,6 +89,7 @@ pub(super) struct Flight {
 }
 
 impl Flight {
+    /// The fill's outcome, or `None` when it was cancelled before it had one.
     pub(super) async fn wait(&self) -> Option<Outcome> {
         loop {
             let notified = self.notify.notified();
@@ -113,37 +129,45 @@ impl NoteSnapshotCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn disabled(&self) -> bool {
+        self.max_bytes == 0 || self.ttl.is_zero()
+    }
+
+    /// Whether a body of `len` bytes could be kept, counting the entry's
+    /// fixed structures, so a caller copies one only when it would be. Only
+    /// the title, IDs, and validator are left for `store` to judge.
+    pub(super) fn accepts(&self, len: usize) -> bool {
+        !self.disabled() && len.saturating_add(FIXED_ENTRY_BYTES) <= self.max_bytes
+    }
+
     pub(super) fn begin(&self, workspace: &Workspace, id: &str) -> Lookup<'_> {
-        if self.max_bytes == 0 || self.ttl.is_zero() {
+        if self.disabled() {
             return Lookup::Disabled;
         }
         let key = (workspace.clone(), id.to_owned());
         let mut state = self.lock();
-        if let Some(flight) = state.flights.get(&key) {
-            return Lookup::Wait(Arc::clone(flight));
+        if let Some(flight) = state.flights.get(&key).map(Arc::clone) {
+            // A note read mostly by joining others' reads is still in use.
+            state.clock = state.clock.wrapping_add(1);
+            let access = state.clock;
+            if let Some(entry) = state.entries.get_mut(&key) {
+                entry.access = access;
+            }
+            return Lookup::Wait(flight);
         }
-        let generation = state.generation;
+        self.prune(&mut state);
         state.clock = state.clock.wrapping_add(1);
         let access = state.clock;
-        state
-            .entries
-            .retain(|_, entry| entry.inserted.elapsed() < self.ttl);
-        state.bytes = state.entries.values().map(|entry| entry.size_bytes).sum();
-        let previous = state
-            .entries
-            .get_mut(&key)
-            .filter(|entry| entry.generation == generation)
-            .map(|entry| {
-                entry.access = access;
-                Arc::clone(&entry.snapshot)
-            });
+        let previous = state.entries.get_mut(&key).map(|entry| {
+            entry.access = access;
+            Arc::clone(&entry.snapshot)
+        });
         let flight = Arc::new(Flight::default());
         state.flights.insert(key.clone(), Arc::clone(&flight));
         Lookup::Fill {
             guard: Fill {
                 cache: self,
                 key,
-                generation,
                 flight,
                 completed: false,
             },
@@ -151,36 +175,47 @@ impl NoteSnapshotCache {
         }
     }
 
-    pub(super) fn generation(&self) -> u64 {
-        self.lock().generation
-    }
-
-    /// Also fences fills that began before a write, including cancelled writes.
+    /// Drops every snapshot, and detaches the reads in flight: they still
+    /// answer their callers, but are not kept, and a read that starts now
+    /// sends its own request instead of joining one sent before this.
     pub(super) fn invalidate(&self) {
         let mut state = self.lock();
-        state.generation = state.generation.wrapping_add(1);
         state.entries.clear();
         state.bytes = 0;
-        for (_, flight) in state.flights.drain() {
-            flight.finish(None);
+        state.flights.clear();
+    }
+
+    /// Records a confirmed read: detaches any read of the same note still in
+    /// flight, which may have been sent before the write showed and which a
+    /// read starting after this one must not join, then keeps `snapshot` if
+    /// there is one. The detach holds when nothing is kept (no validator, a
+    /// body over the budget), since it guards correctness, not reuse.
+    pub(super) fn seed(&self, workspace: &Workspace, id: &str, snapshot: Option<Arc<Snapshot>>) {
+        let key = (workspace.clone(), id.to_owned());
+        let mut state = self.lock();
+        state.flights.remove(&key);
+        match snapshot {
+            Some(snapshot) => self.store(&mut state, key, snapshot),
+            None => {
+                if let Some(old) = state.entries.remove(&key) {
+                    state.bytes -= old.size_bytes;
+                }
+            }
         }
     }
 
-    pub(super) fn seed(
-        &self,
-        workspace: &Workspace,
-        id: &str,
-        generation: u64,
-        snapshot: Arc<Snapshot>,
-    ) {
-        let mut state = self.lock();
-        if state.generation == generation {
-            let key = (workspace.clone(), id.to_owned());
-            if let Some(flight) = state.flights.remove(&key) {
-                flight.finish(None);
+    /// Drops expired entries. Linear in the entry count, which a session's
+    /// working set keeps small.
+    fn prune(&self, state: &mut State) {
+        let mut freed = 0;
+        state.entries.retain(|_, entry| {
+            let keep = entry.inserted.elapsed() < self.ttl;
+            if !keep {
+                freed += entry.size_bytes;
             }
-            self.store(&mut state, key, snapshot);
-        }
+            keep
+        });
+        state.bytes -= freed;
     }
 
     fn store(&self, state: &mut State, key: Key, snapshot: Arc<Snapshot>) {
@@ -188,14 +223,10 @@ impl NoteSnapshotCache {
             state.bytes -= old.size_bytes;
         }
         let bytes = entry_bytes(&key, &snapshot);
-        // Charge metadata too, bounding empty notes and unusually long titles.
-        if self.max_bytes == 0
-            || self.ttl.is_zero()
-            || bytes > self.max_bytes
-            || snapshot.validator.is_none()
-        {
+        if self.disabled() || bytes > self.max_bytes || snapshot.validator.is_none() {
             return;
         }
+        self.prune(state);
         while state.bytes.saturating_add(bytes) > self.max_bytes {
             let Some(key) = state
                 .entries
@@ -217,43 +248,60 @@ impl NoteSnapshotCache {
                 snapshot,
                 size_bytes: bytes,
                 inserted: tokio::time::Instant::now(),
-                generation: state.generation,
                 access: state.clock,
             },
         );
     }
 }
 
+/// The structures every entry carries whatever its contents: both `Arc`
+/// headers, the snapshot, the body's `String`, and the map slot.
+const FIXED_ENTRY_BYTES: usize = 2 * (2 * size_of::<usize>())
+    + size_of::<Snapshot>()
+    + size_of::<String>()
+    + size_of::<(Key, Entry)>();
+
+/// What one entry holds: the body, title, and validator bytes; the snapshot
+/// and the body's `String`, each behind an `Arc` header; the key's strings;
+/// and the map slot. The map's spare slots, which hold no bodies, are not
+/// counted.
 fn entry_bytes(key: &Key, snapshot: &Snapshot) -> usize {
     let team_bytes = match &key.0 {
         Workspace::Personal => 0,
         Workspace::Team { team_path } => team_path.capacity(),
     };
     snapshot
-        .retained_bytes()
+        .content
+        .capacity()
+        .saturating_add(snapshot.title.capacity())
+        .saturating_add(
+            snapshot
+                .validator
+                .as_ref()
+                .map_or(0, |value| value.as_bytes().len()),
+        )
         .saturating_add(key.1.capacity())
         .saturating_add(team_bytes)
-        .saturating_add(std::mem::size_of::<Key>())
-        .saturating_add(std::mem::size_of::<Entry>())
+        .saturating_add(FIXED_ENTRY_BYTES)
 }
 
 pub(super) struct Fill<'a> {
     cache: &'a NoteSnapshotCache,
     key: Key,
-    generation: u64,
     flight: Arc<Flight>,
     completed: bool,
 }
 
 impl Fill<'_> {
-    pub(super) fn complete(mut self, outcome: &Outcome) -> bool {
+    /// Hands `outcome` to every waiter, and keeps it unless a write detached
+    /// this fill meanwhile.
+    pub(super) fn complete(mut self, outcome: &Outcome) {
         let mut state = self.cache.lock();
-        let current = state.generation == self.generation
-            && state
-                .flights
-                .get(&self.key)
-                .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight));
-        if current {
+        if state
+            .flights
+            .get(&self.key)
+            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+        {
             state.flights.remove(&self.key);
             if let Ok(snapshot) = outcome {
                 self.cache
@@ -262,9 +310,9 @@ impl Fill<'_> {
                 state.bytes -= old.size_bytes;
             }
         }
-        self.flight.finish(current.then(|| outcome.clone()));
+        drop(state);
+        self.flight.finish(Some(outcome.clone()));
         self.completed = true;
-        current
     }
 }
 
@@ -289,19 +337,25 @@ impl Drop for Fill<'_> {
 mod tests {
     use super::*;
     fn value(body: &str) -> Arc<Snapshot> {
-        Arc::new(Snapshot {
-            content: Arc::new(body.to_owned()),
-            digest: crate::hash::body_digest(body),
-            title: String::new(),
-            last_changed_at: Some(1),
-            validator: Some(HeaderValue::from_static("W/\"one\"")),
-        })
+        Arc::new(Snapshot::new(
+            body.to_owned(),
+            String::new(),
+            Some(1),
+            Some(HeaderValue::from_static("W/\"one\"")),
+        ))
     }
     fn fill(cache: &NoteSnapshotCache, id: &str, body: &str) {
         let Lookup::Fill { guard, .. } = cache.begin(&Workspace::Personal, id) else {
             panic!("expected fill")
         };
-        assert!(guard.complete(&Ok(value(body))));
+        guard.complete(&Ok(value(body)));
+    }
+    fn content(cache: &NoteSnapshotCache, id: &str) -> Option<String> {
+        cache
+            .lock()
+            .entries
+            .get(&(Workspace::Personal, id.into()))
+            .map(|entry| entry.snapshot.content.to_string())
     }
     #[test]
     fn byte_bound_evicts_lru_and_rejects_oversized_and_unvalidated_snapshots() {
@@ -313,27 +367,42 @@ mod tests {
             panic!("fill")
         };
         assert!(previous.is_some());
-        assert!(guard.complete(&Ok(value("body"))));
+        guard.complete(&Ok(value("body")));
         fill(&cache, "six", "body");
-        let state = cache.lock();
-        assert_eq!(state.bytes, size * 2);
-        assert!(
-            !state
-                .entries
-                .contains_key(&(Workspace::Personal, "two".into()))
-        );
-        drop(state);
+        assert_eq!(cache.lock().bytes, size * 2);
+        assert_eq!(content(&cache, "two"), None);
         fill(&cache, "one", &"x".repeat(size * 3));
-        assert!(
-            !cache
-                .lock()
-                .entries
-                .contains_key(&(Workspace::Personal, "one".into()))
-        );
+        assert_eq!(content(&cache, "one"), None);
+        assert!(!cache.accepts(size * 3));
         let mut unvalidated = value("body");
         Arc::get_mut(&mut unvalidated).unwrap().validator = None;
-        cache.seed(&Workspace::Personal, "six", cache.generation(), unvalidated);
+        cache.seed(&Workspace::Personal, "six", Some(unvalidated));
         assert!(cache.lock().entries.is_empty());
+    }
+    #[test]
+    fn accepts_counts_the_fixed_structures() {
+        let cache = NoteSnapshotCache::new(Duration::from_secs(60), FIXED_ENTRY_BYTES + 10);
+        assert!(cache.accepts(10));
+        assert!(!cache.accepts(11));
+    }
+    #[test]
+    fn a_note_read_by_joining_stays_recent() {
+        let size = entry_bytes(&(Workspace::Personal, "aaa".into()), &value("body"));
+        let cache = NoteSnapshotCache::new(Duration::from_secs(60), size * 2);
+        fill(&cache, "aaa", "body");
+        let Lookup::Fill { guard, .. } = cache.begin(&Workspace::Personal, "aaa") else {
+            panic!("fill")
+        };
+        fill(&cache, "bbb", "body");
+        // Joining the read in flight is a use of "aaa", newer than "bbb".
+        assert!(matches!(
+            cache.begin(&Workspace::Personal, "aaa"),
+            Lookup::Wait(_)
+        ));
+        fill(&cache, "ccc", "body");
+        assert_eq!(content(&cache, "bbb"), None);
+        assert!(content(&cache, "aaa").is_some());
+        drop(guard);
     }
     #[test]
     fn disabled_cache_never_fills_or_seeds() {
@@ -343,19 +412,14 @@ mod tests {
                 cache.begin(&Workspace::Personal, "id"),
                 Lookup::Disabled
             ));
-            cache.seed(
-                &Workspace::Personal,
-                "id",
-                cache.generation(),
-                value("body"),
-            );
+            assert!(!cache.accepts(1));
+            cache.seed(&Workspace::Personal, "id", Some(value("body")));
             assert!(cache.lock().entries.is_empty());
         }
     }
     #[tokio::test]
-    async fn invalidation_fences_fill_seed_and_waiters() {
+    async fn a_detached_fill_answers_its_waiters_but_is_not_kept() {
         let cache = NoteSnapshotCache::new(Duration::from_secs(60), 1024);
-        let generation = cache.generation();
         let Lookup::Fill { guard, .. } = cache.begin(&Workspace::Personal, "id") else {
             panic!("fill")
         };
@@ -363,45 +427,48 @@ mod tests {
             panic!("wait")
         };
         cache.invalidate();
-        assert!(waiter.wait().await.is_none());
+        // A read starting after the write sends its own request.
         let Lookup::Fill { guard: newer, .. } = cache.begin(&Workspace::Personal, "id") else {
             panic!("new fill")
         };
-        assert!(newer.complete(&Ok(value("new"))));
-        assert!(!guard.complete(&Ok(value("old"))));
-        cache.seed(&Workspace::Personal, "id", generation, value("old"));
-        assert_eq!(
-            &*cache.lock().entries[&(Workspace::Personal, "id".into())]
-                .snapshot
-                .content,
-            "new"
-        );
+        newer.complete(&Ok(value("new")));
+        guard.complete(&Ok(value("old")));
+        let answered = waiter
+            .wait()
+            .await
+            .expect("the waiter gets the fill's reply");
+        assert_eq!(answered.unwrap().content.as_str(), "old");
+        assert_eq!(content(&cache, "id").as_deref(), Some("new"));
     }
-    #[tokio::test]
-    async fn confirmed_seed_fences_an_older_fill_for_the_same_note() {
+    #[test]
+    fn a_seed_detaches_an_older_fill_of_the_same_note() {
         let cache = NoteSnapshotCache::new(Duration::from_secs(60), 1024);
         let Lookup::Fill { guard, .. } = cache.begin(&Workspace::Personal, "id") else {
             panic!("fill")
         };
-        let Lookup::Wait(waiter) = cache.begin(&Workspace::Personal, "id") else {
-            panic!("wait")
+        cache.seed(&Workspace::Personal, "id", Some(value("new")));
+        let Lookup::Fill { previous, .. } = cache.begin(&Workspace::Personal, "id") else {
+            panic!("a later read must not join the older fill")
         };
-        cache.seed(
-            &Workspace::Personal,
-            "id",
-            cache.generation(),
-            value("confirmed"),
-        );
-        assert!(waiter.wait().await.is_none());
-        assert!(!guard.complete(&Ok(value("old"))));
-        assert_eq!(
-            &*cache.lock().entries[&(Workspace::Personal, "id".into())]
-                .snapshot
-                .content,
-            "confirmed"
-        );
+        assert_eq!(previous.unwrap().content.as_str(), "new");
+        guard.complete(&Ok(value("old")));
+        assert_eq!(content(&cache, "id").as_deref(), Some("new"));
     }
-
+    #[test]
+    fn a_seed_that_keeps_nothing_still_detaches() {
+        let cache = NoteSnapshotCache::new(Duration::from_secs(60), 1024);
+        fill(&cache, "id", "old");
+        let Lookup::Fill { guard, .. } = cache.begin(&Workspace::Personal, "id") else {
+            panic!("fill")
+        };
+        // A confirmed body too large to keep, or with no validator.
+        cache.seed(&Workspace::Personal, "id", None);
+        let Lookup::Fill { previous, .. } = cache.begin(&Workspace::Personal, "id") else {
+            panic!("a later read must not join the older fill")
+        };
+        assert!(previous.is_none(), "the older snapshot is gone too");
+        drop(guard);
+    }
     #[tokio::test]
     async fn cancellation_wakes_waiters_and_does_not_remove_a_newer_flight() {
         let cache = NoteSnapshotCache::new(Duration::from_secs(60), 1024);
@@ -425,7 +492,8 @@ mod tests {
             cache.begin(&Workspace::Personal, "id"),
             Lookup::Wait(_)
         ));
-        assert!(newer.complete(&Ok(value("new"))));
+        newer.complete(&Ok(value("new")));
+        assert_eq!(content(&cache, "id").as_deref(), Some("new"));
     }
     #[tokio::test]
     async fn expiry_prevents_conditionals_and_workspaces_do_not_share_entries() {
@@ -446,5 +514,9 @@ mod tests {
         assert!(previous.is_none());
         assert_eq!(cache.lock().bytes, 0);
         drop(guard);
+    }
+    #[test]
+    fn the_digest_is_the_body_digest() {
+        assert_eq!(value("body").digest(), crate::hash::body_digest("body"));
     }
 }

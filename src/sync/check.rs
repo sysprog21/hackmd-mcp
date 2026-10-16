@@ -69,7 +69,7 @@ pub(crate) async fn check_note_sync(
         .get_note_snapshot(&tracked.state.workspace, &tracked.state.internal_id)
         .await?;
     let (local_digest, remote_digest) =
-        crate::local::offload(|| (body_digest(&local), remote_note.digest));
+        crate::local::offload(|| (body_digest(&local), remote_note.digest()));
 
     // Converged sides are in sync, as push agrees, and the next push moves the
     // baseline there.
