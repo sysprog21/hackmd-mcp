@@ -133,11 +133,12 @@ impl NoteSnapshotCache {
         self.max_bytes == 0 || self.ttl.is_zero()
     }
 
-    /// Whether a body of `len` bytes could be kept, counting the entry's
-    /// fixed structures, so a caller copies one only when it would be. Only
-    /// the title, IDs, and validator are left for `store` to judge.
-    pub(super) fn accepts(&self, len: usize) -> bool {
-        !self.disabled() && len.saturating_add(FIXED_ENTRY_BYTES) <= self.max_bytes
+    /// Whether an entry whose body and stored strings (title, IDs,
+    /// validator) total `bytes` could be kept, counting its fixed structures
+    /// too, so a caller copies a body only when it would be. `store` still
+    /// judges the exact capacities.
+    pub(super) fn accepts(&self, bytes: usize) -> bool {
+        !self.disabled() && bytes.saturating_add(FIXED_ENTRY_BYTES) <= self.max_bytes
     }
 
     pub(super) fn begin(&self, workspace: &Workspace, id: &str) -> Lookup<'_> {

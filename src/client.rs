@@ -209,12 +209,18 @@ impl HackmdClient {
 
     /// `get_note` for `hackmd_get_note`. Its body is kept as a snapshot, so
     /// the edit that usually follows can revalidate it instead of downloading
-    /// it again.
+    /// it again. The read registers as one in flight, so a write landing
+    /// before it answers detaches it, as it does any read, and it is not kept.
     pub(crate) async fn get_note_retained(
         &self,
         workspace: &Workspace,
         note_id: &str,
     ) -> Result<NoteResponse, HackmdError> {
+        // Another read already in flight is left to fill the snapshot.
+        let fill = match self.snapshots.begin(workspace, note_id) {
+            snapshot::Lookup::Fill { guard, .. } => Some(guard),
+            snapshot::Lookup::Wait(_) | snapshot::Lookup::Disabled => None,
+        };
         let reply = self
             .send(
                 Method::GET,
@@ -229,7 +235,12 @@ impl HackmdClient {
         let note: NoteResponse = reply
             .json()?
             .ok_or_else(|| HackmdError::unreadable_reply(method, path, None))?;
-        self.seed_snapshot(workspace, note_id, validator, &note);
+        // A fill dropped without completing sends its waiters to read again.
+        if let (Some(fill), Some(snapshot)) =
+            (fill, self.keepable(workspace, note_id, validator, &note))
+        {
+            fill.complete(&Ok(snapshot));
+        }
         Ok(note)
     }
 
@@ -331,10 +342,38 @@ impl HackmdClient {
         )))
     }
 
-    /// Keeps the body of a note just read in full. The caller still needs
-    /// the note, so the body is copied, and only when the cache would keep it.
-    /// Seeding happens either way, so a read sent before this one is detached
-    /// even when nothing is kept.
+    /// A snapshot of a note just read in full, when the cache would keep it.
+    /// The caller still needs the note, so the body is copied, and only then;
+    /// the acceptance check counts the body and every string stored with it.
+    fn keepable(
+        &self,
+        workspace: &Workspace,
+        note_id: &str,
+        validator: Option<reqwest::header::HeaderValue>,
+        note: &NoteResponse,
+    ) -> Option<Arc<snapshot::Snapshot>> {
+        let (validator, content) = validator.zip(note.content.as_ref())?;
+        let team_bytes = match workspace {
+            Workspace::Personal => 0,
+            Workspace::Team { team_path } => team_path.len(),
+        };
+        let bytes = content.len()
+            + note.title.len()
+            + note_id.len()
+            + team_bytes
+            + validator.as_bytes().len();
+        self.snapshots.accepts(bytes).then(|| {
+            Arc::new(snapshot::Snapshot::new(
+                content.clone(),
+                note.title.clone(),
+                note.last_changed_at,
+                Some(validator),
+            ))
+        })
+    }
+
+    /// Records a confirmed read-back. Seeding happens even when nothing is
+    /// kept, so a read sent before the write showed is detached either way.
     fn seed_snapshot(
         &self,
         workspace: &Workspace,
@@ -342,17 +381,7 @@ impl HackmdClient {
         validator: Option<reqwest::header::HeaderValue>,
         note: &NoteResponse,
     ) {
-        let snapshot = validator
-            .zip(note.content.as_ref())
-            .filter(|(_, content)| self.snapshots.accepts(content.len()))
-            .map(|(validator, content)| {
-                Arc::new(snapshot::Snapshot::new(
-                    content.clone(),
-                    note.title.clone(),
-                    note.last_changed_at,
-                    Some(validator),
-                ))
-            });
+        let snapshot = self.keepable(workspace, note_id, validator, note);
         self.snapshots.seed(workspace, note_id, snapshot);
     }
 
@@ -1540,6 +1569,33 @@ mod tests {
         assert_eq!(snapshot.content.as_str(), "body");
         assert_eq!(snapshot.title, "Note");
         assert_eq!(server.finish().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_full_note_read_overtaken_by_a_write_is_not_kept() {
+        let slot = Arc::new(std::sync::OnceLock::<Arc<HackmdClient>>::new());
+        let action = Arc::clone(&slot);
+        let note = r#"{"id":"id","title":"Note","content":"old"}"#;
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/notes/id", 200, note)
+                .response_header("etag", "W/\"old\"")
+                .before_response(move || {
+                    action.get().unwrap().snapshots.invalidate();
+                }),
+            Scenario::new("GET", "/v1/notes/id", 200, note).response_header("etag", "W/\"old\""),
+        ]);
+        let client = Arc::new(snapshot_client(&server));
+        slot.set(Arc::clone(&client)).unwrap();
+        client
+            .get_note_retained(&Workspace::Personal, "id")
+            .await
+            .unwrap();
+        client
+            .get_note_snapshot(&Workspace::Personal, "id")
+            .await
+            .unwrap();
+        let requests = server.finish();
+        assert!(!requests[1].to_ascii_lowercase().contains("if-none-match:"));
     }
 
     #[tokio::test]
