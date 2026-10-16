@@ -45,9 +45,9 @@ only the keys listed above, and it treats the file as untrusted, because a
   token to a host of its author's choosing. Set both in the same place.
 - `HACKMD_MCP_STATE_DIR` is ignored in `.env`. That directory holds full note
   bodies, and a stranger's `.env` must not be able to redirect them.
-- The two snapshot limits are ignored in `.env`: they bound how much memory
-  retained note bodies may use, and a stranger's file must not raise that
-  bound.
+- The two snapshot limits are ignored in `.env`: they bound how long retained
+  note bodies stay in memory and how much memory they may use, and a
+  stranger's file must not lengthen the one or raise the other.
 - A `HACKMD_MCP_WORKSPACE_ROOT` from `.env` still confines, but counts as
   untrusted; see [Workspace root](#workspace-root) for what that changes.
 
@@ -146,8 +146,9 @@ The cache uses LRU eviction and shares concurrent reads of the same note.
 Note-affecting writes clear snapshots and note lists before I/O and on every
 exit, including errors and cancellation. A read already in flight then still
 answers its caller but is not kept, and a read that starts afterwards sends its
-own request. A snapshot older than a write is never served after it anyway: it
-comes back only on a 304, and an edit changes the ETag. Successful write
+own request. On the public API a snapshot older than a write is never served
+after it anyway: it comes back only on a 304, and an edit changes the ETag
+there. Elsewhere that holds only if the endpoint's ETag does the same. Successful write
 readbacks and `hackmd_get_note` reads may seed snapshots; intermediate reads that do
 not confirm the write cannot. This saves transferred bodies, not GET requests,
 and retained bodies consume memory up to the configured budget, which counts

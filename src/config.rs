@@ -44,9 +44,10 @@ const ENV_KEYS: [(&str, Dotenv); 6] = [
     // It holds full private note bodies, which such a file could otherwise
     // have written into its own tree.
     ("HACKMD_MCP_STATE_DIR", Dotenv::EnvironmentOnly),
-    // They bound how much memory retained note bodies may use, which such a
-    // file must not raise.
+    // How long private note bodies stay in memory, which such a file must
+    // not lengthen.
     ("HACKMD_MCP_SNAPSHOT_TTL_SECONDS", Dotenv::EnvironmentOnly),
+    // How much memory they may use, which such a file must not raise.
     ("HACKMD_MCP_SNAPSHOT_MAX_BYTES", Dotenv::EnvironmentOnly),
 ];
 
