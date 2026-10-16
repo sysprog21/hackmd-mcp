@@ -235,11 +235,11 @@ impl HackmdClient {
         let note: NoteResponse = reply
             .json()?
             .ok_or_else(|| HackmdError::unreadable_reply(method, path, None))?;
-        // A fill dropped without completing sends its waiters to read again.
-        if let (Some(fill), Some(snapshot)) =
-            (fill, self.keepable(workspace, note_id, validator, &note))
-        {
-            fill.complete(&Ok(snapshot));
+        if let Some(fill) = fill {
+            match self.keepable(workspace, note_id, validator, &note) {
+                Some(snapshot) => fill.complete(&Ok(snapshot)),
+                None => fill.discard(),
+            }
         }
         Ok(note)
     }

@@ -317,6 +317,29 @@ impl Fill<'_> {
     }
 }
 
+impl Fill<'_> {
+    /// Ends the fill with nothing to keep, as when its reply was too large or
+    /// had no validator: the note's older entry goes too, since this read
+    /// showed it may be out of date, and waiters read again. A fill a write
+    /// detached leaves the entries, and any newer fill, alone.
+    pub(super) fn discard(self) {
+        let mut state = self.cache.lock();
+        let current = state
+            .flights
+            .get(&self.key)
+            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight));
+        let old = if current {
+            state.entries.remove(&self.key)
+        } else {
+            None
+        };
+        if let Some(old) = old {
+            state.bytes -= old.size_bytes;
+        }
+        // `Drop` removes the flight and wakes the waiters.
+    }
+}
+
 impl Drop for Fill<'_> {
     fn drop(&mut self) {
         if self.completed {
@@ -453,6 +476,37 @@ mod tests {
         };
         assert_eq!(previous.unwrap().content.as_str(), "new");
         guard.complete(&Ok(value("old")));
+        assert_eq!(content(&cache, "id").as_deref(), Some("new"));
+    }
+    #[tokio::test]
+    async fn a_discarded_fill_drops_the_older_entry_and_wakes_waiters() {
+        let cache = NoteSnapshotCache::new(Duration::from_secs(60), 1024);
+        fill(&cache, "id", "old");
+        let Lookup::Fill { guard, .. } = cache.begin(&Workspace::Personal, "id") else {
+            panic!("fill")
+        };
+        let Lookup::Wait(waiter) = cache.begin(&Workspace::Personal, "id") else {
+            panic!("wait")
+        };
+        guard.discard();
+        assert!(waiter.wait().await.is_none());
+        assert_eq!(content(&cache, "id"), None);
+
+        // Detached by a write, it leaves a newer fill and its entry alone.
+        fill(&cache, "id", "old");
+        let Lookup::Fill { guard, .. } = cache.begin(&Workspace::Personal, "id") else {
+            panic!("fill")
+        };
+        cache.invalidate();
+        let Lookup::Fill { guard: newer, .. } = cache.begin(&Workspace::Personal, "id") else {
+            panic!("new fill")
+        };
+        guard.discard();
+        assert!(matches!(
+            cache.begin(&Workspace::Personal, "id"),
+            Lookup::Wait(_)
+        ));
+        newer.complete(&Ok(value("new")));
         assert_eq!(content(&cache, "id").as_deref(), Some("new"));
     }
     #[test]
