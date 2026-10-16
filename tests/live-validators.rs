@@ -30,8 +30,10 @@ async fn assert_unchanged(api: &LiveApi, route: &[&str], validator: &str) {
 
 /// Saves `title` and `content`, waits until a read shows both, and checks that
 /// `old` no longer validates while the new `ETag` does. Returns the new one.
+/// `step` names the edit in failure messages.
 async fn edit_invalidates(
     api: &LiveApi,
+    step: &str,
     route: &[&str],
     old: &str,
     title: &str,
@@ -47,18 +49,20 @@ async fn edit_invalidates(
         note["title"] == title && note["content"] == content
     })
     .await
-    .expect("edit must become visible");
+    .unwrap_or_else(|| panic!("{step} edit must become visible"));
     let after = api.get(route, Some(("if-none-match", old))).await;
     assert_eq!(
         after.status,
         StatusCode::OK,
-        "old ETag must not validate an edit"
+        "old ETag must not validate a {step} edit"
     );
     let note = after.value.as_ref().expect("edited note JSON");
-    assert_eq!(note["title"], title);
-    assert_eq!(note["content"], content);
+    assert_eq!(note["title"], title, "{step} edit title");
+    assert_eq!(note["content"], content, "{step} edit content");
     let current = etag(&after);
-    assert_ne!(current, old);
+    // Stated outright rather than left to the 200 and 304 above: the snapshot
+    // cache relies on the value itself changing with every edit.
+    assert_ne!(current, old, "{step} edit must change the ETag");
     assert_unchanged(api, route, &current).await;
     current
 }
@@ -97,10 +101,25 @@ async fn probe_workspace(api: &LiveApi, team: Option<&str>, suffix: u128) {
         let before_body = etag(&first);
         assert_unchanged(api, &route, &before_body).await;
         let changed_body = format!("validator changed {suffix}\n");
-        let before_title =
-            edit_invalidates(api, &route, &before_body, &initial_title, &changed_body).await;
+        let before_title = edit_invalidates(
+            api,
+            "body",
+            &route,
+            &before_body,
+            &initial_title,
+            &changed_body,
+        )
+        .await;
         let changed_title = format!("codex-validator-renamed-{suffix}");
-        edit_invalidates(api, &route, &before_title, &changed_title, &changed_body).await;
+        edit_invalidates(
+            api,
+            "title",
+            &route,
+            &before_title,
+            &changed_title,
+            &changed_body,
+        )
+        .await;
         let workspace = if team.is_some() { "team" } else { "personal" };
         eprintln!(
             "measured validators ({workspace}): body edit old_etag_status=200; \
@@ -111,16 +130,18 @@ async fn probe_workspace(api: &LiveApi, team: Option<&str>, suffix: u128) {
     .await;
 
     // Delete only this new note; no purge request. Team trash placement is
-    // unchecked.
+    // unchecked. After a failed probe a failed cleanup is only reported, so
+    // the probe's own panic is the one that surfaces.
+    if let Err(panic) = outcome {
+        api.cleanup_delete(&route, "validator probe note").await;
+        std::panic::resume_unwind(panic);
+    }
     let deleted = api.request(Method::DELETE, &route, None).await;
     assert!(
         deleted.status.is_success(),
         "validator probe cleanup failed: {}",
         deleted.status
     );
-    if let Err(panic) = outcome {
-        std::panic::resume_unwind(panic);
-    }
 }
 
 #[tokio::test]

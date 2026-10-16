@@ -157,8 +157,8 @@ impl LiveApi {
     }
 
     /// GETs `segments` until `accepted` holds, up to ten reads a second
-    /// apart, since `HackMD` shows some writes only after a delay. `None` if
-    /// it never did.
+    /// apart, since `HackMD` shows some writes only after a delay. A 429 or
+    /// 5xx read counts as not yet. `None` if it never did.
     pub(crate) async fn poll_json(
         &self,
         segments: &[&str],
@@ -168,7 +168,20 @@ impl LiveApi {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
-            let read = self.json(Method::GET, segments, None).await;
+            let response = self.request(Method::GET, segments, None).await;
+            if response.status == StatusCode::TOO_MANY_REQUESTS || response.status.is_server_error()
+            {
+                continue;
+            }
+            assert!(
+                response.status.is_success(),
+                "live API returned {}: {:?}",
+                response.status,
+                response.value
+            );
+            let read = response
+                .value
+                .expect("live API response should contain JSON");
             if accepted(&read) {
                 return Some(read);
             }
