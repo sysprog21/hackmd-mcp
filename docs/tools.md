@@ -113,7 +113,10 @@ repository can work with:
    `body_hash`, in the same form `hackmd_get_note` and a successful push report.
    When it replaced a file it could read, `changes` is a bounded diff of what
    the pull changed in it; `title_drift` names the title the body now gives
-   when it no longer matches the listed one (see above).
+   when it no longer matches the listed one (see above). A file the pull
+   creates is private (mode 0600 on Unix, not the umask default); one it
+   replaces keeps its permissions. If another account, such as a web server,
+   must read a new file, widen it with `chmod`.
 2. You or the agent edit the file locally.
 3. `hackmd_get_note` with `local_path` reports where things stand by comparing
    the file, the baseline, and the remote note:
