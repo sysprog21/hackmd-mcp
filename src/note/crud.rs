@@ -557,7 +557,7 @@ pub(crate) async fn update_note(
         (Some(content), None) => content.into(),
         (replacement, expected) => {
             let resending = replacement.is_none();
-            current = client
+            let snapshot = client
                 .get_note_snapshot(&note.workspace, &note.note_id)
                 .await
                 .map_err(|error| match error {
@@ -566,8 +566,15 @@ pub(crate) async fn update_note(
                     }
                     other => other.into(),
                 })?;
-            ensure_unchanged(&note.note_id, || current.digest(), expected)?;
-            replacement.map_or_else(|| current.content.as_str().into(), Into::into)
+            ensure_unchanged(&note.note_id, || snapshot.digest(), expected)?;
+            // A replacement lets the read go here; only a resent body keeps it
+            // alive through the write.
+            if let Some(content) = replacement {
+                content.into()
+            } else {
+                current = snapshot;
+                current.content.as_str().into()
+            }
         }
     };
     let mut payload = UpdateNoteRequest {
