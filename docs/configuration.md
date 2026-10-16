@@ -13,8 +13,8 @@ only command-line flags are `--self-check` with its optional `--probe-api`,
 | `HACKMD_API_URL` | no | yes, with a restriction | HTTPS API endpoint; defaults to `https://api.hackmd.io/v1`. Note URLs are parsed only for `hackmd.io`; elsewhere, pass note IDs |
 | `HACKMD_MCP_WORKSPACE_ROOT` | no, recommended | yes, with a restriction | Absolute directory that local file access is confined to |
 | `HACKMD_MCP_STATE_DIR` | no | never | Private directory for sync state |
-| `HACKMD_MCP_SNAPSHOT_TTL_SECONDS` | no | yes | Snapshot retention window in seconds; defaults to 60; zero disables |
-| `HACKMD_MCP_SNAPSHOT_MAX_BYTES` | no | yes | Snapshot byte budget including retained body and metadata; defaults to 8 MiB; zero disables |
+| `HACKMD_MCP_SNAPSHOT_TTL_SECONDS` | no | never | Snapshot retention window in seconds; defaults to 60; zero disables |
+| `HACKMD_MCP_SNAPSHOT_MAX_BYTES` | no | never | Snapshot byte budget including retained body and metadata; defaults to 8 MiB; zero disables |
 | `RUST_LOG` | no | no | Log filter for stderr; defaults to `info` |
 | `HACKMD_MCP_OTEL` | no | no | `1` exports spans over OTLP; needs a build with `--features otel` |
 
@@ -45,6 +45,9 @@ only the keys listed above, and it treats the file as untrusted, because a
   token to a host of its author's choosing. Set both in the same place.
 - `HACKMD_MCP_STATE_DIR` is ignored in `.env`. That directory holds full note
   bodies, and a stranger's `.env` must not be able to redirect them.
+- The two snapshot limits are ignored in `.env` for the same reason: they bound
+  how many of those bodies stay in memory, and a stranger's file must not
+  lift that bound.
 - A `HACKMD_MCP_WORKSPACE_ROOT` from `.env` still confines, but counts as
   untrusted; see [Workspace root](#workspace-root) for what that changes.
 

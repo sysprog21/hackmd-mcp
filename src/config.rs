@@ -35,11 +35,17 @@ const SUPPORTED_ENV_KEYS: [&str; 6] = [
 /// Parsed from a working-directory `.env` but never honored there. The state
 /// directory holds full private note bodies, and a `.env` shipped in someone
 /// else's repository could otherwise have them written into its own tree.
+/// The snapshot limits bound how much of those bodies stays in memory, so
+/// such a file cannot lift that bound either.
 ///
 /// `HACKMD_MCP_WORKSPACE_ROOT` is honored from `.env`, so a user who confines
 /// the server there stays confined, but such a root is not trusted: see
 /// `Config::workspace_root_trusted`.
-const ENVIRONMENT_ONLY_KEYS: [&str; 1] = ["HACKMD_MCP_STATE_DIR"];
+const ENVIRONMENT_ONLY_KEYS: [&str; 3] = [
+    "HACKMD_MCP_STATE_DIR",
+    "HACKMD_MCP_SNAPSHOT_TTL_SECONDS",
+    "HACKMD_MCP_SNAPSHOT_MAX_BYTES",
+];
 
 /// Application configuration loaded from the local process environment.
 #[derive(Debug)]

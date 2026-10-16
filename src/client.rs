@@ -1435,7 +1435,13 @@ mod tests {
     #[ignore = "manual before/after snapshot transfer and latency workload"]
     async fn benchmark_repeated_note_snapshots() {
         let content = "# Snapshot workload\n".repeat(13_108);
-        let body=serde_json::json!({"id":"id","title":"Snapshot workload","content":content,"lastChangedAt":1}).to_string();
+        let body = serde_json::json!({
+            "id": "id",
+            "title": "Snapshot workload",
+            "content": content,
+            "lastChangedAt": 1
+        })
+        .to_string();
         for capacity in [0, 8 * 1024 * 1024] {
             let scenarios: [Scenario; 8] = std::array::from_fn(|index| {
                 if capacity == 0 || index == 0 {
@@ -1468,7 +1474,8 @@ mod tests {
                 .filter(|request| !request.to_ascii_lowercase().contains("if-none-match:"))
                 .count();
             eprintln!(
-                "snapshot benchmark: capacity={capacity} markdown_bytes={} requests={} full_responses={full} body_bytes={} elapsed_us={}",
+                "snapshot benchmark: capacity={capacity} markdown_bytes={} requests={} \
+                 full_responses={full} body_bytes={} elapsed_us={}",
                 content.len(),
                 requests.len(),
                 full * body.len(),

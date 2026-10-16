@@ -19,6 +19,8 @@ fn server() -> Command {
         .env_remove("HACKMD_API_URL")
         .env_remove("HACKMD_MCP_STATE_DIR")
         .env_remove("HACKMD_MCP_WORKSPACE_ROOT")
+        .env_remove("HACKMD_MCP_SNAPSHOT_TTL_SECONDS")
+        .env_remove("HACKMD_MCP_SNAPSHOT_MAX_BYTES")
         .env_remove("HACKMD_MCP_OTEL")
         .env_remove("RUST_LOG");
     command
@@ -240,6 +242,30 @@ fn a_dotenv_workspace_root_confines_but_is_not_trusted() {
     assert!(stderr.contains(
         "HACKMD_MCP_WORKSPACE_ROOT comes from the working-directory .env, not the environment"
     ));
+}
+
+#[test]
+fn dotenv_cannot_lift_the_snapshot_limits() {
+    // Unparseable values would refuse startup if either key were honored, so a
+    // server that starts and warns proves both were dropped.
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    fs::write(
+        directory.path().join(".env"),
+        "HACKMD_MCP_SNAPSHOT_TTL_SECONDS=forever\nHACKMD_MCP_SNAPSHOT_MAX_BYTES=unbounded\n",
+    )
+    .expect("dotenv fixture should be written");
+
+    let output = assert_waiting_then_stop(spawn_server(None, Some(directory.path()), None));
+    assert!(output.stdout.is_empty(), "stdout is reserved for MCP");
+    let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
+    for key in [
+        "HACKMD_MCP_SNAPSHOT_TTL_SECONDS",
+        "HACKMD_MCP_SNAPSHOT_MAX_BYTES",
+    ] {
+        assert!(stderr.contains(&format!(
+            "the working-directory .env sets {key}, which is honored only from the environment"
+        )));
+    }
 }
 
 #[test]
