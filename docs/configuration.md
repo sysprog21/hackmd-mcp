@@ -45,9 +45,9 @@ only the keys listed above, and it treats the file as untrusted, because a
   token to a host of its author's choosing. Set both in the same place.
 - `HACKMD_MCP_STATE_DIR` is ignored in `.env`. That directory holds full note
   bodies, and a stranger's `.env` must not be able to redirect them.
-- The two snapshot limits are ignored in `.env` for the same reason: they bound
-  how many of those bodies stay in memory, and a stranger's file must not
-  lift that bound.
+- The two snapshot limits are ignored in `.env`: they bound how much memory
+  retained note bodies may use, and a stranger's file must not raise that
+  bound.
 - A `HACKMD_MCP_WORKSPACE_ROOT` from `.env` still confines, but counts as
   untrusted; see [Workspace root](#workspace-root) for what that changes.
 

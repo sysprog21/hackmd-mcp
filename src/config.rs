@@ -23,28 +23,31 @@ const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 /// a momentary annoyance, long enough to absorb an agent resolving several note
 /// URLs in a row.
 const LIST_CACHE_TTL: Duration = Duration::from_secs(60);
-const SUPPORTED_ENV_KEYS: [&str; 6] = [
-    "HACKMD_MCP_SNAPSHOT_TTL_SECONDS",
-    "HACKMD_MCP_SNAPSHOT_MAX_BYTES",
-    "HACKMD_API_TOKEN",
-    "HACKMD_API_URL",
-    "HACKMD_MCP_STATE_DIR",
-    "HACKMD_MCP_WORKSPACE_ROOT",
-];
+/// Whether a working-directory `.env` may set a key. That file may come with
+/// someone else's repository, so every key a `.env` can name states its rule
+/// here, in one table, rather than being honored unless a second list says
+/// otherwise.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dotenv {
+    Honored,
+    /// Parsed, so setting it there is warned about, but never honored.
+    EnvironmentOnly,
+}
 
-/// Parsed from a working-directory `.env` but never honored there. The state
-/// directory holds full private note bodies, and a `.env` shipped in someone
-/// else's repository could otherwise have them written into its own tree.
-/// The snapshot limits bound how much of those bodies stays in memory, so
-/// such a file cannot lift that bound either.
-///
-/// `HACKMD_MCP_WORKSPACE_ROOT` is honored from `.env`, so a user who confines
-/// the server there stays confined, but such a root is not trusted: see
-/// `Config::workspace_root_trusted`.
-const ENVIRONMENT_ONLY_KEYS: [&str; 3] = [
-    "HACKMD_MCP_STATE_DIR",
-    "HACKMD_MCP_SNAPSHOT_TTL_SECONDS",
-    "HACKMD_MCP_SNAPSHOT_MAX_BYTES",
+const ENV_KEYS: [(&str, Dotenv); 6] = [
+    // The token and URL also carry the inherited-token rule in `from_env`.
+    ("HACKMD_API_TOKEN", Dotenv::Honored),
+    ("HACKMD_API_URL", Dotenv::Honored),
+    // Honored, so a user who confines the server there stays confined, but
+    // not trusted: see `Config::workspace_root_trusted`.
+    ("HACKMD_MCP_WORKSPACE_ROOT", Dotenv::Honored),
+    // It holds full private note bodies, which such a file could otherwise
+    // have written into its own tree.
+    ("HACKMD_MCP_STATE_DIR", Dotenv::EnvironmentOnly),
+    // They bound how much memory retained note bodies may use, which such a
+    // file must not raise.
+    ("HACKMD_MCP_SNAPSHOT_TTL_SECONDS", Dotenv::EnvironmentOnly),
+    ("HACKMD_MCP_SNAPSHOT_MAX_BYTES", Dotenv::EnvironmentOnly),
 ];
 
 /// Application configuration loaded from the local process environment.
@@ -74,8 +77,11 @@ impl Config {
             .ok()
             .map(|directory| load_dotenv(&directory.join(".env")))
             .unwrap_or_default();
-        for key in ENVIRONMENT_ONLY_KEYS {
-            if dotenv.remove(key).is_some() {
+        for (key, _) in ENV_KEYS
+            .iter()
+            .filter(|(_, rule)| *rule == Dotenv::EnvironmentOnly)
+        {
+            if dotenv.remove(*key).is_some() {
                 tracing::warn!(
                     "the working-directory .env sets {key}, which is honored only from the environment; set it there instead"
                 );
@@ -448,7 +454,7 @@ fn parse_dotenv_line(line: &str) -> Option<(String, String)> {
 
     let (key, raw_value) = line.split_once('=')?;
     let key = key.trim();
-    if !SUPPORTED_ENV_KEYS.contains(&key) {
+    if !ENV_KEYS.iter().any(|(known, _)| *known == key) {
         return None;
     }
 
