@@ -61,15 +61,16 @@ pub(crate) struct BodyChanged {
 /// not hash to it. `HackMD` has no conditional write, so a change landing
 /// between this read and the write still wins; this catches every change
 /// made before the read, which is where a stale agent's edits come from.
+/// `digest` is the body's, asked for only when there is a hash to check.
 pub(crate) fn ensure_unchanged(
     note_id: &str,
-    body: &str,
+    digest: impl FnOnce() -> [u8; 32],
     expected: Option<&str>,
 ) -> Result<(), BodyChanged> {
     let Some(expected) = expected else {
         return Ok(());
     };
-    let actual = crate::local::offload(|| crate::hash::body_hash(body));
+    let actual = crate::hash::body_hash_from_digest(&digest());
     if actual == expected {
         Ok(())
     } else {
@@ -106,8 +107,16 @@ pub(crate) async fn edit_note(
     let NoteResolution::Resolved { note } = resolution else {
         return Ok(Err(resolution));
     };
-    let (_, content) = client.get_note_body(&note.workspace, &note.note_id).await?;
-    ensure_unchanged(&note.note_id, &content, input.expected_hash.as_deref())?;
+    let current = client
+        .get_note_snapshot(&note.workspace, &note.note_id)
+        .await?;
+    ensure_unchanged(
+        &note.note_id,
+        || current.digest(),
+        input.expected_hash.as_deref(),
+    )?;
+    let content = std::sync::Arc::clone(&current.content);
+    drop(current);
     let patch_path = crate::note::patch::patch_path(&note.workspace, &note.note_id);
     // Matching hunks against a large body is CPU work, kept off the runtime.
     let (updated, changed) = crate::local::offload(|| {

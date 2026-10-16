@@ -66,6 +66,9 @@ pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     }
     let client = Arc::new(HackmdClient::new(config)?);
 
+    // Logged before the handshake, which `serve` awaits: startup tests read it
+    // as proof that configuration succeeded.
+    tracing::info!("serving MCP on stdio");
     HackmdServer::new(client, files)
         .serve(rmcp::transport::stdio())
         .await?

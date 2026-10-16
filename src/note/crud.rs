@@ -550,12 +550,15 @@ pub(crate) async fn update_note(
     // A body converts only when the caller supplied it; a resent one goes back
     // exactly as read.
     let replacement = crate::local::offload(|| input.content.map(into_stored));
-    let content = match (replacement, input.expected_hash.as_deref()) {
-        (Some(content), None) => content,
+    // A resent body is borrowed from the read, which the snapshot cache may
+    // share, rather than copied.
+    let current;
+    let content: std::borrow::Cow<'_, str> = match (replacement, input.expected_hash.as_deref()) {
+        (Some(content), None) => content.into(),
         (replacement, expected) => {
             let resending = replacement.is_none();
-            let (_, current) = client
-                .get_note_body(&note.workspace, &note.note_id)
+            let snapshot = client
+                .get_note_snapshot(&note.workspace, &note.note_id)
                 .await
                 .map_err(|error| match error {
                     HackmdError::MissingContent { note_id } if resending => {
@@ -563,15 +566,20 @@ pub(crate) async fn update_note(
                     }
                     other => other.into(),
                 })?;
-            ensure_unchanged(&note.note_id, &current, expected)?;
-            replacement.unwrap_or_else(|| {
-                std::sync::Arc::try_unwrap(current).unwrap_or_else(|body| (*body).clone())
-            })
+            ensure_unchanged(&note.note_id, || snapshot.digest(), expected)?;
+            // A replacement lets the read go here; only a resent body keeps it
+            // alive through the write.
+            if let Some(content) = replacement {
+                content.into()
+            } else {
+                current = snapshot;
+                current.content.as_str().into()
+            }
         }
     };
     let mut payload = UpdateNoteRequest {
         title: input.title,
-        content: content.into(),
+        content,
         tags: input.tags,
         description: input.description,
         read_permission: input.read_permission,

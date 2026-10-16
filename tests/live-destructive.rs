@@ -319,16 +319,24 @@ async fn personal_crud_folder_order_trash_and_restore() {
             Some(&json!({"content": edited})),
         )
         .await;
-        let read = api.json(Method::GET, &["notes", &note_id], None).await;
-        assert_eq!(read["content"], edited);
+        api.poll_json(&["notes", &note_id], |note| note["content"] == edited)
+            .await
+            .expect("the edit must become visible");
         api.empty_ok(
             Method::PATCH,
             &["notes", &note_id],
             Some(&json!({"content": edited})),
         )
         .await;
-        let unchanged = api.json(Method::GET, &["notes", &note_id], None).await;
-        assert_eq!(unchanged["content"], edited);
+        // The body already reads `edited`, so waiting for that proves nothing.
+        // Watch the whole read-back window for anything else instead.
+        let changed = api
+            .poll_json(&["notes", &note_id], |note| note["content"] != edited)
+            .await;
+        assert!(
+            changed.is_none(),
+            "resending the same body changed it: {changed:?}"
+        );
 
         // The title read-back and title_drift ignore runs of whitespace, since
         // whether HackMD collapses them is unmeasured. The body is sent too, as

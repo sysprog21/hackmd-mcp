@@ -98,7 +98,8 @@ the top of `tests/live-destructive.rs`.
 ### Snapshot validation and workload
 
 `tests/live-validators.rs` is an additional ignored write probe, with the same
-explicit destructive gates. Run only with separately authorized writes:
+environment gates as `tests/live-destructive.rs`, listed at its top. Run only
+with separately authorized writes:
 
 ```sh
 cargo test --test live-validators -- --ignored --nocapture

@@ -9,7 +9,7 @@ use similar::TextDiff;
 use thiserror::Error;
 
 use crate::{
-    client::{HackmdClient, HackmdError},
+    client::{HackmdClient, HackmdError, Snapshot},
     hash::{body_digest, body_hash, body_hash_from_digest},
     local::{Expect, LocalAccessError, LocalFiles},
     models::Workspace,
@@ -228,10 +228,9 @@ pub(crate) async fn push_note(
             return Err(PushNoteError::TrackingMismatch);
         }
     }
-    let (remote_note, remote) = client.get_note_body(&note.workspace, &note.note_id).await?;
-    let title = remote_note.title.clone();
-    let last_changed_at = remote_note.last_changed_at;
-    drop(remote_note);
+    let remote = client
+        .get_note_snapshot(&note.workspace, &note.note_id)
+        .await?;
     push_resolved(
         client,
         files,
@@ -241,21 +240,10 @@ pub(crate) async fn push_note(
         },
         tracked,
         note,
-        Remote {
-            body: remote,
-            title,
-            last_changed_at,
-        },
+        remote,
         local,
     )
     .await
-}
-
-/// The remote body a push is judged against, and when it last changed.
-struct Remote {
-    body: std::sync::Arc<String>,
-    title: String,
-    last_changed_at: Option<i64>,
 }
 
 fn validate_and_read_local(
@@ -289,14 +277,13 @@ async fn push_resolved(
     guard: Guard<'_>,
     tracked: crate::sync::state::LoadedTrackedState,
     note: crate::note::reference::ResolvedNoteRef,
-    remote: Remote,
+    snapshot: std::sync::Arc<Snapshot>,
     local: String,
 ) -> Result<Result<PushNoteOutput, NoteResolution>, PushNoteError> {
-    let Remote {
-        body: remote,
-        title,
-        last_changed_at: remote_timestamp,
-    } = remote;
+    // The remote body a push is judged against, and when it last changed.
+    let remote = std::sync::Arc::clone(&snapshot.content);
+    let title = snapshot.title.clone();
+    let remote_timestamp = snapshot.last_changed_at;
 
     // Every result reports the tracked canonical path, not the caller's
     // spelling of it, and the conflict snapshot is written beside that path.
@@ -307,8 +294,10 @@ async fn push_resolved(
         baseline_path: &tracked.baseline_path,
     };
     let write = if matches!(guard.strategy, PushStrategy::Safe) {
-        let (local_digest, remote_digest) =
-            crate::local::offload(|| (body_digest(&local), body_digest(&remote)));
+        // The remote digest is the snapshot's, computed once however often
+        // the note is read.
+        let remote_digest = snapshot.digest();
+        let local_digest = crate::local::offload(|| body_digest(&local));
         let remote_hash = body_hash_from_digest(&remote_digest);
 
         // A merge names the remote it was built against. If the remote has
@@ -375,6 +364,7 @@ async fn push_resolved(
     // baseline through the write and its read-back would keep three copies of a
     // large note alive at once.
     drop(remote);
+    drop(snapshot);
     // All that drift needs of the baseline, taken before it goes.
     let synced_title =
         crate::local::offload(|| crate::note::body::body_title(&tracked.baseline_body));
@@ -746,11 +736,12 @@ mod tests {
                 workspace: Workspace::Personal,
                 note_id: "note-id".to_owned(),
             },
-            super::Remote {
-                body: std::sync::Arc::new("baseline".to_owned()),
-                title: "Note".to_owned(),
-                last_changed_at: None,
-            },
+            std::sync::Arc::new(crate::client::Snapshot::new(
+                "baseline".to_owned(),
+                "Note".to_owned(),
+                None,
+                None,
+            )),
             "local edit".to_owned(),
         )
         .await;
@@ -793,11 +784,12 @@ mod tests {
                 workspace: Workspace::Personal,
                 note_id: "note-id".to_owned(),
             },
-            super::Remote {
-                body: std::sync::Arc::new("baseline".to_owned()),
-                title: "Note".to_owned(),
-                last_changed_at: None,
-            },
+            std::sync::Arc::new(crate::client::Snapshot::new(
+                "baseline".to_owned(),
+                "Note".to_owned(),
+                None,
+                None,
+            )),
             "local edit".to_owned(),
         )
         .await;

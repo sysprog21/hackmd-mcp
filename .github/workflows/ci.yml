@@ -115,11 +115,25 @@ jobs:
           elif git cat-file -e "$PUSH_BEFORE_SHA^{commit}" 2>/dev/null; then
               coverage_base="$PUSH_BEFORE_SHA"
           else
-              echo "The previous main commit is unavailable; cannot verify the coverage ratchet" >&2
+              # A force-push dropped the previous commit. Any older commit could
+              # carry a lower floor than the one replaced, so nothing stands in;
+              # the next push compares against this one again.
+              echo "The previous main commit is unavailable; cannot verify the coverage ratchet." >&2
+              echo "Push a follow-up commit to compare against this one." >&2
               exit 1
           fi
           if [ -n "$coverage_base" ]; then
-              python3 .ci/coverage.py coverage-reports --base "$coverage_base"
+              # The gate that judges a change is the one it is compared against,
+              # so a change cannot loosen its own check. A change to the gate
+              # takes effect from the next one. Every comparison commit carries
+              # a gate, so one without is refused rather than judged by the gate
+              # under review.
+              gate="$RUNNER_TEMP/coverage.py"
+              if ! git show "$coverage_base:.ci/coverage.py" > "$gate"; then
+                  echo "$coverage_base has no .ci/coverage.py to judge this change with" >&2
+                  exit 1
+              fi
+              python3 "$gate" coverage-reports --base "$coverage_base"
           else
               python3 .ci/coverage.py coverage-reports
           fi
@@ -147,7 +161,9 @@ jobs:
       - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-audit@0.22.2
-      - run: cargo audit
+      # Unsound and yanked crates fail as vulnerabilities do; ignore a specific
+      # advisory by ID in .cargo/audit.toml rather than drop this flag.
+      - run: cargo audit --deny warnings
 
   # Prebuilt binaries, one per platform the test matrix above runs on. A binary
   # for a platform whose suite never ran there is a promise nobody checked, so

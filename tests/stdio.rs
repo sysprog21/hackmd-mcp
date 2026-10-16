@@ -19,6 +19,8 @@ fn server() -> Command {
         .env_remove("HACKMD_API_URL")
         .env_remove("HACKMD_MCP_STATE_DIR")
         .env_remove("HACKMD_MCP_WORKSPACE_ROOT")
+        .env_remove("HACKMD_MCP_SNAPSHOT_TTL_SECONDS")
+        .env_remove("HACKMD_MCP_SNAPSHOT_MAX_BYTES")
         .env_remove("HACKMD_MCP_OTEL")
         .env_remove("RUST_LOG");
     command
@@ -73,9 +75,18 @@ fn assert_waiting_then_stop(mut child: Child) -> Output {
     // own and every startup diagnostic it wrote is guaranteed to be collected,
     // however slow the machine was to reach that point.
     drop(child.stdin.take());
-    child
+    let output = child
         .wait_with_output()
-        .expect("server output should be collected")
+        .expect("server output should be collected");
+    // The liveness check above is one sample, and a server that failed after
+    // it would still get here. This line is logged once config and the client
+    // are built, just before the transport starts: a config error never logs
+    // it. It does not prove the MCP handshake, which these tests never send.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("serving MCP on stdio"),
+        "server did not reach the transport: {output:?}"
+    );
+    output
 }
 
 #[test]
@@ -243,6 +254,30 @@ fn a_dotenv_workspace_root_confines_but_is_not_trusted() {
 }
 
 #[test]
+fn dotenv_cannot_lift_the_snapshot_limits() {
+    // Unparseable values would refuse startup if either key were honored, so a
+    // server that starts and warns proves both were dropped.
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    fs::write(
+        directory.path().join(".env"),
+        "HACKMD_MCP_SNAPSHOT_TTL_SECONDS=forever\nHACKMD_MCP_SNAPSHOT_MAX_BYTES=unbounded\n",
+    )
+    .expect("dotenv fixture should be written");
+
+    let output = assert_waiting_then_stop(spawn_server(None, Some(directory.path()), None));
+    assert!(output.stdout.is_empty(), "stdout is reserved for MCP");
+    let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
+    for key in [
+        "HACKMD_MCP_SNAPSHOT_TTL_SECONDS",
+        "HACKMD_MCP_SNAPSHOT_MAX_BYTES",
+    ] {
+        assert!(stderr.contains(&format!(
+            "the working-directory .env sets {key}, which is honored only from the environment"
+        )));
+    }
+}
+
+#[test]
 fn startup_does_not_create_the_configured_state_directory() {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let state_dir = directory.path().join("state-must-not-exist");
@@ -263,7 +298,28 @@ fn tool_calls_emit_request_scoped_json_only_to_stderr() {
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hackmd_get_me","arguments":{}}}"#,
         "\n"
     );
-    let output = exchange_then_stop(spawn_server(Some(SENTINEL_TOKEN), None, None), messages);
+    // A loopback port that closes every connection it accepts: the call fails
+    // at once, offline, without reaching api.hackmd.io from CI. Held for the
+    // test, so no other fixture can take the port meanwhile.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback should bind");
+    let port = listener
+        .local_addr()
+        .expect("the bound port should be known")
+        .port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
+    let child = server()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("HACKMD_API_TOKEN", SENTINEL_TOKEN)
+        .env("HACKMD_API_URL", format!("https://127.0.0.1:{port}/v1"))
+        .spawn()
+        .expect("server binary should start");
+    let output = exchange_then_stop(child, messages);
     assert!(output.status.success());
 
     let stdout = String::from_utf8(output.stdout).expect("MCP output should be UTF-8");

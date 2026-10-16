@@ -28,6 +28,7 @@ use error::{RateLimitHeaders, map_status_error, parse_header, request_error, tra
 pub(crate) use readback::Readback;
 use readback::{poll_readback_sized, transfer_allowance};
 pub(crate) use remote::{ImageUrl, RemoteImageError};
+pub(crate) use snapshot::Snapshot;
 
 /// HTTP client shared by all `HackMD` tool handlers.
 #[derive(Debug)]
@@ -195,6 +196,8 @@ impl HackmdClient {
         }
     }
 
+    /// A full note read whose body is not kept: write paths poll with it, and
+    /// a read that has not confirmed their write must not seed a snapshot.
     pub(crate) async fn get_note(
         &self,
         workspace: &Workspace,
@@ -202,6 +205,43 @@ impl HackmdClient {
     ) -> Result<NoteResponse, HackmdError> {
         self.get_required(&workspace_route(workspace, &["notes", note_id]))
             .await
+    }
+
+    /// `get_note` for `hackmd_get_note`. Its body is kept as a snapshot, so
+    /// the edit that usually follows can revalidate it instead of downloading
+    /// it again. The read registers as one in flight, so a write landing
+    /// before it answers detaches it, as it does any read, and it is not kept.
+    pub(crate) async fn get_note_retained(
+        &self,
+        workspace: &Workspace,
+        note_id: &str,
+    ) -> Result<NoteResponse, HackmdError> {
+        // Another read already in flight is left to fill the snapshot.
+        let fill = match self.snapshots.begin(workspace, note_id) {
+            snapshot::Lookup::Fill { guard, .. } => Some(guard),
+            snapshot::Lookup::Wait(_) | snapshot::Lookup::Disabled => None,
+        };
+        let reply = self
+            .send(
+                Method::GET,
+                &workspace_route(workspace, &["notes", note_id]),
+                NO_BODY,
+                true,
+                true,
+            )
+            .await?;
+        let validator = reply.validator.clone();
+        let (method, path) = (reply.method.clone(), reply.path.clone());
+        let note: NoteResponse = reply
+            .json()?
+            .ok_or_else(|| HackmdError::unreadable_reply(method, path, None))?;
+        if let Some(fill) = fill {
+            match self.keepable(workspace, note_id, validator, &note) {
+                Some(snapshot) => fill.complete(&Ok(snapshot)),
+                None => fill.discard(),
+            }
+        }
+        Ok(note)
     }
 
     pub(crate) async fn create_note(
@@ -226,19 +266,9 @@ impl HackmdClient {
         self.write(Method::PATCH, &segments, Some(payload)).await
     }
 
-    /// A note with its Markdown body taken out, for the tools that work on
-    /// the body: a note that comes back without one is an error, not an
-    /// empty body.
-    pub(crate) async fn get_note_body(
-        &self,
-        workspace: &Workspace,
-        note_id: &str,
-    ) -> Result<(Arc<snapshot::Snapshot>, Arc<String>), HackmdError> {
-        let snapshot = self.get_note_snapshot(workspace, note_id).await?;
-        let body = Arc::clone(&snapshot.content);
-        Ok((snapshot, body))
-    }
-
+    /// A note's Markdown body with the metadata the body tools need,
+    /// revalidated against the last one read: a note that comes back without
+    /// a body is an error, not an empty body.
     pub(crate) async fn get_note_snapshot(
         &self,
         workspace: &Workspace,
@@ -249,6 +279,8 @@ impl HackmdClient {
                 snapshot::Lookup::Disabled => {
                     return self.fetch_snapshot(workspace, note_id, None).await;
                 }
+                // A read cancelled before it answered leaves nothing to
+                // share; look again, and most likely send this one.
                 snapshot::Lookup::Wait(flight) => {
                     if let Some(outcome) = flight.wait().await {
                         return outcome;
@@ -256,9 +288,8 @@ impl HackmdClient {
                 }
                 snapshot::Lookup::Fill { guard, previous } => {
                     let outcome = self.fetch_snapshot(workspace, note_id, previous).await;
-                    if guard.complete(&outcome) {
-                        return outcome;
-                    }
+                    guard.complete(&outcome);
+                    return outcome;
                 }
             }
         }
@@ -296,24 +327,62 @@ impl HackmdClient {
     }
 
     fn snapshot_from_note(
-        mut note: NoteResponse,
+        note: NoteResponse,
         validator: Option<reqwest::header::HeaderValue>,
         note_id: &str,
     ) -> Result<Arc<snapshot::Snapshot>, HackmdError> {
-        let content = note
-            .content
-            .take()
-            .ok_or_else(|| HackmdError::MissingContent {
-                note_id: note_id.to_owned(),
-            })?;
-        let digest = crate::local::offload(|| crate::hash::body_digest(&content));
-        Ok(Arc::new(snapshot::Snapshot {
-            content: Arc::new(content),
-            digest,
-            title: note.title,
-            last_changed_at: note.last_changed_at,
+        let content = note.content.ok_or_else(|| HackmdError::MissingContent {
+            note_id: note_id.to_owned(),
+        })?;
+        Ok(Arc::new(snapshot::Snapshot::new(
+            content,
+            note.title,
+            note.last_changed_at,
             validator,
-        }))
+        )))
+    }
+
+    /// A snapshot of a note just read in full, when the cache would keep it.
+    /// The caller still needs the note, so the body is copied, and only then;
+    /// the acceptance check counts the body and every string stored with it.
+    fn keepable(
+        &self,
+        workspace: &Workspace,
+        note_id: &str,
+        validator: Option<reqwest::header::HeaderValue>,
+        note: &NoteResponse,
+    ) -> Option<Arc<snapshot::Snapshot>> {
+        let (validator, content) = validator.zip(note.content.as_ref())?;
+        let team_bytes = match workspace {
+            Workspace::Personal => 0,
+            Workspace::Team { team_path } => team_path.len(),
+        };
+        let bytes = content.len()
+            + note.title.len()
+            + note_id.len()
+            + team_bytes
+            + validator.as_bytes().len();
+        self.snapshots.accepts(bytes).then(|| {
+            Arc::new(snapshot::Snapshot::new(
+                content.clone(),
+                note.title.clone(),
+                note.last_changed_at,
+                Some(validator),
+            ))
+        })
+    }
+
+    /// Records a confirmed read-back. Seeding happens even when nothing is
+    /// kept, so a read sent before the write showed is detached either way.
+    fn seed_snapshot(
+        &self,
+        workspace: &Workspace,
+        note_id: &str,
+        validator: Option<reqwest::header::HeaderValue>,
+        note: &NoteResponse,
+    ) {
+        let snapshot = self.keepable(workspace, note_id, validator, note);
+        self.snapshots.seed(workspace, note_id, snapshot);
     }
 
     /// Replaces a note's body and returns the first read that shows it. A
@@ -343,7 +412,6 @@ impl HackmdClient {
         written_bytes: usize,
         accepted: impl Fn(&NoteResponse) -> bool,
     ) -> Result<NoteResponse, HackmdError> {
-        let generation = self.snapshots.generation();
         let (note, validator) = self
             .poll_readback(
                 written_bytes,
@@ -369,18 +437,7 @@ impl HackmdClient {
             .confirmed_or(|| HackmdError::ReadbackMismatch {
                 note_id: note_id.to_owned(),
             })?;
-        if validator.is_some()
-            && !self.config.snapshot_ttl().is_zero()
-            && self.config.snapshot_max_bytes() > 0
-            && note
-                .content
-                .as_ref()
-                .is_some_and(|body| body.len() <= self.config.snapshot_max_bytes())
-        {
-            let snapshot = Self::snapshot_from_note(note.clone(), validator, note_id)?;
-            self.snapshots
-                .seed(workspace, note_id, generation, snapshot);
-        }
+        self.seed_snapshot(workspace, note_id, validator, &note);
         Ok(note)
     }
 
@@ -1255,7 +1312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_snapshot_fill_is_refetched_and_never_returned() {
+    async fn a_fill_overtaken_by_a_write_is_returned_once_and_not_kept() {
         let slot = Arc::new(std::sync::OnceLock::<Arc<HackmdClient>>::new());
         let action = Arc::clone(&slot);
         let server = SequenceServer::spawn_scenarios([
@@ -1279,21 +1336,24 @@ mod tests {
         ]);
         let client = Arc::new(snapshot_client(&server));
         slot.set(Arc::clone(&client)).unwrap();
-        assert_eq!(
-            &*client
-                .get_note_snapshot(&Workspace::Personal, "id")
-                .await
-                .unwrap()
-                .content,
-            "new"
-        );
+        // The reply was current when sent; the caller gets it, once.
+        for expected in ["old", "new"] {
+            assert_eq!(
+                &*client
+                    .get_note_snapshot(&Workspace::Personal, "id")
+                    .await
+                    .unwrap()
+                    .content,
+                expected
+            );
+        }
         let requests = server.finish();
         assert_eq!(requests.len(), 2);
         assert!(!requests[1].to_ascii_lowercase().contains("if-none-match:"));
     }
 
     #[tokio::test]
-    async fn write_evicts_before_io_and_fences_a_fill_started_during_the_write() {
+    async fn write_evicts_before_io_and_drops_a_fill_made_during_the_write() {
         let slot = Arc::new(std::sync::OnceLock::<Arc<HackmdClient>>::new());
         let action = Arc::clone(&slot);
         let server = SequenceServer::spawn_scenarios([
@@ -1319,7 +1379,7 @@ mod tests {
                     "id",
                 )
                 .unwrap();
-                assert!(guard.complete(&Ok(snapshot)));
+                guard.complete(&Ok(snapshot));
             }),
             Scenario::new(
                 "GET",
@@ -1349,49 +1409,6 @@ mod tests {
         );
         let requests = server.finish();
         assert!(!requests[2].to_ascii_lowercase().contains("if-none-match:"));
-    }
-
-    #[tokio::test]
-    async fn readback_overtaken_by_invalidation_cannot_seed_snapshot() {
-        let slot = Arc::new(std::sync::OnceLock::<Arc<HackmdClient>>::new());
-        let action = Arc::clone(&slot);
-        let server = SequenceServer::spawn_scenarios([
-            Scenario::new(
-                "GET",
-                "/v1/notes/id",
-                200,
-                r#"{"id":"id","title":"Note","content":"confirmed"}"#,
-            )
-            .response_header("etag", "W/\"old\"")
-            .before_response(move || {
-                action.get().unwrap().snapshots.invalidate();
-            }),
-            Scenario::new(
-                "GET",
-                "/v1/notes/id",
-                200,
-                r#"{"id":"id","title":"Note","content":"newer"}"#,
-            )
-            .response_header("etag", "W/\"new\""),
-        ]);
-        let client = Arc::new(snapshot_client(&server));
-        slot.set(Arc::clone(&client)).unwrap();
-        client
-            .confirm_note_write(&Workspace::Personal, "id", 9, |note| {
-                note.content.as_deref() == Some("confirmed")
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            &*client
-                .get_note_snapshot(&Workspace::Personal, "id")
-                .await
-                .unwrap()
-                .content,
-            "newer"
-        );
-        let requests = server.finish();
-        assert!(!requests[1].to_ascii_lowercase().contains("if-none-match:"));
     }
 
     #[tokio::test]
@@ -1435,7 +1452,13 @@ mod tests {
     #[ignore = "manual before/after snapshot transfer and latency workload"]
     async fn benchmark_repeated_note_snapshots() {
         let content = "# Snapshot workload\n".repeat(13_108);
-        let body=serde_json::json!({"id":"id","title":"Snapshot workload","content":content,"lastChangedAt":1}).to_string();
+        let body = serde_json::json!({
+            "id": "id",
+            "title": "Snapshot workload",
+            "content": content,
+            "lastChangedAt": 1
+        })
+        .to_string();
         for capacity in [0, 8 * 1024 * 1024] {
             let scenarios: [Scenario; 8] = std::array::from_fn(|index| {
                 if capacity == 0 || index == 0 {
@@ -1468,7 +1491,8 @@ mod tests {
                 .filter(|request| !request.to_ascii_lowercase().contains("if-none-match:"))
                 .count();
             eprintln!(
-                "snapshot benchmark: capacity={capacity} markdown_bytes={} requests={} full_responses={full} body_bytes={} elapsed_us={}",
+                "snapshot benchmark: capacity={capacity} markdown_bytes={} requests={} \
+                 full_responses={full} body_bytes={} elapsed_us={}",
                 content.len(),
                 requests.len(),
                 full * body.len(),
@@ -1519,6 +1543,78 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_full_note_read_lets_the_next_body_read_revalidate() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"body","tags":["kept"]}"#,
+            )
+            .response_header("etag", "W/\"one\""),
+            Scenario::new("GET", "/v1/notes/id", 304, "")
+                .expect_header("if-none-match", "W/\"one\""),
+        ]);
+        let client = snapshot_client(&server);
+        let note = client
+            .get_note_retained(&Workspace::Personal, "id")
+            .await
+            .unwrap();
+        assert_eq!(note.content.as_deref(), Some("body"));
+        let snapshot = client
+            .get_note_snapshot(&Workspace::Personal, "id")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.content.as_str(), "body");
+        assert_eq!(snapshot.title, "Note");
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_full_note_read_overtaken_by_a_write_is_not_kept() {
+        let slot = Arc::new(std::sync::OnceLock::<Arc<HackmdClient>>::new());
+        let action = Arc::clone(&slot);
+        let note = r#"{"id":"id","title":"Note","content":"old"}"#;
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/notes/id", 200, note)
+                .response_header("etag", "W/\"old\"")
+                .before_response(move || {
+                    action.get().unwrap().snapshots.invalidate();
+                }),
+            Scenario::new("GET", "/v1/notes/id", 200, note).response_header("etag", "W/\"old\""),
+        ]);
+        let client = Arc::new(snapshot_client(&server));
+        slot.set(Arc::clone(&client)).unwrap();
+        client
+            .get_note_retained(&Workspace::Personal, "id")
+            .await
+            .unwrap();
+        client
+            .get_note_snapshot(&Workspace::Personal, "id")
+            .await
+            .unwrap();
+        let requests = server.finish();
+        assert!(!requests[1].to_ascii_lowercase().contains("if-none-match:"));
+    }
+
+    #[tokio::test]
+    async fn a_polling_note_read_keeps_no_snapshot() {
+        let note = r#"{"id":"id","title":"Note","content":"body"}"#;
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/notes/id", 200, note).response_header("etag", "W/\"one\""),
+            Scenario::new("GET", "/v1/notes/id", 200, note).response_header("etag", "W/\"one\""),
+        ]);
+        let client = snapshot_client(&server);
+        client.get_note(&Workspace::Personal, "id").await.unwrap();
+        client
+            .get_note_snapshot(&Workspace::Personal, "id")
+            .await
+            .unwrap();
+        let requests = server.finish();
+        assert!(!requests[1].to_ascii_lowercase().contains("if-none-match:"));
+    }
+
     fn snapshot_client(server: &SequenceServer) -> HackmdClient {
         HackmdClient::new(
             Config::for_loopback_test(&server.api_url, Some(FIXTURE_TOKEN))
@@ -1564,7 +1660,7 @@ mod tests {
             assert_eq!(snapshot.content.as_str(), content);
             assert_eq!(snapshot.title, title);
             assert_eq!(snapshot.last_changed_at, Some(ts));
-            assert_eq!(snapshot.digest, crate::hash::body_digest(content));
+            assert_eq!(snapshot.digest(), crate::hash::body_digest(content));
         }
         assert_eq!(server.finish().len(), 4);
     }
@@ -1681,7 +1777,7 @@ mod tests {
         ]);
         let client = snapshot_client(&server);
         client
-            .get_note_body(&Workspace::Personal, "id")
+            .get_note_snapshot(&Workspace::Personal, "id")
             .await
             .unwrap();
         client
