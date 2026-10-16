@@ -46,12 +46,49 @@ The `otel` feature adds an OTLP span exporter, switched on at runtime with
 ## Live API suites
 
 Both live suites are ignored by default. The read-only one mutates nothing and
-prints `ETag`/`Last-Modified` headers and conditional response status:
+prints both conditional-validator results and compression body-byte counts:
 
 ```sh
 HACKMD_RUN_LIVE_READONLY_TESTS=1 HACKMD_LIVE_TEST_TOKEN=... \
+    HACKMD_LIVE_TEST_TEAM_PATH=... HACKMD_LIVE_TEST_LARGE_NOTE_ID=... \
     cargo test --test live-readonly -- --ignored --nocapture
 ```
+
+The large note must have at least 64 KiB of Markdown in the selected team
+(personal when the team path is unset). Identity, `gzip, br`, and gzip-only
+GETs measure response body bytes with automatic decompression disabled.
+
+### Measured validators and compression (2026-10-14)
+
+Both ignored read-only tests passed at revision `12d1dec` against
+`https://api.hackmd.io/v1` (no API URL override).
+This is the tracked evidence record for the dated local TODO/DONE entries.
+The dedicated-token default remains in place; the user authorized use of the
+configured token for this read-only run only. No note content, identifiers or
+credentials are recorded here.
+
+| GET endpoint | Status | ETag | Last-Modified | If-None-Match |
+|--------------|--------|------|---------------|---------------|
+| `/me` | 200 | present, weak | absent | 304 |
+| `/notes` | 200 | present, weak | absent | 304 |
+| `/notes/{id}` | 200 | present, weak | absent | 304 |
+| `/teams` | 200 | present, weak | absent | 304 |
+| `/teams/{team}/notes` | 200 | present, weak | absent | 304 |
+| `/teams/{team}/notes/{id}` | 200 | present, weak | absent | 304 |
+
+The personal and team note GETs therefore support conditional revalidation for
+this deployment. Last-Modified conditionals were not sent because that header
+was absent. This observation permits implementing the bounded snapshot cache;
+each conditional request was sampled once immediately after its initial GET.
+It does not establish behavior on other deployments, validator changes after
+a write, or rate-limit accounting.
+
+The compression test read an existing team note with 233,314 Markdown bytes.
+All three GETs succeeded, omitted Content-Encoding, and transferred 238,438
+HTTP body bytes (excluding headers and framing): `identity`, `gzip, br`, and
+`gzip`. The offered encodings saved zero body bytes, so runtime gzip support
+stays disabled. These are separate requests to a live note, not an atomic snapshot.
+Recheck before adding a compression dependency if the deployment changes.
 
 The destructive suite creates and deletes notes and folders. Run it only with a
 dedicated throwaway account; the environment gates it requires are listed at
@@ -64,8 +101,9 @@ weekly:
 
 | Job | What it checks |
 |-----|----------------|
-| `test` | the full suite on Linux, macOS, and Windows |
-| `lint` | `cargo fmt --check` and clippy on a pinned toolchain |
+| `test` | the full suite with line coverage on Linux, macOS, and Windows |
+| `lint` | formatting, coverage-script tests, unused dependencies, duplicate reporting, and clippy on a pinned toolchain |
+| `coverage` | merged platform reports and the changed-line coverage ratchet; skipped on the weekly run |
 | `msrv` | the build on the `rust-version` in `Cargo.toml` |
 | `audit` | RustSec advisories against `Cargo.lock` |
 | `build` | release binaries for each tested platform, Linux against glibc 2.17; skipped on the weekly run |
