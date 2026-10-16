@@ -32,6 +32,11 @@ teams you belong to.
 HackMD returns whole collections, so filtering, sorting, and paging happen in
 the server. No list searches note bodies.
 
+To check many notes for changes, or read their permissions, without holding
+their bodies, pass `include_content: false` with a `note_ref` to
+`hackmd_get_note`: the result keeps `body_hash` and every other field. HackMD
+still sends the whole note, so this saves context, not requests.
+
 ## Editing a note
 
 The safe edit is a patch:

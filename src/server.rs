@@ -388,6 +388,9 @@ mod tests {
         for field in ["note_ref", "local_path"] {
             assert!(get_note.input_schema["properties"].get(field).is_some());
         }
+        let include_content = &get_note.input_schema["properties"]["include_content"];
+        assert_eq!(include_content["type"], "boolean");
+        assert_eq!(include_content["default"], true);
         // Either one names what to get, so neither is required on its own.
         assert!(get_note.input_schema.get("required").is_none());
 
