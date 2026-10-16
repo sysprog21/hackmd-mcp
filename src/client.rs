@@ -20,6 +20,7 @@ mod cache;
 mod error;
 mod readback;
 mod remote;
+mod snapshot;
 
 use cache::{AccountCache, CacheFill, CacheLookup, NotesCache, fresh, store};
 pub(crate) use error::HackmdError;
@@ -35,6 +36,7 @@ pub(crate) struct HackmdClient {
     http: reqwest::Client,
     notes: NotesCache,
     account: AccountCache,
+    snapshots: snapshot::NoteSnapshotCache,
     /// Built on the first `image_url` fetch; see [`remote::Fetcher`].
     images: std::sync::OnceLock<remote::Fetcher>,
 }
@@ -58,11 +60,14 @@ impl HackmdClient {
             .map_err(|_| HackmdError::ClientBuild)?;
         let notes = NotesCache::new(config.list_cache_ttl());
         let account = AccountCache::new(config.list_cache_ttl());
+        let snapshots =
+            snapshot::NoteSnapshotCache::new(config.snapshot_ttl(), config.snapshot_max_bytes());
         Ok(Self {
             config,
             http,
             notes,
             account,
+            snapshots,
             images: std::sync::OnceLock::new(),
         })
     }
@@ -228,15 +233,87 @@ impl HackmdClient {
         &self,
         workspace: &Workspace,
         note_id: &str,
-    ) -> Result<(NoteResponse, String), HackmdError> {
-        let mut note = self.get_note(workspace, note_id).await?;
-        let body = note
+    ) -> Result<(Arc<snapshot::Snapshot>, Arc<String>), HackmdError> {
+        let snapshot = self.get_note_snapshot(workspace, note_id).await?;
+        let body = Arc::clone(&snapshot.content);
+        Ok((snapshot, body))
+    }
+
+    pub(crate) async fn get_note_snapshot(
+        &self,
+        workspace: &Workspace,
+        note_id: &str,
+    ) -> Result<Arc<snapshot::Snapshot>, HackmdError> {
+        loop {
+            match self.snapshots.begin(workspace, note_id) {
+                snapshot::Lookup::Disabled => {
+                    return self.fetch_snapshot(workspace, note_id, None).await;
+                }
+                snapshot::Lookup::Wait(flight) => {
+                    if let Some(outcome) = flight.wait().await {
+                        return outcome;
+                    }
+                }
+                snapshot::Lookup::Fill { guard, previous } => {
+                    let outcome = self.fetch_snapshot(workspace, note_id, previous).await;
+                    if guard.complete(&outcome) {
+                        return outcome;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn fetch_snapshot(
+        &self,
+        workspace: &Workspace,
+        note_id: &str,
+        previous: Option<Arc<snapshot::Snapshot>>,
+    ) -> Result<Arc<snapshot::Snapshot>, HackmdError> {
+        let validator = previous
+            .as_ref()
+            .and_then(|snapshot| snapshot.validator.as_ref());
+        let reply = self
+            .send_validated(
+                Method::GET,
+                &workspace_route(workspace, &["notes", note_id]),
+                NO_BODY,
+                true,
+                true,
+                validator,
+            )
+            .await?;
+        if reply.status == StatusCode::NOT_MODIFIED {
+            return previous.ok_or_else(|| {
+                HackmdError::unreadable_reply(reply.method, reply.path, Some(reply.status))
+            });
+        }
+        let validator = reply.validator.clone();
+        let note: NoteResponse = reply.json()?.ok_or_else(|| HackmdError::MissingContent {
+            note_id: note_id.to_owned(),
+        })?;
+        Self::snapshot_from_note(note, validator, note_id)
+    }
+
+    fn snapshot_from_note(
+        mut note: NoteResponse,
+        validator: Option<reqwest::header::HeaderValue>,
+        note_id: &str,
+    ) -> Result<Arc<snapshot::Snapshot>, HackmdError> {
+        let content = note
             .content
             .take()
             .ok_or_else(|| HackmdError::MissingContent {
                 note_id: note_id.to_owned(),
             })?;
-        Ok((note, body))
+        let digest = crate::local::offload(|| crate::hash::body_digest(&content));
+        Ok(Arc::new(snapshot::Snapshot {
+            content: Arc::new(content),
+            digest,
+            title: note.title,
+            last_changed_at: note.last_changed_at,
+            validator,
+        }))
     }
 
     /// Replaces a note's body and returns the first read that shows it. A
@@ -266,15 +343,45 @@ impl HackmdClient {
         written_bytes: usize,
         accepted: impl Fn(&NoteResponse) -> bool,
     ) -> Result<NoteResponse, HackmdError> {
-        self.poll_readback(
-            written_bytes,
-            || self.get_note(workspace, note_id),
-            accepted,
-        )
-        .await?
-        .confirmed_or(|| HackmdError::ReadbackMismatch {
-            note_id: note_id.to_owned(),
-        })
+        let generation = self.snapshots.generation();
+        let (note, validator) = self
+            .poll_readback(
+                written_bytes,
+                || async {
+                    let reply = self
+                        .send(
+                            Method::GET,
+                            &workspace_route(workspace, &["notes", note_id]),
+                            NO_BODY,
+                            true,
+                            true,
+                        )
+                        .await?;
+                    let validator = reply.validator.clone();
+                    let note = reply.json()?.ok_or_else(|| HackmdError::MissingContent {
+                        note_id: note_id.to_owned(),
+                    })?;
+                    Ok((note, validator))
+                },
+                |(note, _)| accepted(note),
+            )
+            .await?
+            .confirmed_or(|| HackmdError::ReadbackMismatch {
+                note_id: note_id.to_owned(),
+            })?;
+        if validator.is_some()
+            && !self.config.snapshot_ttl().is_zero()
+            && self.config.snapshot_max_bytes() > 0
+            && note
+                .content
+                .as_ref()
+                .is_some_and(|body| body.len() <= self.config.snapshot_max_bytes())
+        {
+            let snapshot = Self::snapshot_from_note(note.clone(), validator, note_id)?;
+            self.snapshots
+                .seed(workspace, note_id, generation, snapshot);
+        }
+        Ok(note)
     }
 
     pub(crate) async fn delete_note(
@@ -375,6 +482,10 @@ impl HackmdClient {
             .timeout(self.ceiling(size))
             .bearer_auth(token)
             .multipart(form);
+        self.snapshots.invalidate();
+        let _snapshot_invalidate = SnapshotInvalidateOnDrop(&self.snapshots);
+        let _invalidate =
+            self.invalidate_list_cache_on_write(&Method::POST, &["notes", note_id, "images"]);
         let response = self
             .until_headers(request, size)
             .await
@@ -588,6 +699,30 @@ impl HackmdClient {
         retryable: bool,
         read_success_body: bool,
     ) -> Result<Reply, HackmdError> {
+        self.send_validated(
+            method,
+            path_segments,
+            body,
+            retryable,
+            read_success_body,
+            None,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "retry and conditional handling share one request loop"
+    )]
+    async fn send_validated(
+        &self,
+        method: Method,
+        path_segments: &[&str],
+        body: Option<&(impl Serialize + Sync)>,
+        retryable: bool,
+        read_success_body: bool,
+        validator: Option<&reqwest::header::HeaderValue>,
+    ) -> Result<Reply, HackmdError> {
         let method_text = method.as_str().to_owned();
         let (url, path, token) = self.authorized(&method_text, path_segments)?;
         let retry = self.config.retry();
@@ -618,9 +753,17 @@ impl HackmdClient {
                 .body(body);
         }
 
+        if let Some(validator) = validator {
+            request = request.header(reqwest::header::IF_NONE_MATCH, validator);
+        }
+        let _snapshot_invalidate =
+            (method != Method::GET && changes_note_lists(&method, path_segments)).then(|| {
+                self.snapshots.invalidate();
+                SnapshotInvalidateOnDrop(&self.snapshots)
+            });
         let _invalidate = self.invalidate_list_cache_on_write(&method, path_segments);
         tracing::debug!(method = %method_text, path = %path, "HackMD request started");
-        let (status, bytes, rate_limit) = loop {
+        let (status, bytes, rate_limit, response_validator) = loop {
             let request = request.try_clone().ok_or(HackmdError::InvalidPayload)?;
             let response = match self.until_headers(request, body_len).await {
                 Ok(response) => response,
@@ -632,14 +775,17 @@ impl HackmdClient {
                 Err(error) => return Err(error.into_hackmd(&method_text, &path)),
             };
             let status = response.status();
+            let response_validator = response.headers().get(reqwest::header::ETAG).cloned();
             let retry_after = retry_after(response.headers());
             let rate_limit = RateLimitHeaders::from_headers(response.headers());
 
             // A write whose reply nobody reads is done once its status says so.
             // Reading on would let a body that breaks off turn a write that
             // landed into a retry, or into an error.
-            if status.is_success() && !read_success_body {
-                break (status, Vec::new(), rate_limit);
+            if (status.is_success() && !read_success_body)
+                || (validator.is_some() && status == StatusCode::NOT_MODIFIED)
+            {
+                break (status, Vec::new(), rate_limit, response_validator);
             }
             let bytes = match self.read_body(response).await {
                 Ok(bytes) => bytes,
@@ -676,7 +822,7 @@ impl HackmdClient {
                 retries += 1;
                 continue;
             }
-            break (status, bytes, rate_limit);
+            break (status, bytes, rate_limit, response_validator);
         };
 
         tracing::debug!(
@@ -687,7 +833,18 @@ impl HackmdClient {
             "HackMD request completed"
         );
 
-        Reply::check(status, method_text, path, bytes, token, rate_limit)
+        if validator.is_some() && status == StatusCode::NOT_MODIFIED {
+            return Ok(Reply {
+                method: method_text,
+                path,
+                status,
+                bytes,
+                validator: response_validator,
+            });
+        }
+        let mut reply = Reply::check(status, method_text, path, bytes, token, rate_limit)?;
+        reply.validator = response_validator;
+        Ok(reply)
     }
 
     /// Sends `request` and waits for its response headers: the request
@@ -849,8 +1006,15 @@ const RESPONSE_MAX_BYTES: usize = 2 * crate::sync::BODY_MAX_BYTES + 1024 * 1024;
 /// future large idempotent write from re-uploading its whole body blind.
 const RETRY_BODY_MAX_BYTES: usize = 1024 * 1024;
 
-/// Clears the note-list cache when dropped, on whichever path leaves the
-/// request.
+/// Clears snapshots on every exit from a write request.
+struct SnapshotInvalidateOnDrop<'a>(&'a snapshot::NoteSnapshotCache);
+impl Drop for SnapshotInvalidateOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.invalidate();
+    }
+}
+
+/// Clears note lists on every exit from a write request.
 struct InvalidateOnDrop<'a>(&'a NotesCache);
 
 impl Drop for InvalidateOnDrop<'_> {
@@ -914,6 +1078,7 @@ async fn read_body_capped(
 
 /// A response whose status was a success, its body not yet decoded.
 struct Reply {
+    validator: Option<reqwest::header::HeaderValue>,
     method: String,
     path: String,
     status: StatusCode,
@@ -937,6 +1102,7 @@ impl Reply {
             ));
         }
         Ok(Self {
+            validator: None,
             method,
             path,
             status,
@@ -1038,7 +1204,7 @@ mod tests {
     use reqwest::Method;
     use serde_json::{Value, json};
 
-    use super::{HackmdClient, HackmdError, NO_BODY, retry_after};
+    use super::{HackmdClient, HackmdError, NO_BODY, retry_after, snapshot};
     use crate::config::Config;
 
     #[test]
@@ -1088,6 +1254,511 @@ mod tests {
         assert!(!serves(same, "https://example/uploads/a.png"));
     }
 
+    #[tokio::test]
+    async fn stale_snapshot_fill_is_refetched_and_never_returned() {
+        let slot = Arc::new(std::sync::OnceLock::<Arc<HackmdClient>>::new());
+        let action = Arc::clone(&slot);
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"old"}"#,
+            )
+            .response_header("etag", "W/\"old\"")
+            .before_response(move || {
+                action.get().unwrap().snapshots.invalidate();
+            }),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"new"}"#,
+            )
+            .response_header("etag", "W/\"new\""),
+        ]);
+        let client = Arc::new(snapshot_client(&server));
+        slot.set(Arc::clone(&client)).unwrap();
+        assert_eq!(
+            &*client
+                .get_note_snapshot(&Workspace::Personal, "id")
+                .await
+                .unwrap()
+                .content,
+            "new"
+        );
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[1].to_ascii_lowercase().contains("if-none-match:"));
+    }
+
+    #[tokio::test]
+    async fn write_evicts_before_io_and_fences_a_fill_started_during_the_write() {
+        let slot = Arc::new(std::sync::OnceLock::<Arc<HackmdClient>>::new());
+        let action = Arc::clone(&slot);
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"old"}"#,
+            )
+            .response_header("etag", "W/\"old\""),
+            Scenario::new("PATCH", "/v1/notes/id", 202, "").before_response(move || {
+                let client = action.get().unwrap();
+                let snapshot::Lookup::Fill { guard, previous } =
+                    client.snapshots.begin(&Workspace::Personal, "id")
+                else {
+                    panic!("write must evict before I/O")
+                };
+                assert!(previous.is_none());
+                let snapshot = HackmdClient::snapshot_from_note(
+                    serde_json::from_str(r#"{"id":"id","title":"Note","content":"stale"}"#)
+                        .unwrap(),
+                    Some(reqwest::header::HeaderValue::from_static("W/\"stale\"")),
+                    "id",
+                )
+                .unwrap();
+                assert!(guard.complete(&Ok(snapshot)));
+            }),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"new"}"#,
+            )
+            .response_header("etag", "W/\"new\""),
+        ]);
+        let client = Arc::new(snapshot_client(&server));
+        slot.set(Arc::clone(&client)).unwrap();
+        client
+            .get_note_snapshot(&Workspace::Personal, "id")
+            .await
+            .unwrap();
+        client
+            .update_note(&Workspace::Personal, "id", &UpdateNoteRequest::new("new"))
+            .await
+            .unwrap();
+        assert_eq!(
+            &*client
+                .get_note_snapshot(&Workspace::Personal, "id")
+                .await
+                .unwrap()
+                .content,
+            "new"
+        );
+        let requests = server.finish();
+        assert!(!requests[2].to_ascii_lowercase().contains("if-none-match:"));
+    }
+
+    #[tokio::test]
+    async fn readback_overtaken_by_invalidation_cannot_seed_snapshot() {
+        let slot = Arc::new(std::sync::OnceLock::<Arc<HackmdClient>>::new());
+        let action = Arc::clone(&slot);
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"confirmed"}"#,
+            )
+            .response_header("etag", "W/\"old\"")
+            .before_response(move || {
+                action.get().unwrap().snapshots.invalidate();
+            }),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"newer"}"#,
+            )
+            .response_header("etag", "W/\"new\""),
+        ]);
+        let client = Arc::new(snapshot_client(&server));
+        slot.set(Arc::clone(&client)).unwrap();
+        client
+            .confirm_note_write(&Workspace::Personal, "id", 9, |note| {
+                note.content.as_deref() == Some("confirmed")
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            &*client
+                .get_note_snapshot(&Workspace::Personal, "id")
+                .await
+                .unwrap()
+                .content,
+            "newer"
+        );
+        let requests = server.finish();
+        assert!(!requests[1].to_ascii_lowercase().contains("if-none-match:"));
+    }
+
+    #[tokio::test]
+    async fn failed_write_still_evicts_snapshot() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"old"}"#,
+            )
+            .response_header("etag", "W/\"old\""),
+            Scenario::new("PATCH", "/v1/notes/id", 409, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"old"}"#,
+            )
+            .response_header("etag", "W/\"old\""),
+        ]);
+        let client = snapshot_client(&server);
+        client
+            .get_note_snapshot(&Workspace::Personal, "id")
+            .await
+            .unwrap();
+        assert!(
+            client
+                .update_note(&Workspace::Personal, "id", &UpdateNoteRequest::new("new"))
+                .await
+                .is_err()
+        );
+        client
+            .get_note_snapshot(&Workspace::Personal, "id")
+            .await
+            .unwrap();
+        let requests = server.finish();
+        assert!(!requests[2].to_ascii_lowercase().contains("if-none-match:"));
+    }
+    #[tokio::test]
+    #[ignore = "manual before/after snapshot transfer and latency workload"]
+    async fn benchmark_repeated_note_snapshots() {
+        let content = "# Snapshot workload\n".repeat(13_108);
+        let body=serde_json::json!({"id":"id","title":"Snapshot workload","content":content,"lastChangedAt":1}).to_string();
+        for capacity in [0, 8 * 1024 * 1024] {
+            let scenarios: [Scenario; 8] = std::array::from_fn(|index| {
+                if capacity == 0 || index == 0 {
+                    Scenario::new("GET", "/v1/notes/id", 200, &body)
+                        .response_header("etag", "W/\"bench\"")
+                } else {
+                    Scenario::new("GET", "/v1/notes/id", 304, "")
+                        .expect_header("if-none-match", "W/\"bench\"")
+                }
+            });
+            let server = SequenceServer::spawn_scenarios(scenarios);
+            let client = HackmdClient::new(
+                Config::for_loopback_test(&server.api_url, Some(FIXTURE_TOKEN))
+                    .with_snapshots(Duration::from_secs(60), capacity),
+            )
+            .unwrap();
+            let started = std::time::Instant::now();
+            for _ in 0..8 {
+                let snapshot = client
+                    .get_note_snapshot(&Workspace::Personal, "id")
+                    .await
+                    .unwrap();
+                assert_eq!(snapshot.content.as_str(), content);
+            }
+            let elapsed = started.elapsed();
+            let requests = server.finish();
+            assert_eq!(requests.len(), 8);
+            let full = requests
+                .iter()
+                .filter(|request| !request.to_ascii_lowercase().contains("if-none-match:"))
+                .count();
+            eprintln!(
+                "snapshot benchmark: capacity={capacity} markdown_bytes={} requests={} full_responses={full} body_bytes={} elapsed_us={}",
+                content.len(),
+                requests.len(),
+                full * body.len(),
+                elapsed.as_micros()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_write_evicts_snapshot_on_drop() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"old"}"#,
+            )
+            .response_header("etag", "W/\"old\""),
+            Scenario::new("PATCH", "/v1/notes/id", 202, "").delay(Duration::from_millis(50)),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"new"}"#,
+            )
+            .response_header("etag", "W/\"new\""),
+        ]);
+        let client = snapshot_client(&server);
+        client
+            .get_note_snapshot(&Workspace::Personal, "id")
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                client.update_note(&Workspace::Personal, "id", &UpdateNoteRequest::new("new"))
+            )
+            .await
+            .is_err()
+        );
+        client
+            .get_note_snapshot(&Workspace::Personal, "id")
+            .await
+            .unwrap();
+        assert!(
+            !server.finish()[2]
+                .to_ascii_lowercase()
+                .contains("if-none-match:")
+        );
+    }
+
+    fn snapshot_client(server: &SequenceServer) -> HackmdClient {
+        HackmdClient::new(
+            Config::for_loopback_test(&server.api_url, Some(FIXTURE_TOKEN))
+                .with_snapshots(Duration::from_secs(60), 1024 * 1024),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn snapshots_revalidate_verbatim_and_replace_changed_body() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"First","content":"old","lastChangedAt":1}"#,
+            )
+            .response_header("etag", "W/\"first\""),
+            Scenario::new("GET", "/v1/notes/id", 304, "")
+                .expect_header("if-none-match", "W/\"first\""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Second","content":"new","lastChangedAt":2}"#,
+            )
+            .expect_header("if-none-match", "W/\"first\"")
+            .response_header("etag", "W/\"second\""),
+            Scenario::new("GET", "/v1/notes/id", 304, "")
+                .expect_header("if-none-match", "W/\"second\""),
+        ]);
+        let client = snapshot_client(&server);
+        for (content, title, ts) in [
+            ("old", "First", 1),
+            ("old", "First", 1),
+            ("new", "Second", 2),
+            ("new", "Second", 2),
+        ] {
+            let snapshot = client
+                .get_note_snapshot(&Workspace::Personal, "id")
+                .await
+                .unwrap();
+            assert_eq!(snapshot.content.as_str(), content);
+            assert_eq!(snapshot.title, title);
+            assert_eq!(snapshot.last_changed_at, Some(ts));
+            assert_eq!(snapshot.digest, crate::hash::body_digest(content));
+        }
+        assert_eq!(server.finish().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn disabled_or_unvalidated_snapshots_always_fetch_full_body() {
+        for (ttl, bytes, etag) in [
+            (Duration::ZERO, 1024, true),
+            (Duration::from_secs(60), 0, true),
+            (Duration::from_secs(60), 1024, false),
+        ] {
+            let scenario = || {
+                let mut s = Scenario::new(
+                    "GET",
+                    "/v1/notes/id",
+                    200,
+                    r#"{"id":"id","title":"Note","content":"body"}"#,
+                );
+                if etag {
+                    s = s.response_header("etag", "W/\"one\"");
+                }
+                s
+            };
+            let server = SequenceServer::spawn_scenarios([scenario(), scenario()]);
+            let client = HackmdClient::new(
+                Config::for_loopback_test(&server.api_url, Some(FIXTURE_TOKEN))
+                    .with_snapshots(ttl, bytes),
+            )
+            .unwrap();
+            for _ in 0..2 {
+                client
+                    .get_note_snapshot(&Workspace::Personal, "id")
+                    .await
+                    .unwrap();
+            }
+            for request in server.finish() {
+                assert!(!request.to_ascii_lowercase().contains("if-none-match:"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unsolicited_304_and_missing_content_are_errors() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/notes/id", 304, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"No body"}"#,
+            )
+            .response_header("etag", "W/\"one\""),
+        ]);
+        let client = snapshot_client(&server);
+        assert!(
+            client
+                .get_note_snapshot(&Workspace::Personal, "id")
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            client.get_note_snapshot(&Workspace::Personal, "id").await,
+            Err(HackmdError::MissingContent { .. })
+        ));
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_snapshot_misses_share_one_get() {
+        let server = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/id",
+            200,
+            r#"{"id":"id","title":"Note","content":"body"}"#,
+        )
+        .response_header("etag", "W/\"one\"")
+        .delay(Duration::from_millis(30))]);
+        let client = snapshot_client(&server);
+        let (one, two) = tokio::join!(
+            client.get_note_snapshot(&Workspace::Personal, "id"),
+            client.get_note_snapshot(&Workspace::Personal, "id")
+        );
+        assert!(Arc::ptr_eq(&one.unwrap(), &two.unwrap()));
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn push_readback_seeds_only_after_confirmation() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"old"}"#,
+            )
+            .response_header("etag", "W/\"old\""),
+            Scenario::new("PATCH", "/v1/notes/id", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"old"}"#,
+            )
+            .response_header("etag", "W/\"old\""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"new"}"#,
+            )
+            .response_header("etag", "W/\"new\""),
+            Scenario::new("GET", "/v1/notes/id", 304, "")
+                .expect_header("if-none-match", "W/\"new\""),
+        ]);
+        let client = snapshot_client(&server);
+        client
+            .get_note_body(&Workspace::Personal, "id")
+            .await
+            .unwrap();
+        client
+            .write_note_body(&Workspace::Personal, "id", "new")
+            .await
+            .unwrap();
+        assert_eq!(
+            &*client
+                .get_note_snapshot(&Workspace::Personal, "id")
+                .await
+                .unwrap()
+                .content,
+            "new"
+        );
+        let requests = server.finish();
+        assert_eq!(requests.len(), 5);
+        assert!(!requests[2].to_ascii_lowercase().contains("if-none-match:"));
+        assert!(!requests[3].to_ascii_lowercase().contains("if-none-match:"));
+    }
+
+    #[tokio::test]
+    async fn delete_restore_and_folder_delete_evict_snapshots_and_lists() {
+        for (method, path) in [
+            (Method::DELETE, vec!["notes", "id"]),
+            (Method::PUT, vec!["trash", "id", "restore"]),
+            (Method::DELETE, vec!["folders", "folder"]),
+        ] {
+            let route = format!("/v1/{}", path.join("/"));
+            let server = SequenceServer::spawn_scenarios([
+                Scenario::new("GET", "/v1/notes", 200, "[]"),
+                Scenario::new(
+                    "GET",
+                    "/v1/notes/id",
+                    200,
+                    r#"{"id":"id","title":"Note","content":"old"}"#,
+                )
+                .response_header("etag", "W/\"old\""),
+                Scenario::new(method.as_str(), &route, 204, ""),
+                Scenario::new("GET", "/v1/notes", 200, "[]"),
+                Scenario::new(
+                    "GET",
+                    "/v1/notes/id",
+                    200,
+                    r#"{"id":"id","title":"Note","content":"new"}"#,
+                )
+                .response_header("etag", "W/\"new\""),
+            ]);
+            let client = HackmdClient::new(
+                Config::for_loopback_test_with_cache(&server.api_url)
+                    .with_snapshots(Duration::from_secs(60), 1024),
+            )
+            .unwrap();
+            client
+                .list_notes(&Workspace::Personal, false)
+                .await
+                .unwrap();
+            client
+                .get_note_snapshot(&Workspace::Personal, "id")
+                .await
+                .unwrap();
+            client.write(method, &path, NO_BODY).await.unwrap();
+            client
+                .list_notes(&Workspace::Personal, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                &*client
+                    .get_note_snapshot(&Workspace::Personal, "id")
+                    .await
+                    .unwrap()
+                    .content,
+                "new"
+            );
+            let requests = server.finish();
+            assert!(!requests[4].to_ascii_lowercase().contains("if-none-match:"));
+        }
+    }
     #[tokio::test]
     async fn a_fresh_note_list_is_reused_until_a_write_invalidates_it() {
         // Two list responses for three list calls: the second call is served

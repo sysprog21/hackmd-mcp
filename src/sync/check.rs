@@ -65,11 +65,11 @@ pub(crate) async fn check_note_sync(
     let tracked = files.state().load_for_local_path(local_path)?;
     // Only looking needs no large-file confirmation, but the maximum holds.
     let local = read_local_body(files, local_path, true)?;
-    let (remote_note, remote) = client
-        .get_note_body(&tracked.state.workspace, &tracked.state.internal_id)
+    let remote_note = client
+        .get_note_snapshot(&tracked.state.workspace, &tracked.state.internal_id)
         .await?;
     let (local_digest, remote_digest) =
-        crate::local::offload(|| (body_digest(&local), body_digest(&remote)));
+        crate::local::offload(|| (body_digest(&local), remote_note.digest));
 
     // Converged sides are in sync, as push agrees, and the next push moves the
     // baseline there.
@@ -98,6 +98,55 @@ mod tests {
 
     use super::{SyncStatus, check_note_sync};
     use crate::fixture::{Scenario, SequenceServer};
+    #[tokio::test]
+    async fn conditional_snapshot_checks_still_detect_remote_changes_within_ttl() {
+        let directory = tempfile::tempdir().unwrap();
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").unwrap();
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"baseline","lastChangedAt":1}"#,
+            )
+            .response_header("etag", "W/\"one\""),
+            Scenario::new("GET", "/v1/notes/id", 304, "")
+                .expect_header("if-none-match", "W/\"one\""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/id",
+                200,
+                r#"{"id":"id","title":"Note","content":"changed","lastChangedAt":2}"#,
+            )
+            .expect_header("if-none-match", "W/\"one\"")
+            .response_header("etag", "W/\"two\""),
+        ]);
+        let client = crate::client::HackmdClient::new(
+            crate::config::Config::for_loopback_test(
+                &fixture.api_url,
+                Some(crate::fixture::FIXTURE_TOKEN),
+            )
+            .with_snapshots(std::time::Duration::from_secs(60), 1024),
+        )
+        .unwrap();
+        let files = crate::fixture::tracked_files(directory.path(), "id", &local_path, "baseline");
+        for expected in [
+            SyncStatus::InSync,
+            SyncStatus::InSync,
+            SyncStatus::RemoteChanged,
+        ] {
+            assert_eq!(
+                check_note_sync(&client, &files, &local_path)
+                    .await
+                    .unwrap()
+                    .status,
+                expected
+            );
+        }
+        assert_eq!(fixture.finish().len(), 3);
+    }
+
     #[tokio::test]
     async fn classifies_all_four_sync_states_without_writes() {
         let directory = tempfile::tempdir().expect("temp directory should create");

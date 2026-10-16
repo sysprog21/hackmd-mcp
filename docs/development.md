@@ -45,7 +45,7 @@ The `otel` feature adds an OTLP span exporter, switched on at runtime with
 
 ## Live API suites
 
-Both live suites are ignored by default. The read-only one mutates nothing and
+The live suites are ignored by default. The read-only one mutates nothing and
 prints both conditional-validator results and compression body-byte counts:
 
 ```sh
@@ -80,8 +80,9 @@ The personal and team note GETs therefore support conditional revalidation for
 this deployment. Last-Modified conditionals were not sent because that header
 was absent. This observation permits implementing the bounded snapshot cache;
 each conditional request was sampled once immediately after its initial GET.
-It does not establish behavior on other deployments, validator changes after
-a write, or rate-limit accounting.
+This initial read-only observation does not establish behavior on other
+deployments or rate-limit accounting. Post-edit validator behavior is
+[measured below](#measured-post-edit-validators-2026-10-14).
 
 The compression test read an existing team note with 233,314 Markdown bytes.
 All three GETs succeeded, omitted Content-Encoding, and transferred 238,438
@@ -93,6 +94,60 @@ Recheck before adding a compression dependency if the deployment changes.
 The destructive suite creates and deletes notes and folders. Run it only with a
 dedicated throwaway account; the environment gates it requires are listed at
 the top of `tests/live-destructive.rs`.
+
+### Snapshot validation and workload
+
+`tests/live-validators.rs` is an additional ignored write probe, with the same
+explicit destructive gates. Run only with separately authorized writes:
+
+```sh
+cargo test --test live-validators -- --ignored --nocapture
+```
+
+It creates one personal and one selected-team note with owner permissions,
+checks that each saved ETag returns 304 before an edit and 200 after separate
+body/title edits, then DELETEs only its own new notes (no purge request).
+It does not run the broader destructive suite. The completed measurement below
+supports the 8 MiB default snapshot budget.
+
+Offline verification uses
+`cargo test benchmark_repeated_note_snapshots -- --ignored --nocapture`.
+With Rust 1.99.0 on aarch64 macOS, eight sequential reads of the same 262,160-byte
+fixture Markdown body produced these results, using the same client and
+workload with only the snapshot byte capacity changed:
+
+| Capacity | GETs | Full responses | HTTP body bytes | Loopback time |
+|----------|------|----------------|-----------------|---------------|
+| zero | 8 | 8 | 2,202,704 | 70,846 us |
+| 8 MiB | 8 | 1 | 275,338 | 16,787 us |
+
+Seven bodies are avoided (87.5% fewer transferred body bytes), with no GET-count
+reduction. Fixture timing is not a live latency claim. Retained snapshots add
+memory up to the configured byte budget; TTL, LRU eviction and write invalidation
+bound that retention. Body storage shares the decoded String rather than
+copying it for each reader. Full metadata reads stay uncached.
+
+### Measured post-edit validators (2026-10-14)
+
+The user explicitly authorized the existing configured token for this isolated
+write probe. At revision `85978fa`, the ignored `live-validators` test passed
+against `https://api.hackmd.io/v1`, using one new personal note and one new
+selected-team note with verified owner read/write permissions. It edited only
+those notes; DELETE succeeded for both, with no purge request and no
+modification of existing notes. Team trash placement was not measured.
+No credentials or note identifiers are published.
+
+| Workspace | Old ETag before edit | Old ETag after body edit | Old ETag after title edit | Final unchanged ETag |
+|-----------|----------------------|--------------------------|---------------------------|----------------------|
+| personal | 304 before each edit | 200, new body | 200, new title and same body | 304 |
+| team | 304 before each edit | 200, new body | 200, new title and same body | 304 |
+
+Both edits produced a different ETag. Plain GET polling first confirmed each
+write was visible; the conditional GET then asserted the changed fields.
+These measured API writes support enabling the 8 MiB snapshot default on this
+deployment. They do not measure web UI edits, other deployments, cross-replica
+consistency or rate-limit accounting. Every cache read still revalidates;
+TTL alone never supplies content for conflict detection.
 
 ## Continuous integration
 

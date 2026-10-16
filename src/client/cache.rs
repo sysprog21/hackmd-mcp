@@ -75,7 +75,7 @@ struct CachedNotes {
 
 /// A short-lived copy of a workspace's note list.
 ///
-/// `HackMD` has no note-list pagination and no conditional GET, so listing is
+/// `HackMD` has no note-list pagination, so listing here is
 /// all-or-nothing and the same list backs both the list tool and every URL
 /// reference resolution. A TTL of zero disables the cache, which is what the
 /// tests use so their request counts stay meaningful.

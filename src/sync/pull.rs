@@ -229,7 +229,7 @@ pub(crate) async fn pull_note(
     Ok(Ok(PullNoteOutput {
         workspace: note.workspace,
         note_id: note.note_id,
-        title: remote.title,
+        title: remote.title.clone(),
         body_hash: state.baseline_body_hash,
         // The canonical path the record keeps, which is what push reports back.
         local_path: state.local_path,

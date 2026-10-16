@@ -564,7 +564,9 @@ pub(crate) async fn update_note(
                     other => other.into(),
                 })?;
             ensure_unchanged(&note.note_id, &current, expected)?;
-            replacement.unwrap_or(current)
+            replacement.unwrap_or_else(|| {
+                std::sync::Arc::try_unwrap(current).unwrap_or_else(|body| (*body).clone())
+            })
         }
     };
     let mut payload = UpdateNoteRequest {
