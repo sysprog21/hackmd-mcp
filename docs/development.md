@@ -10,6 +10,17 @@
 | `make indent` | rustfmt, plus commentflow and shfmt when installed |
 | `make coverage` | line coverage, needs cargo-llvm-cov |
 
+CI runs the same all-target, all-feature suite with pinned cargo-llvm-cov on
+Linux, macOS, and Windows, and merges their line coverage. The coverage job
+checks changed production source lines against the floor in
+`.ci/coverage-floor`, an integer percentage raised by hand in a reviewed change;
+the gate refuses lowering or deleting it. Macro attribute spans and test
+items are excluded; error and platform code remains measured. Coverage tools
+are installed in CI, never linked into the server. `python3 tests/coverage.py`
+checks the merge, source filter, and ratchet locally. Raw platform reports are
+available as `coverage-*` artifacts, and the merged result is in the coverage
+job summary.
+
 `make check` and clippy are separate gates, and CI runs both. To install the
 current checkout and register it:
 
