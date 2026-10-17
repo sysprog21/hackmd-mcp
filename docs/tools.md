@@ -7,9 +7,13 @@ explains how they fit together.
 ## Finding notes
 
 Every tool that takes a `note_ref` accepts either a note's internal ID or its
-URL, such as `https://hackmd.io/@owner/slug`. If a URL matches no note, or more
-than one, the tool does not guess: it returns the candidates so the agent can
-pick.
+URL, such as `https://hackmd.io/@owner/slug`; a trailing `/download` is
+ignored. A legacy share link, `https://hackmd.io/s/<shortId>`, names no
+workspace: with a `team_path` only that team is searched, and without one the
+personal notes and then every team (a team that cannot be listed fails the
+search, and the error suggests `team_path`). If a URL matches no note, or
+more than one, the tool does not guess: it returns the candidates so the agent
+can pick.
 
 Notes the tools return carry a `note_url`, `https://hackmd.io/<id>`, which opens
 personal and team notes alike. It is a link, not an invite: whoever follows it
@@ -78,10 +82,12 @@ write and one upload with it. An edit landing between that read and the write
 is reverted; `expected_hash` works here too and catches any made before it. The
 `title` field always takes effect. The body sets a title only when a note is
 created without one (a front-matter `title:`, then the first H1, then
-"Untitled"), and later body edits never change it, so `hackmd_pull_note` and
-`hackmd_push_note` report `title_drift` when the body's own title no longer
-matches the listed one. They report it only when the body as last synced gave
-the listed title (a title that always differed may be deliberate, and a first
+"Untitled"), and later body edits never change it, so `hackmd_pull_note`,
+`hackmd_push_note`, and a `patch` edit on `hackmd_update_note` report
+`title_drift` when the body's own title no longer matches the listed one;
+set `title` in a separate update if the listing should follow. They report it
+only when the body as last synced (for a patch, the body before it) gave the
+listed title (a title that always differed may be deliberate, and a first
 pull has nothing to compare), only when they can read both titles for certain
 (plain front matter, or an H1 that is the body's first line of text), and push
 only on a push or a no-op, so a missing `title_drift` does not mean the titles

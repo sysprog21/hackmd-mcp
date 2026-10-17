@@ -18,7 +18,7 @@ pub(crate) struct ListTrackedNotesInput<'a> {
     pub(crate) offset: usize,
     /// Case-insensitive match against the note ID and the local path.
     pub(crate) query: Option<&'a str>,
-    /// Only this team's records, when given.
+    /// Only this workspace's records, when given.
     pub(crate) team: Option<&'a Workspace>,
 }
 

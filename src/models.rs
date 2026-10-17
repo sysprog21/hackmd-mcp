@@ -5,10 +5,12 @@ use serde::{Deserialize, Serialize};
 /// family for both route shapes.
 ///
 /// On the wire it is a nullable team path: `null` for the personal workspace,
-/// the team's path for a team. That is the shape tool input takes (as
-/// `team_path`) and tool output reports, so an agent can pass back what it was
-/// given. The older tagged object (`{"kind": "team", "team_path": ...}`) is
-/// still read; only the sync state store still writes it, through [`tagged`].
+/// the team's path for a team. That is the shape tool output reports and tool
+/// input takes (as `team_path`), so an agent can pass back what it was given;
+/// an input read through [`given`] holds `None` for `null`, which each tool
+/// treats as the personal workspace except where it searches more widely. The
+/// older tagged object (`{"kind": "team", "team_path": ...}`) is still read;
+/// only the sync state store still writes it, through [`tagged`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Workspace {
     /// Operate on the authenticated user's personal workspace.
@@ -95,6 +97,17 @@ impl schemars::JsonSchema for Workspace {
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
         <Option<String>>::json_schema(generator)
     }
+}
+
+/// `deserialize_with` for an optional `team_path` input: a team, or `None`
+/// when none was named. Older clients send the tagged personal object as
+/// their default on every call, so it means "none named" too, exactly as
+/// `null` and omission do.
+pub(crate) fn given<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Workspace>, D::Error> {
+    Ok(Option::<Workspace>::deserialize(deserializer)?
+        .filter(|workspace| *workspace != Workspace::Personal))
 }
 
 /// `#[serde(with = "crate::models::tagged")]` for sync state, which keeps

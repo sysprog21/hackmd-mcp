@@ -23,13 +23,20 @@ use crate::{
 pub(crate) struct PullNoteInput {
     /// Team path (from `hackmd_get_me`) when a direct internal note ID belongs
     /// to a team; omit for personal notes. `@owner/slug` URLs name their own
-    /// workspace.
-    #[serde(default, rename = "team_path", alias = "workspace")]
-    pub(crate) workspace: Workspace,
-    /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
+    /// workspace. With an `s/<shortId>` link, only this team is searched;
+    /// omitted, the personal notes and then every team are.
+    #[serde(
+        default,
+        rename = "team_path",
+        alias = "workspace",
+        deserialize_with = "crate::models::given"
+    )]
+    pub(crate) workspace: Option<Workspace>,
+    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
+    /// `hackmd.io/s/<shortId>` share link. A trailing `/download` is ignored.
     pub(crate) note_ref: String,
     /// Bypass the 60-second account and note-list caches when resolving an
-    /// `@owner/slug` URL.
+    /// `@owner/slug` URL or `s/<shortId>` link.
     #[serde(default)]
     pub(crate) refresh: bool,
     /// Absolute destination path ending in `.md` for the exact remote body.
@@ -332,7 +339,7 @@ mod tests {
     use serde_json::json;
 
     use super::{NoteResolution, PullNoteError, PullNoteInput, PullNoteOutput, pull_note};
-    use crate::{client::HackmdClient, config::Config, local::LocalFiles, models::Workspace};
+    use crate::{client::HackmdClient, config::Config, local::LocalFiles};
 
     #[tokio::test]
     async fn a_workspace_root_stops_a_write_outside_it() {
@@ -342,7 +349,7 @@ mod tests {
         let client = HackmdClient::new(Config::for_tests()).expect("client should build");
         let files = LocalFiles::new(directory.path().join("state"), Some(root));
         let input = PullNoteInput {
-            workspace: Workspace::Personal,
+            workspace: None,
             note_ref: "note-id".to_owned(),
             refresh: false,
             local_path: directory.path().join("outside.md"),
@@ -379,7 +386,7 @@ mod tests {
             &client,
             &files,
             PullNoteInput {
-                workspace: Workspace::Personal,
+                workspace: None,
                 note_ref: "note/id".to_owned(),
                 refresh: false,
                 local_path: destination.clone(),
@@ -474,7 +481,7 @@ mod tests {
             &fixture.client(),
             &files,
             PullNoteInput {
-                workspace: Workspace::Personal,
+                workspace: None,
                 note_ref: "large-note".to_owned(),
                 refresh: false,
                 local_path: destination.clone(),
@@ -515,7 +522,7 @@ mod tests {
         let existing = directory.path().join("note.md");
         fs::write(&existing, "local").expect("fixture should write");
         let input = PullNoteInput {
-            workspace: Workspace::Personal,
+            workspace: None,
             note_ref: "id".to_owned(),
             refresh: false,
             local_path: existing,
@@ -532,7 +539,7 @@ mod tests {
         let non_markdown = directory.path().join("note.txt");
         fs::write(&non_markdown, "local").expect("fixture should write");
         let input = PullNoteInput {
-            workspace: Workspace::Personal,
+            workspace: None,
             note_ref: "id".to_owned(),
             refresh: false,
             local_path: non_markdown,
@@ -547,7 +554,7 @@ mod tests {
         ));
 
         let input = PullNoteInput {
-            workspace: Workspace::Personal,
+            workspace: None,
             note_ref: "id".to_owned(),
             refresh: false,
             local_path: {
@@ -567,7 +574,7 @@ mod tests {
 
         let missing_parent = directory.path().join("missing/note.md");
         let input = PullNoteInput {
-            workspace: Workspace::Personal,
+            workspace: None,
             note_ref: "id".to_owned(),
             refresh: false,
             local_path: missing_parent.clone(),
@@ -608,7 +615,7 @@ mod tests {
                 fs::write(&editor_path, "saved mid-pull").expect("editor save should write");
             })]);
         let input = PullNoteInput {
-            workspace: Workspace::Personal,
+            workspace: None,
             note_ref: "note-id".to_owned(),
             refresh: false,
             local_path: local_path.clone(),
@@ -632,7 +639,7 @@ mod tests {
 
     fn overwrite_input(local_path: &std::path::Path, discard_local_changes: bool) -> PullNoteInput {
         PullNoteInput {
-            workspace: Workspace::Personal,
+            workspace: None,
             note_ref: "note-id".to_owned(),
             refresh: false,
             local_path: local_path.to_path_buf(),

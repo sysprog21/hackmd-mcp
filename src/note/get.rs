@@ -22,14 +22,21 @@ use crate::{
 pub(crate) struct GetNoteInput {
     /// Team path (from `hackmd_get_me`) when a direct internal note ID belongs
     /// to a team; omit for personal notes. `@owner/slug` URLs name their own
-    /// workspace.
-    #[serde(default, rename = "team_path", alias = "workspace")]
-    pub(crate) workspace: Workspace,
-    /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
+    /// workspace. With an `s/<shortId>` link, only this team is searched;
+    /// omitted, the personal notes and then every team are.
+    #[serde(
+        default,
+        rename = "team_path",
+        alias = "workspace",
+        deserialize_with = "crate::models::given"
+    )]
+    pub(crate) workspace: Option<Workspace>,
+    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
+    /// `hackmd.io/s/<shortId>` share link. A trailing `/download` is ignored.
     /// Give this or `local_path`, not both.
     pub(crate) note_ref: Option<String>,
     /// Bypass the 60-second account and note-list caches when resolving an
-    /// `@owner/slug` URL.
+    /// `@owner/slug` URL or `s/<shortId>` link.
     #[serde(default)]
     pub(crate) refresh: bool,
     /// Instead of `note_ref`: the absolute path of a Markdown file tracked by
@@ -140,7 +147,7 @@ pub(crate) async fn get_note(
         (None, Some(local_path)) => {
             // The record names the note, so a team or a cache bypass here would
             // only look like it mattered.
-            if input.workspace != Workspace::Personal || input.refresh || !input.include_content {
+            if input.workspace.is_some() || input.refresh || !input.include_content {
                 return Err(GetNoteError::SyncFilters);
             }
             let sync = check_note_sync(client, files, &local_path).await?;
@@ -225,6 +232,44 @@ mod tests {
         models::Workspace,
         note::reference::ResolvedNoteRef,
     };
+
+    /// `null` is what clients send for an unset optional field, and older
+    /// clients send the tagged personal object by default, so both mean "not
+    /// given", as omission does. Both aliases read the same.
+    #[test]
+    fn a_null_team_path_is_the_same_as_none_given() {
+        let team_path = |input: serde_json::Value| {
+            serde_json::from_value::<GetNoteInput>(input)
+                .expect("input should deserialize")
+                .workspace
+        };
+        assert_eq!(team_path(json!({"note_ref": "id"})), None);
+        assert_eq!(
+            team_path(json!({"note_ref": "id", "team_path": null})),
+            None
+        );
+        assert_eq!(
+            team_path(json!({"note_ref": "id", "workspace": null})),
+            None
+        );
+        assert_eq!(
+            team_path(json!({"note_ref": "id", "workspace": {"kind": "personal"}})),
+            None
+        );
+        let core = Some(Workspace::Team {
+            team_path: "core".to_owned(),
+        });
+        assert_eq!(
+            team_path(json!({"note_ref": "id", "team_path": "core"})),
+            core
+        );
+        assert_eq!(
+            team_path(
+                json!({"note_ref": "id", "workspace": {"kind": "team", "team_path": "core"}})
+            ),
+            core
+        );
+    }
 
     fn response() -> NoteResponse {
         serde_json::from_value(json!({
@@ -380,7 +425,7 @@ mod tests {
             &fixture.client(),
             &crate::fixture::scratch_files(),
             GetNoteInput {
-                workspace: Workspace::Personal,
+                workspace: None,
                 note_ref: Some("https://hackmd.io/@alice/slug".to_owned()),
                 refresh: false,
                 local_path: None,

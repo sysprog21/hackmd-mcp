@@ -90,7 +90,7 @@ pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     instructions = "Before editing an existing note, fetch it with hackmd_get_note, preserve unrelated passages, and pass its body_hash as expected_hash to hackmd_update_note. Prefer a context-checked patch. On a conflict, fetch again and rebuild the change; do not blindly retry an uncertain write or create. HackMD has no atomic conditional writes, so concurrent edits can still race.\n\
         Locate notes with hackmd_list_notes metadata filters, then fetch only relevant candidates to search their bodies. There is no full-text search or revision diff; history is the account's history list, not edit history. Do not pick arbitrarily among ambiguous destinations.\n\
         Use hackmd_get_me to identify team_path for shared workspaces. folder_ids is the ancestor chain of the note's folder; parent_folder_id sets that folder.\n\
-        When sharing, check the intended audience and read_permission, including unconfirmed_fields after creation. When present, note_url identifies a note but grants no access and is not an invite or published link. This server does not create invite links or publish pages; use the HackMD web UI. The title field always wins; the body supplies a title only when a note is created without one, and editing a body's H1 later never renames the note, so pull and push report title_drift."
+        When sharing, check the intended audience and read_permission, including unconfirmed_fields after creation. When present, note_url identifies a note but grants no access and is not an invite or published link. This server does not create invite links or publish pages; use the HackMD web UI. The title field always wins; the body supplies a title only when a note is created without one, and editing a body's H1 later never renames the note, so pull, push, and patch edits report title_drift."
 )]
 impl rmcp::ServerHandler for HackmdServer {
     /// Wraps every dispatch in one span and one retry scope, so each tool call
@@ -321,6 +321,28 @@ mod tests {
         assert_eq!(Arc::strong_count(&client), 2);
         drop(server);
         assert_eq!(Arc::strong_count(&client), 1);
+    }
+
+    /// An optional `team_path` advertises the same nullable string as before.
+    #[test]
+    fn optional_team_paths_keep_the_nullable_string_schema() {
+        let tools = HackmdServer::router().list_all();
+        for name in [
+            "hackmd_get_note",
+            "hackmd_list_notes",
+            "hackmd_update_note",
+            "hackmd_delete_note",
+            "hackmd_pull_note",
+            "hackmd_push_note",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("tool should exist");
+            let team_path = &tool.input_schema["properties"]["team_path"];
+            assert_eq!(team_path["type"], json!(["string", "null"]), "{name}");
+            assert!(team_path.get("anyOf").is_none(), "{name}");
+        }
     }
 
     #[test]

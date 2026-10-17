@@ -2117,7 +2117,7 @@ mod tests {
             &crate::fixture::scratch_files(),
             crate::note::list::ListNotesInput {
                 source: crate::note::list::NoteSource::Workspace,
-                workspace: Workspace::Personal,
+                workspace: None,
                 limit: 100,
                 offset: 4_900,
                 query: Some("roadmap".to_owned()),

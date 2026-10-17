@@ -26,8 +26,13 @@ pub(crate) struct ListNotesInput {
     /// personal workspace. History and trash are account-wide and take no
     /// team; for `tracked` a team narrows the records to that team's notes,
     /// and omitting it lists every workspace's.
-    #[serde(default, rename = "team_path", alias = "workspace")]
-    pub(crate) workspace: Workspace,
+    #[serde(
+        default,
+        rename = "team_path",
+        alias = "workspace",
+        deserialize_with = "crate::models::given"
+    )]
+    pub(crate) workspace: Option<Workspace>,
     /// Maximum notes returned after filtering (default 20, maximum 100).
     #[serde(default = "default_limit")]
     #[schemars(range(min = 1, max = 100))]
@@ -196,15 +201,14 @@ fn list_tracked(
     }
 
     // An omitted team lists every workspace's records, not only personal ones:
-    // `Workspace` cannot tell "omitted" from "personal", and listing everything
-    // is what a caller without a team means here.
+    // that is what a caller without a team means here.
     Ok(list_tracked_notes(
         files,
         &ListTrackedNotesInput {
             limit: input.limit,
             offset: input.offset,
             query: input.query.as_deref(),
-            team: Some(&input.workspace).filter(|team| **team != Workspace::Personal),
+            team: input.workspace.as_ref(),
         },
     )?)
 }
@@ -219,7 +223,7 @@ pub(crate) async fn list_notes(
     }
     // History and trash are account-wide and never cached.
     let account_wide = |name| {
-        if input.workspace != Workspace::Personal {
+        if input.workspace.is_some() {
             Err(ListNotesError::AccountWideSource(name))
         } else if input.refresh {
             Err(ListNotesError::UncachedRefresh(name))
@@ -238,9 +242,10 @@ pub(crate) async fn list_notes(
     let site = client.site_url();
     match input.source {
         NoteSource::Workspace => {
-            let notes = client.list_notes(&input.workspace, input.refresh).await?;
+            let workspace = input.workspace.clone().unwrap_or_default();
+            let notes = client.list_notes(&workspace, input.refresh).await?;
             Ok(filter_sort_page(site, &notes, &input, sort, |_| {
-                input.workspace.clone()
+                workspace.clone()
             }))
         }
         NoteSource::History => {
@@ -379,7 +384,7 @@ mod tests {
     fn input() -> ListNotesInput {
         ListNotesInput {
             source: NoteSource::Workspace,
-            workspace: Workspace::Personal,
+            workspace: None,
             limit: 20,
             offset: 0,
             query: None,
@@ -423,9 +428,9 @@ mod tests {
         // A team narrows the records; this one is personal.
         let mut other_team = input();
         other_team.source = NoteSource::Tracked;
-        other_team.workspace = Workspace::Team {
+        other_team.workspace = Some(Workspace::Team {
             team_path: "core".to_owned(),
-        };
+        });
         let ListOutput::Tracked(output) = list_notes(&client, &files, other_team)
             .await
             .expect("a team filter should list")
@@ -663,9 +668,9 @@ mod tests {
         for source in [NoteSource::History, NoteSource::Trash] {
             let mut invalid = input();
             invalid.source = source;
-            invalid.workspace = Workspace::Team {
+            invalid.workspace = Some(Workspace::Team {
                 team_path: "core".to_owned(),
-            };
+            });
             assert!(matches!(
                 remote(&client, invalid).await,
                 Err(ListNotesError::AccountWideSource(_))
@@ -678,6 +683,32 @@ mod tests {
             assert!(matches!(
                 remote(&client, refreshed).await,
                 Err(ListNotesError::UncachedRefresh(_))
+            ));
+        }
+    }
+
+    /// `null`, omission, and the older tagged personal object all name no
+    /// team, so an account-wide source passes its check and reaches the
+    /// network (here, the missing token).
+    #[tokio::test]
+    async fn account_wide_sources_accept_every_form_of_no_team() {
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        for team_path in [
+            json!({}),
+            json!({"team_path": null}),
+            json!({"workspace": {"kind": "personal"}}),
+        ] {
+            let mut input = json!({"source": "history"});
+            input
+                .as_object_mut()
+                .expect("an object")
+                .extend(team_path.as_object().expect("an object").clone());
+            let input: ListNotesInput =
+                serde_json::from_value(input).expect("input should deserialize");
+            assert_eq!(input.workspace, None);
+            assert!(matches!(
+                remote(&client, input).await,
+                Err(ListNotesError::Api(_))
             ));
         }
     }

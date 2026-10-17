@@ -71,13 +71,20 @@ pub(crate) struct CreateNoteInput {
 pub(crate) struct UpdateNoteInput {
     /// Team path (from `hackmd_get_me`) when a direct internal note ID belongs
     /// to a team; omit for personal notes. `@owner/slug` URLs name their own
-    /// workspace.
-    #[serde(default, rename = "team_path", alias = "workspace")]
-    pub(crate) workspace: Workspace,
-    /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
+    /// workspace. With an `s/<shortId>` link, only this team is searched;
+    /// omitted, the personal notes and then every team are.
+    #[serde(
+        default,
+        rename = "team_path",
+        alias = "workspace",
+        deserialize_with = "crate::models::given"
+    )]
+    pub(crate) workspace: Option<Workspace>,
+    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
+    /// `hackmd.io/s/<shortId>` share link. A trailing `/download` is ignored.
     pub(crate) note_ref: String,
     /// Bypass the 60-second account and note-list caches when resolving an
-    /// `@owner/slug` URL.
+    /// `@owner/slug` URL or `s/<shortId>` link.
     #[serde(default)]
     pub(crate) refresh: bool,
     /// New listed title. It always takes effect, whatever the body's
@@ -161,16 +168,23 @@ impl UpdateNoteInput {
 pub(crate) struct DeleteNoteInput {
     /// Team path (from `hackmd_get_me`) when a direct internal note ID belongs
     /// to a team; omit for personal notes. `@owner/slug` URLs name their own
-    /// workspace.
-    #[serde(default, rename = "team_path", alias = "workspace")]
-    pub(crate) workspace: Workspace,
-    /// Internal API ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
+    /// workspace. With an `s/<shortId>` link, only this team is searched;
+    /// omitted, the personal notes and then every team are.
+    #[serde(
+        default,
+        rename = "team_path",
+        alias = "workspace",
+        deserialize_with = "crate::models::given"
+    )]
+    pub(crate) workspace: Option<Workspace>,
+    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
+    /// `hackmd.io/s/<shortId>` share link. A trailing `/download` is ignored.
     /// With `restore`, the internal ID from `hackmd_list_notes` with source
     /// `trash`.
     #[serde(alias = "note_id")]
     pub(crate) note_ref: String,
     /// Bypass the 60-second account and note-list caches when resolving an
-    /// `@owner/slug` URL.
+    /// `@owner/slug` URL or `s/<shortId>` link.
     #[serde(default)]
     pub(crate) refresh: bool,
     /// Bring a personal note back from trash instead of deleting it.
@@ -237,7 +251,7 @@ pub(crate) enum CrudError {
     )]
     MalformedExpectedHash,
     #[error(
-        "restore takes the internal note ID from hackmd_list_notes with source trash; a trashed note has no live @owner/slug to resolve, and refresh does not apply"
+        "restore takes the internal note ID from hackmd_list_notes with source trash; a trashed note has no live @owner/slug or s/<shortId> to resolve, and refresh does not apply"
     )]
     RestoreNeedsId,
     #[error(
@@ -688,7 +702,9 @@ pub(crate) async fn delete_note(
 ) -> Result<Result<DeleteNoteOutput, NoteResolution>, CrudError> {
     // Resolving a slug searches the live workspace list, where a trashed note
     // never appears, so it could only end in a confusing not-found.
-    if input.restore && (input.refresh || crate::note::reference::is_slug_url(&input.note_ref)) {
+    if input.restore
+        && (input.refresh || crate::note::reference::resolves_by_listing(&input.note_ref))
+    {
         return Err(CrudError::RestoreNeedsId);
     }
     let resolution = crate::note::reference::resolve_note_ref(
@@ -780,6 +796,7 @@ mod tests {
         }
         for input in [
             json!({"note_ref": "https://hackmd.io/@alice/slug", "restore": true}),
+            json!({"note_ref": "https://hackmd.io/s/SkE33UTHf", "restore": true}),
             json!({"note_ref": "id", "restore": true, "refresh": true}),
         ] {
             let input = serde_json::from_value(input).expect("input should deserialize");

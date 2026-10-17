@@ -23,15 +23,22 @@ const IMAGE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 pub(crate) struct UploadNoteImageInput {
     /// Accepted, as on every other tool, so older callers are not rejected
     /// outright. Not advertised: the upload route is the same for every note,
-    /// so this only cross-checks the owner of an `@owner/slug` URL.
-    #[serde(default, rename = "team_path", alias = "workspace")]
+    /// so this only cross-checks the owner of an `@owner/slug` URL and limits
+    /// the search for an `s/<shortId>` link to that team.
+    #[serde(
+        default,
+        rename = "team_path",
+        alias = "workspace",
+        deserialize_with = "crate::models::given"
+    )]
     #[schemars(skip)]
-    pub(crate) workspace: Workspace,
-    /// Internal note ID, `hackmd.io/<id>`, or `hackmd.io/@owner/slug` URL.
+    pub(crate) workspace: Option<Workspace>,
+    /// Internal note ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
+    /// `hackmd.io/s/<shortId>` share link. A trailing `/download` is ignored.
     /// Personal and team notes both accept uploads.
     pub(crate) note_ref: String,
     /// Bypass the 60-second account and note-list caches when resolving an
-    /// `@owner/slug` URL.
+    /// `@owner/slug` URL or `s/<shortId>` link.
     #[serde(default)]
     pub(crate) refresh: bool,
     /// Absolute path to a local image file. Give this or `image_url`.
@@ -366,7 +373,7 @@ mod tests {
         confirm_large_file: bool,
     ) -> UploadNoteImageInput {
         UploadNoteImageInput {
-            workspace: crate::models::Workspace::Personal,
+            workspace: None,
             note_ref: note_ref.to_owned(),
             refresh: false,
             image_path: Some(path.to_path_buf()),
@@ -627,7 +634,7 @@ mod tests {
         confirm_large_file: bool,
     ) -> Result<super::UploadNoteImageOutput, UploadNoteImageError> {
         let input = UploadNoteImageInput {
-            workspace: crate::models::Workspace::Personal,
+            workspace: None,
             note_ref: "id".to_owned(),
             refresh: false,
             image_path: None,

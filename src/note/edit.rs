@@ -4,7 +4,7 @@ use thiserror::Error;
 use crate::{
     client::{HackmdClient, HackmdError},
     models::Workspace,
-    note::body::into_stored,
+    note::body::{body_title, into_stored},
     note::patch::PatchError,
     note::reference::{NoteRefError, NoteResolution},
 };
@@ -12,7 +12,7 @@ use crate::{
 /// What `hackmd_update_note` passes on when given a `patch`.
 #[derive(Debug)]
 pub(crate) struct EditNoteInput {
-    pub(crate) workspace: Workspace,
+    pub(crate) workspace: Option<Workspace>,
     pub(crate) note_ref: String,
     pub(crate) refresh: bool,
     pub(crate) patch: String,
@@ -32,6 +32,11 @@ pub(crate) struct EditNoteOutput {
     pub(crate) changed: bool,
     /// Size of the body now stored; `hackmd_get_note` returns the body itself.
     pub(crate) bytes: usize,
+    /// The title the patched body implies when it differs from the listed
+    /// one, as `hackmd_push_note` reports it: a patch that renames the H1
+    /// leaves the listing unchanged, so set `title` in a separate update.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) title_drift: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -119,21 +124,32 @@ pub(crate) async fn edit_note(
     drop(current);
     let patch_path = crate::note::patch::patch_path(&note.workspace, &note.note_id);
     // Matching hunks against a large body is CPU work, kept off the runtime.
-    let (updated, changed) = crate::local::offload(|| {
+    let (updated, changed, synced_title) = crate::local::offload(|| {
         // An added line may carry a lone `\r`; HackMD would store it as `\n`.
         let updated = crate::note::patch::apply_note_patch(&content, &input.patch, &patch_path)
             .map(into_stored)?;
         let changed = updated.as_str() != content.as_str();
-        Ok::<_, PatchError>((updated, changed))
+        // The body before the patch stands in for the last-synced one: drift
+        // is reported only when its title matched the listing.
+        let synced_title = changed.then(|| body_title(&content)).flatten();
+        Ok::<_, PatchError>((updated, changed, synced_title))
     })?;
 
     // The old body is not needed past here; a large note is held once less
     // through the write and its read-back.
     drop(content);
+    let mut title_drift = None;
     if changed {
-        client
+        // Judged against the read-back's title, as push does, so a rename
+        // made meanwhile is respected. Only the title is kept: the read-back
+        // body is another full copy of the note.
+        let listed = client
             .write_note_body(&note.workspace, &note.note_id, &updated)
-            .await?;
+            .await?
+            .title;
+        title_drift = crate::local::offload(|| {
+            crate::note::body::title_drift(&listed, &updated, || synced_title)
+        });
     }
     Ok(Ok(EditNoteOutput {
         workspace: note.workspace,
@@ -142,6 +158,7 @@ pub(crate) async fn edit_note(
         patch_path,
         changed,
         bytes: updated.len(),
+        title_drift,
     }))
 }
 
@@ -157,7 +174,7 @@ mod tests {
 
     fn input(patch: &str) -> EditNoteInput {
         EditNoteInput {
-            workspace: Workspace::Personal,
+            workspace: None,
             note_ref: "note-id".to_owned(),
             refresh: false,
             patch: patch.to_owned(),
@@ -173,7 +190,7 @@ mod tests {
         let fixture = SequenceServer::spawn_repeating([(200, OLD), (202, ""), (200, OLD)]);
         let client = fixture.client();
         let input = EditNoteInput {
-            workspace: Workspace::Personal,
+            workspace: None,
             note_ref: "note-id".to_owned(),
             refresh: false,
             patch:
@@ -249,6 +266,125 @@ mod tests {
             output.note_url.as_deref(),
             Some("https://hackmd.io/note-id")
         );
+        server.finish();
+    }
+
+    /// One patch edit: the note as read, then the PATCH and its read-back.
+    async fn patch_once(title: &str, old: &str, patch_lines: &str) -> super::EditNoteOutput {
+        patch_with_readback(title, title, old, patch_lines).await
+    }
+
+    /// As [`patch_once`], with the read-back listing `read_back_title`.
+    async fn patch_with_readback(
+        title: &str,
+        read_back_title: &str,
+        old: &str,
+        patch_lines: &str,
+    ) -> super::EditNoteOutput {
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: notes/note-id.md\n{patch_lines}*** End Patch"
+        );
+        let new = crate::note::patch::apply_note_patch(old, &patch, "notes/note-id.md")
+            .expect("the test patch applies");
+        let note = |title: &str, content: &str| {
+            serde_json::json!({"id": "note-id", "title": title, "content": content}).to_string()
+        };
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/notes/note-id", 200, &note(title, old)),
+            Scenario::new("PATCH", "/v1/notes/note-id", 202, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                &note(read_back_title, &new),
+            ),
+        ]);
+        let output = edit_note(&server.client(), input(&patch))
+            .await
+            .expect("edit should succeed")
+            .expect("reference should resolve");
+        server.finish();
+        output
+    }
+
+    #[tokio::test]
+    async fn a_patch_that_renames_the_h1_reports_title_drift() {
+        let output = patch_once(
+            "Old name",
+            "# Old name\n\nbody\n",
+            "@@\n-# Old name\n+# New name\n",
+        )
+        .await;
+        assert_eq!(output.title_drift.as_deref(), Some("New name"));
+    }
+
+    #[tokio::test]
+    async fn drift_follows_a_rename_made_during_the_patch() {
+        // The listing already shows the new H1 when the write is read back.
+        let output = patch_with_readback(
+            "Old name",
+            "New name",
+            "# Old name\n\nbody\n",
+            "@@\n-# Old name\n+# New name\n",
+        )
+        .await;
+        assert_eq!(output.title_drift, None);
+    }
+
+    #[tokio::test]
+    async fn a_patch_that_leaves_the_h1_reports_no_drift() {
+        let output = patch_once("Old name", "# Old name\n\nbody\n", "@@\n-body\n+text\n").await;
+        assert_eq!(output.title_drift, None);
+    }
+
+    #[tokio::test]
+    async fn a_heading_that_never_matched_the_listing_is_not_drift() {
+        // A listed title set apart from the H1 on purpose stays silent, as in push.
+        let output = patch_once(
+            "Listed",
+            "# Heading\n\nbody\n",
+            "@@\n-# Heading\n+# Renamed\n",
+        )
+        .await;
+        assert_eq!(output.title_drift, None);
+    }
+
+    #[tokio::test]
+    async fn a_patch_that_retitles_the_front_matter_reports_title_drift() {
+        let output = patch_once(
+            "Old name",
+            "---\ntitle: Old name\n---\nbody\n",
+            "@@\n-title: Old name\n+title: New name\n",
+        )
+        .await;
+        assert_eq!(output.title_drift.as_deref(), Some("New name"));
+    }
+
+    #[tokio::test]
+    async fn a_first_h1_added_by_a_patch_is_not_drift() {
+        // The body gave no title before, so nothing says the listing followed
+        // it.
+        let output = patch_once("Listed", "body\n", "@@\n+# Heading\n body\n").await;
+        assert_eq!(output.title_drift, None);
+    }
+
+    #[tokio::test]
+    async fn a_patch_that_changes_nothing_writes_nothing_and_reports_no_drift() {
+        let server = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes/note-id",
+            200,
+            r##"{"id":"note-id","title":"Listed","content":"# Other\n"}"##,
+        )]);
+        let output = edit_note(
+            &server.client(),
+            input("*** Begin Patch\n*** Update File: notes/note-id.md\n@@\n-# Other\n+# Other\n*** End Patch"),
+        )
+        .await
+        .expect("edit should succeed")
+        .expect("reference should resolve");
+        assert!(!output.changed);
+        assert_eq!(output.title_drift, None);
         server.finish();
     }
 
@@ -393,9 +529,9 @@ mod tests {
         let output = edit_note(
             &server.client(),
             EditNoteInput {
-                workspace: Workspace::Team {
+                workspace: Some(Workspace::Team {
                     team_path: "core".to_owned(),
-                },
+                }),
                 note_ref: "note-id".to_owned(),
                 refresh: false,
                 patch: patch.to_owned(),
