@@ -78,10 +78,12 @@ write and one upload with it. An edit landing between that read and the write
 is reverted; `expected_hash` works here too and catches any made before it. The
 `title` field always takes effect. The body sets a title only when a note is
 created without one (a front-matter `title:`, then the first H1, then
-"Untitled"), and later body edits never change it, so `hackmd_pull_note` and
-`hackmd_push_note` report `title_drift` when the body's own title no longer
-matches the listed one. They report it only when the body as last synced gave
-the listed title (a title that always differed may be deliberate, and a first
+"Untitled"), and later body edits never change it, so `hackmd_pull_note`,
+`hackmd_push_note`, and a `patch` edit on `hackmd_update_note` report
+`title_drift` when the body's own title no longer matches the listed one;
+set `title` in a separate update if the listing should follow. They report it
+only when the body as last synced (for a patch, the body before it) gave the
+listed title (a title that always differed may be deliberate, and a first
 pull has nothing to compare), only when they can read both titles for certain
 (plain front matter, or an H1 that is the body's first line of text), and push
 only on a push or a no-op, so a missing `title_drift` does not mean the titles
