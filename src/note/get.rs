@@ -22,7 +22,8 @@ use crate::{
 pub(crate) struct GetNoteInput {
     /// Team path (from `hackmd_get_me`) when a direct internal note ID belongs
     /// to a team; omit for personal notes. `@owner/slug` URLs name their own
-    /// workspace. With an `s/<shortId>` link, only this team is searched.
+    /// workspace. With an `s/<shortId>` link, only this team is searched;
+    /// omitted, the personal notes and then every team are.
     #[serde(
         default,
         rename = "team_path",
@@ -31,7 +32,7 @@ pub(crate) struct GetNoteInput {
     )]
     pub(crate) workspace: Option<Workspace>,
     /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
-    /// `hackmd.io/s/<shortId>` share link.
+    /// `hackmd.io/s/<shortId>` share link. A trailing `/download` is ignored.
     /// Give this or `local_path`, not both.
     pub(crate) note_ref: Option<String>,
     /// Bypass the 60-second account and note-list caches when resolving an

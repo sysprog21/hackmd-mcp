@@ -687,6 +687,32 @@ mod tests {
         }
     }
 
+    /// `null`, omission, and the older tagged personal object all name no
+    /// team, so an account-wide source passes its check and reaches the
+    /// network (here, the missing token).
+    #[tokio::test]
+    async fn account_wide_sources_accept_every_form_of_no_team() {
+        let client = HackmdClient::new(Config::for_tests()).expect("client should build");
+        for team_path in [
+            json!({}),
+            json!({"team_path": null}),
+            json!({"workspace": {"kind": "personal"}}),
+        ] {
+            let mut input = json!({"source": "history"});
+            input
+                .as_object_mut()
+                .expect("an object")
+                .extend(team_path.as_object().expect("an object").clone());
+            let input: ListNotesInput =
+                serde_json::from_value(input).expect("input should deserialize");
+            assert_eq!(input.workspace, None);
+            assert!(matches!(
+                remote(&client, input).await,
+                Err(ListNotesError::Api(_))
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn rejects_out_of_range_limit_before_network_io() {
         let client = HackmdClient::new(Config::for_tests()).expect("client should build");
