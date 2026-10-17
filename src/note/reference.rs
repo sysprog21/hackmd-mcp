@@ -53,6 +53,10 @@ pub(crate) enum NoteRefError {
     )]
     WorkspaceMismatch { team_path: String, owner: String },
     #[error(
+        "team_path names the personal workspace, but the URL's owner @{owner} is not this account; omit team_path, since the URL names the workspace"
+    )]
+    PersonalMismatch { owner: String },
+    #[error(
         "{source}; this came from a team listing while searching every workspace for s/{short_id}, so pass team_path to search only the team that holds the note"
     )]
     ShortLinkTeam {
@@ -68,9 +72,10 @@ impl crate::reply::ToolError for NoteRefError {
         use crate::reply::ErrorKind;
 
         match self {
-            Self::Empty | Self::InvalidUrl | Self::WorkspaceMismatch { .. } => {
-                ErrorKind::InvalidInput
-            }
+            Self::Empty
+            | Self::InvalidUrl
+            | Self::WorkspaceMismatch { .. }
+            | Self::PersonalMismatch { .. } => ErrorKind::InvalidInput,
             Self::ShortLinkTeam { source: error, .. } | Self::Api(error) => error.kind(),
         }
     }
@@ -87,28 +92,53 @@ enum ParsedNoteRef {
     Short(String),
 }
 
+/// Resolves `note_ref`. `team_path` is `None` when the caller gave none: a
+/// direct ID is then personal, and an `s/<shortId>` link is searched for in
+/// every workspace.
 pub(crate) async fn resolve_note_ref(
     client: &HackmdClient,
-    workspace: Workspace,
+    team_path: Option<Workspace>,
+    note_ref: &str,
+    refresh: bool,
+) -> Result<NoteResolution, NoteRefError> {
+    resolve_note_ref_from(client, team_path, Workspace::Personal, note_ref, refresh).await
+}
+
+/// As [`resolve_note_ref`], with a direct ID given no `team_path` read in
+/// `home` rather than the personal workspace.
+pub(crate) async fn resolve_note_ref_from(
+    client: &HackmdClient,
+    team_path: Option<Workspace>,
+    home: Workspace,
     note_ref: &str,
     refresh: bool,
 ) -> Result<NoteResolution, NoteRefError> {
     match parse_note_ref(note_ref)? {
         ParsedNoteRef::Direct(note_id) => Ok(NoteResolution::Resolved {
-            note: ResolvedNoteRef { workspace, note_id },
+            note: ResolvedNoteRef {
+                workspace: team_path.unwrap_or(home),
+                note_id,
+            },
         }),
         ParsedNoteRef::Short(short_id) => {
-            resolve_short_id(client, workspace, &short_id, refresh).await
+            resolve_short_id(client, team_path, &short_id, refresh).await
         }
         ParsedNoteRef::Scoped { owner, slug } => {
             // A URL names its own workspace. A team_path that names another is
             // a mistake to report, not a hint to drop.
-            if let Workspace::Team { team_path } = workspace
-                && team_path != owner
+            if let Some(Workspace::Team { team_path }) = &team_path
+                && *team_path != owner
             {
-                return Err(NoteRefError::WorkspaceMismatch { team_path, owner });
+                return Err(NoteRefError::WorkspaceMismatch {
+                    team_path: team_path.clone(),
+                    owner,
+                });
             }
-            let workspace = if *owner == *client.user_path(refresh).await? {
+            let mine = *owner == *client.user_path(refresh).await?;
+            if team_path == Some(Workspace::Personal) && !mine {
+                return Err(NoteRefError::PersonalMismatch { owner });
+            }
+            let workspace = if mine {
                 Workspace::Personal
             } else if client.has_team(&owner, refresh).await? {
                 Workspace::Team { team_path: owner }
@@ -126,59 +156,52 @@ pub(crate) async fn resolve_note_ref(
 }
 
 /// Finds a `/s/<shortId>` link's note. A `team_path` limits the search to that
-/// team; without one, personal notes and then every team are listed, and a
-/// `shortId` found in more than one workspace is reported as ambiguous. A team
-/// whose list fails fails the search, since the note may be there, but the
-/// error says that `team_path` narrows it.
+/// workspace; without one, personal notes and then every team are listed, and
+/// a `shortId` found in more than one workspace is reported as ambiguous. A
+/// team whose list fails fails the search, since the note may be there, but
+/// the error says that `team_path` narrows it.
 async fn resolve_short_id(
     client: &HackmdClient,
-    workspace: Workspace,
+    team_path: Option<Workspace>,
     short_id: &str,
     refresh: bool,
 ) -> Result<NoteResolution, NoteRefError> {
-    let searching_all = workspace == Workspace::Personal;
-    let workspaces = if searching_all {
-        std::iter::once(Workspace::Personal)
-            .chain(
-                client
-                    .list_teams(refresh)
-                    .await?
-                    .iter()
-                    .map(|team| Workspace::Team {
-                        team_path: team.path.clone(),
-                    }),
-            )
-            .collect()
-    } else {
-        vec![workspace]
+    let matching = |workspace: &Workspace, notes: &[NoteResponse]| {
+        notes
+            .iter()
+            .filter(|note| note.short_id.as_deref() == Some(short_id))
+            .map(|note| NoteCandidate {
+                workspace: workspace.clone(),
+                note_id: note.id.clone(),
+                title: note.title.clone(),
+                short_id: note.short_id.clone(),
+                permalink: note.permalink.clone(),
+            })
+            .collect::<Vec<_>>()
     };
     let mut candidates = Vec::new();
-    for workspace in workspaces {
-        let notes = match client.list_notes(&workspace, refresh).await {
-            Ok(notes) => notes,
-            Err(source) => {
-                return Err(if searching_all && workspace != Workspace::Personal {
-                    NoteRefError::ShortLinkTeam {
-                        short_id: short_id.to_owned(),
-                        source,
-                    }
-                } else {
-                    source.into()
-                });
-            }
-        };
-        candidates.extend(
-            notes
-                .iter()
-                .filter(|note| note.short_id.as_deref() == Some(short_id))
-                .map(|note| NoteCandidate {
-                    workspace: workspace.clone(),
-                    note_id: note.id.clone(),
-                    title: note.title.clone(),
-                    short_id: note.short_id.clone(),
-                    permalink: note.permalink.clone(),
-                }),
-        );
+    if let Some(workspace) = team_path {
+        candidates = matching(&workspace, &client.list_notes(&workspace, refresh).await?);
+    } else {
+        let teams = client.list_teams(refresh).await?;
+        let personal = Workspace::Personal;
+        candidates.extend(matching(
+            &personal,
+            &client.list_notes(&personal, refresh).await?,
+        ));
+        for team in teams.iter() {
+            let workspace = Workspace::Team {
+                team_path: team.path.clone(),
+            };
+            let notes = client
+                .list_notes(&workspace, refresh)
+                .await
+                .map_err(|source| NoteRefError::ShortLinkTeam {
+                    short_id: short_id.to_owned(),
+                    source,
+                })?;
+            candidates.extend(matching(&workspace, &notes));
+        }
     }
     let query = format!("s/{short_id}");
     Ok(match candidates.len() {
@@ -441,11 +464,62 @@ mod tests {
             "https://hackmd.io/short-id",
             "hackmd.io/short-id",
         ] {
-            let result = resolve_note_ref(&client, Workspace::Personal, value, false)
+            let result = resolve_note_ref(&client, None, value, false)
                 .await
                 .expect("direct reference should resolve without an API token");
-            assert!(matches!(result, NoteResolution::Resolved { .. }));
+            assert!(
+                matches!(&result, NoteResolution::Resolved { note } if note.workspace == Workspace::Personal && !note.note_id.is_empty())
+            );
         }
+        let core = Workspace::Team {
+            team_path: "core".to_owned(),
+        };
+        let result = resolve_note_ref(&client, Some(core.clone()), "internal-id", false)
+            .await
+            .expect("a direct ID should resolve");
+        assert!(matches!(&result, NoteResolution::Resolved { note } if note.workspace == core));
+        // With no team_path, push reads a direct ID in the tracked note's own
+        // workspace; a given team_path still wins.
+        for (team_path, expected) in [
+            (None, &core),
+            (Some(Workspace::Personal), &Workspace::Personal),
+        ] {
+            let result = super::resolve_note_ref_from(
+                &client,
+                team_path,
+                core.clone(),
+                "internal-id",
+                false,
+            )
+            .await
+            .expect("a direct ID should resolve");
+            assert!(
+                matches!(&result, NoteResolution::Resolved { note } if note.workspace == *expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_personal_workspace_contradicting_the_url_is_refused() {
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/me",
+            200,
+            r#"{"id":"u","name":"User","userPath":"alice"}"#,
+        )]);
+        let error = resolve_note_ref(
+            &fixture.client(),
+            Some(Workspace::Personal),
+            "https://hackmd.io/@core/slug",
+            false,
+        )
+        .await
+        .expect_err("a personal team_path cannot name @core's note");
+        assert_eq!(
+            error.to_string(),
+            "team_path names the personal workspace, but the URL's owner @core is not this account; omit team_path, since the URL names the workspace"
+        );
+        fixture.finish();
     }
 
     #[tokio::test]
@@ -465,14 +539,9 @@ mod tests {
             ),
         ]);
         let client = fixture.client();
-        let result = resolve_note_ref(
-            &client,
-            Workspace::Personal,
-            "https://hackmd.io/@alice/slug",
-            false,
-        )
-        .await
-        .expect("personal URL should resolve");
+        let result = resolve_note_ref(&client, None, "https://hackmd.io/@alice/slug", false)
+            .await
+            .expect("personal URL should resolve");
         assert!(
             matches!(result, NoteResolution::Resolved { note } if note.workspace == Workspace::Personal && note.note_id == "personal-id")
         );
@@ -486,9 +555,9 @@ mod tests {
             .expect("client should build");
         let error = resolve_note_ref(
             &client,
-            Workspace::Team {
+            Some(Workspace::Team {
                 team_path: "other".to_owned(),
-            },
+            }),
             "https://hackmd.io/@alice/slug",
             false,
         )
@@ -530,22 +599,12 @@ mod tests {
         ]);
         let client = fixture.client_with_cache();
 
-        let first = resolve_note_ref(
-            &client,
-            Workspace::Personal,
-            "https://hackmd.io/@alice/slug",
-            false,
-        )
-        .await
-        .expect("first URL should resolve");
-        let refreshed = resolve_note_ref(
-            &client,
-            Workspace::Personal,
-            "https://hackmd.io/@alice/slug",
-            true,
-        )
-        .await
-        .expect("refreshed URL should resolve");
+        let first = resolve_note_ref(&client, None, "https://hackmd.io/@alice/slug", false)
+            .await
+            .expect("first URL should resolve");
+        let refreshed = resolve_note_ref(&client, None, "https://hackmd.io/@alice/slug", true)
+            .await
+            .expect("refreshed URL should resolve");
 
         assert!(matches!(first, NoteResolution::Resolved { note } if note.note_id == "old"));
         assert!(matches!(refreshed, NoteResolution::Resolved { note } if note.note_id == "new"));
@@ -581,8 +640,7 @@ mod tests {
             ),
         ]);
         let client = fixture.client_with_cache();
-        let resolve =
-            |url: &'static str| resolve_note_ref(&client, Workspace::Personal, url, false);
+        let resolve = |url: &'static str| resolve_note_ref(&client, None, url, false);
 
         for _ in 0..2 {
             let team = resolve("https://hackmd.io/@core/slug")
@@ -634,7 +692,7 @@ mod tests {
         let fixture = short_link_fixture();
         let result = resolve_note_ref(
             &fixture.client(),
-            Workspace::Personal,
+            None,
             "https://hackmd.io/s/SkE33UTHf",
             false,
         )
@@ -656,9 +714,9 @@ mod tests {
         )]);
         let result = resolve_note_ref(
             &fixture.client(),
-            Workspace::Team {
+            Some(Workspace::Team {
                 team_path: "core".to_owned(),
-            },
+            }),
             "https://hackmd.io/s/missing",
             false,
         )
@@ -666,6 +724,32 @@ mod tests {
         .expect("lookup should answer");
         assert!(matches!(result, NoteResolution::NotFound { query } if query == "s/missing"));
         fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn a_short_link_with_an_explicit_personal_workspace_lists_only_it() {
+        // Only the older tagged form can say "personal" explicitly; teams are
+        // then not listed at all.
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/notes",
+            200,
+            r#"[{"id":"mine","title":"Mine","shortId":"SkE33UTHf"}]"#,
+        )]);
+        let team_path = serde_json::from_value(serde_json::json!({"kind": "personal"}))
+            .expect("the tagged personal form should deserialize");
+        let result = resolve_note_ref(
+            &fixture.client(),
+            Some(team_path),
+            "https://hackmd.io/s/SkE33UTHf",
+            false,
+        )
+        .await
+        .expect("short link should resolve");
+        assert!(
+            matches!(result, NoteResolution::Resolved { note } if note.workspace == Workspace::Personal && note.note_id == "mine")
+        );
+        assert_eq!(fixture.finish().len(), 1, "no team is listed");
     }
 
     #[tokio::test]
@@ -690,14 +774,9 @@ mod tests {
                 r#"[{"id":"team-id","title":"Team","shortId":"dup"}]"#,
             ),
         ]);
-        let result = resolve_note_ref(
-            &fixture.client(),
-            Workspace::Personal,
-            "hackmd.io/s/dup",
-            false,
-        )
-        .await
-        .expect("lookup should answer");
+        let result = resolve_note_ref(&fixture.client(), None, "hackmd.io/s/dup", false)
+            .await
+            .expect("lookup should answer");
         assert!(
             matches!(&result, NoteResolution::Ambiguous { candidates, .. } if candidates.len() == 2),
             "{result:?}"
@@ -718,7 +797,7 @@ mod tests {
         ]);
         let result = resolve_note_ref(
             &fixture.client(),
-            Workspace::Personal,
+            None,
             "https://hackmd.io/s/SkE33UTHf/download",
             false,
         )
@@ -740,9 +819,9 @@ mod tests {
         )]);
         let result = resolve_note_ref(
             &fixture.client(),
-            Workspace::Team {
+            Some(Workspace::Team {
                 team_path: "core".to_owned(),
-            },
+            }),
             "https://hackmd.io/s/dup",
             false,
         )
@@ -777,14 +856,8 @@ mod tests {
             Scenario::new("GET", "/v1/teams/core/notes", 200, "[]"),
         ]);
         let client = fixture.client_with_cache();
-        let resolve = |refresh| {
-            resolve_note_ref(
-                &client,
-                Workspace::Personal,
-                "https://hackmd.io/s/SkE33UTHf",
-                refresh,
-            )
-        };
+        let resolve =
+            |refresh| resolve_note_ref(&client, None, "https://hackmd.io/s/SkE33UTHf", refresh);
         for _ in 0..2 {
             let cached = resolve(false).await.expect("short link should resolve");
             assert!(matches!(cached, NoteResolution::Resolved { note } if note.note_id == "old"));
@@ -822,7 +895,7 @@ mod tests {
         ]);
         let error = resolve_note_ref(
             &fixture.client(),
-            Workspace::Personal,
+            None,
             "https://hackmd.io/s/SkE33UTHf",
             false,
         )
@@ -830,6 +903,11 @@ mod tests {
         .expect_err("a team that cannot be listed may hold the note");
         assert!(
             matches!(&error, super::NoteRefError::ShortLinkTeam { short_id, .. } if short_id == "SkE33UTHf")
+        );
+        // The hint keeps the kind of the error it wraps.
+        assert_eq!(
+            crate::reply::ToolError::kind(&error),
+            crate::reply::ErrorKind::Forbidden
         );
         assert!(
             error
@@ -863,14 +941,9 @@ mod tests {
             ),
         ]);
         let client = fixture.client();
-        let result = resolve_note_ref(
-            &client,
-            Workspace::Personal,
-            "https://hackmd.io/@core/slug",
-            false,
-        )
-        .await
-        .expect("team URL should resolve");
+        let result = resolve_note_ref(&client, None, "https://hackmd.io/@core/slug", false)
+            .await
+            .expect("team URL should resolve");
         assert!(
             matches!(result, NoteResolution::Resolved { note } if note.workspace == Workspace::Team { team_path: "core".to_owned() } && note.note_id == "team-id")
         );

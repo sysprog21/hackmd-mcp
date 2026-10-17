@@ -12,7 +12,7 @@ use crate::{
 /// What `hackmd_update_note` passes on when given a `patch`.
 #[derive(Debug)]
 pub(crate) struct EditNoteInput {
-    pub(crate) workspace: Workspace,
+    pub(crate) workspace: Option<Workspace>,
     pub(crate) note_ref: String,
     pub(crate) refresh: bool,
     pub(crate) patch: String,
@@ -172,7 +172,7 @@ mod tests {
 
     fn input(patch: &str) -> EditNoteInput {
         EditNoteInput {
-            workspace: Workspace::Personal,
+            workspace: None,
             note_ref: "note-id".to_owned(),
             refresh: false,
             patch: patch.to_owned(),
@@ -188,7 +188,7 @@ mod tests {
         let fixture = SequenceServer::spawn_repeating([(200, OLD), (202, ""), (200, OLD)]);
         let client = fixture.client();
         let input = EditNoteInput {
-            workspace: Workspace::Personal,
+            workspace: None,
             note_ref: "note-id".to_owned(),
             refresh: false,
             patch:
@@ -535,9 +535,9 @@ mod tests {
         let output = edit_note(
             &server.client(),
             EditNoteInput {
-                workspace: Workspace::Team {
+                workspace: Some(Workspace::Team {
                     team_path: "core".to_owned(),
-                },
+                }),
                 note_ref: "note-id".to_owned(),
                 refresh: false,
                 patch: patch.to_owned(),

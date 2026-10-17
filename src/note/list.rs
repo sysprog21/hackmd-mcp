@@ -27,7 +27,7 @@ pub(crate) struct ListNotesInput {
     /// team; for `tracked` a team narrows the records to that team's notes,
     /// and omitting it lists every workspace's.
     #[serde(default, rename = "team_path", alias = "workspace")]
-    pub(crate) workspace: Workspace,
+    pub(crate) workspace: Option<Workspace>,
     /// Maximum notes returned after filtering (default 20, maximum 100).
     #[serde(default = "default_limit")]
     #[schemars(range(min = 1, max = 100))]
@@ -196,15 +196,14 @@ fn list_tracked(
     }
 
     // An omitted team lists every workspace's records, not only personal ones:
-    // `Workspace` cannot tell "omitted" from "personal", and listing everything
-    // is what a caller without a team means here.
+    // that is what a caller without a team means here.
     Ok(list_tracked_notes(
         files,
         &ListTrackedNotesInput {
             limit: input.limit,
             offset: input.offset,
             query: input.query.as_deref(),
-            team: Some(&input.workspace).filter(|team| **team != Workspace::Personal),
+            team: input.workspace.as_ref(),
         },
     )?)
 }
@@ -219,7 +218,7 @@ pub(crate) async fn list_notes(
     }
     // History and trash are account-wide and never cached.
     let account_wide = |name| {
-        if input.workspace != Workspace::Personal {
+        if matches!(input.workspace, Some(Workspace::Team { .. })) {
             Err(ListNotesError::AccountWideSource(name))
         } else if input.refresh {
             Err(ListNotesError::UncachedRefresh(name))
@@ -238,9 +237,10 @@ pub(crate) async fn list_notes(
     let site = client.site_url();
     match input.source {
         NoteSource::Workspace => {
-            let notes = client.list_notes(&input.workspace, input.refresh).await?;
+            let workspace = input.workspace.clone().unwrap_or_default();
+            let notes = client.list_notes(&workspace, input.refresh).await?;
             Ok(filter_sort_page(site, &notes, &input, sort, |_| {
-                input.workspace.clone()
+                workspace.clone()
             }))
         }
         NoteSource::History => {
@@ -379,7 +379,7 @@ mod tests {
     fn input() -> ListNotesInput {
         ListNotesInput {
             source: NoteSource::Workspace,
-            workspace: Workspace::Personal,
+            workspace: None,
             limit: 20,
             offset: 0,
             query: None,
@@ -423,9 +423,9 @@ mod tests {
         // A team narrows the records; this one is personal.
         let mut other_team = input();
         other_team.source = NoteSource::Tracked;
-        other_team.workspace = Workspace::Team {
+        other_team.workspace = Some(Workspace::Team {
             team_path: "core".to_owned(),
-        };
+        });
         let ListOutput::Tracked(output) = list_notes(&client, &files, other_team)
             .await
             .expect("a team filter should list")
@@ -433,6 +433,18 @@ mod tests {
             panic!("the tracked source should list tracked records");
         };
         assert_eq!(output.notes, []);
+
+        // The personal workspace, named explicitly, keeps this record.
+        let mut personal = input();
+        personal.source = NoteSource::Tracked;
+        personal.workspace = Some(Workspace::Personal);
+        let ListOutput::Tracked(output) = list_notes(&client, &files, personal)
+            .await
+            .expect("a personal filter should list")
+        else {
+            panic!("the tracked source should list tracked records");
+        };
+        assert_eq!(output.notes.len(), 1);
 
         for refuse in [
             |input: &mut ListNotesInput| input.sort = Some(NoteSort::TitleAsc),
@@ -663,9 +675,9 @@ mod tests {
         for source in [NoteSource::History, NoteSource::Trash] {
             let mut invalid = input();
             invalid.source = source;
-            invalid.workspace = Workspace::Team {
+            invalid.workspace = Some(Workspace::Team {
                 team_path: "core".to_owned(),
-            };
+            });
             assert!(matches!(
                 remote(&client, invalid).await,
                 Err(ListNotesError::AccountWideSource(_))

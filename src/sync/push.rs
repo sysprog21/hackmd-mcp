@@ -42,7 +42,7 @@ pub(crate) struct PushNoteInput {
     /// Without `note_ref`, one naming another workspace than the sync record
     /// is refused.
     #[serde(default, rename = "team_path", alias = "workspace")]
-    pub(crate) workspace: Workspace,
+    pub(crate) workspace: Option<Workspace>,
     /// Bypass the 60-second account and note-list caches when resolving an
     /// `@owner/slug` or `s/<shortId>` `note_ref`.
     #[serde(default)]
@@ -205,8 +205,10 @@ pub(crate) async fn push_note(
     // it is redundant but harmless, as it always was; one that names another
     // workspace means the caller has the wrong file or note in mind.
     if input.note_ref.is_none()
-        && input.workspace != Workspace::Personal
-        && input.workspace != note.workspace
+        && input
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| *workspace != note.workspace)
     {
         return Err(PushNoteError::TrackedWorkspaceMismatch);
     }
@@ -214,17 +216,14 @@ pub(crate) async fn push_note(
         // A bare note ID without team_path is read in the tracked note's own
         // workspace: the cross-check is about which note, and omitting
         // team_path should not make a team note look like a different one.
-        // A link resolved by listing searches every workspace, so one naming
-        // another workspace's note is reported as a mismatch.
-        let workspace = match input.workspace {
-            Workspace::Personal if !crate::note::reference::resolves_by_listing(note_ref) => {
-                note.workspace.clone()
-            }
-            other => other,
-        };
-        let resolution =
-            crate::note::reference::resolve_note_ref(client, workspace, note_ref, input.refresh)
-                .await?;
+        let resolution = crate::note::reference::resolve_note_ref_from(
+            client,
+            input.workspace.clone(),
+            note.workspace.clone(),
+            note_ref,
+            input.refresh,
+        )
+        .await?;
         let NoteResolution::Resolved { note: named } = resolution else {
             return Ok(Err(resolution));
         };
@@ -660,7 +659,7 @@ mod tests {
         PushNoteInput {
             local_path: path.to_path_buf(),
             note_ref: None,
-            workspace: Workspace::Personal,
+            workspace: None,
             refresh: false,
             strategy,
             confirm,
@@ -1474,7 +1473,7 @@ mod tests {
                 "baseline",
             );
             assert!(matches!(
-                push_note(&client, &files, pushing(team(stray), false)).await,
+                push_note(&client, &files, pushing(Some(team(stray)), false)).await,
                 Err(PushNoteError::TrackedWorkspaceMismatch)
             ));
         }
@@ -1487,9 +1486,22 @@ mod tests {
             "baseline",
         );
 
+        // An explicit personal workspace (the older tagged form) on a team
+        // note disagrees as much as another team does.
+        assert!(matches!(
+            push_note(&client, &files, pushing(Some(Workspace::Personal), false)).await,
+            Err(PushNoteError::TrackedWorkspaceMismatch)
+        ));
+        // So does it beside a bare ID, which is then read as a personal note.
+        let mut named = pushing(Some(Workspace::Personal), false);
+        named.note_ref = Some("note-id".to_owned());
+        assert!(matches!(
+            push_note(&client, &files, named).await,
+            Err(PushNoteError::TrackingMismatch)
+        ));
         // The record's own team and an unused refresh go through, as they did
         // before the check existed: they get as far as the network.
-        for (workspace, refresh) in [(team("core"), false), (Workspace::Personal, true)] {
+        for (workspace, refresh) in [(Some(team("core")), false), (None, true)] {
             assert!(matches!(
                 push_note(&client, &files, pushing(workspace, refresh)).await,
                 Err(PushNoteError::Api(_))

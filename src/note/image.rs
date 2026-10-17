@@ -27,7 +27,7 @@ pub(crate) struct UploadNoteImageInput {
     /// the search for an `s/<shortId>` link to that team.
     #[serde(default, rename = "team_path", alias = "workspace")]
     #[schemars(skip)]
-    pub(crate) workspace: Workspace,
+    pub(crate) workspace: Option<Workspace>,
     /// Internal note ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
     /// `hackmd.io/s/<shortId>` share link.
     /// Personal and team notes both accept uploads.
@@ -368,7 +368,7 @@ mod tests {
         confirm_large_file: bool,
     ) -> UploadNoteImageInput {
         UploadNoteImageInput {
-            workspace: crate::models::Workspace::Personal,
+            workspace: None,
             note_ref: note_ref.to_owned(),
             refresh: false,
             image_path: Some(path.to_path_buf()),
@@ -629,7 +629,7 @@ mod tests {
         confirm_large_file: bool,
     ) -> Result<super::UploadNoteImageOutput, UploadNoteImageError> {
         let input = UploadNoteImageInput {
-            workspace: crate::models::Workspace::Personal,
+            workspace: None,
             note_ref: "id".to_owned(),
             refresh: false,
             image_path: None,

@@ -323,6 +323,27 @@ mod tests {
         assert_eq!(Arc::strong_count(&client), 1);
     }
 
+    /// An optional `team_path` advertises the same nullable string as before.
+    #[test]
+    fn optional_team_paths_keep_the_nullable_string_schema() {
+        let tools = HackmdServer::router().list_all();
+        for name in [
+            "hackmd_get_note",
+            "hackmd_update_note",
+            "hackmd_delete_note",
+            "hackmd_pull_note",
+            "hackmd_push_note",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("tool should exist");
+            let team_path = &tool.input_schema["properties"]["team_path"];
+            assert_eq!(team_path["type"], json!(["string", "null"]), "{name}");
+            assert!(team_path.get("anyOf").is_none(), "{name}");
+        }
+    }
+
     #[test]
     fn tools_have_generated_schemas_and_exact_annotations() {
         let tools = HackmdServer::router().list_all();
