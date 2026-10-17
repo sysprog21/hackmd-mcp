@@ -64,11 +64,11 @@ workflow a defined conflict-resolution step. See
 
 A successful request does not always mean the new state is visible yet.
 Body edits, folder updates, and a new note's folder placement are read back to
-confirm their results. When a dropped connection, a 5xx, or an unreadable
-success reply leaves a write's outcome uncertain, a note update reads the note
-back first and succeeds if the read shows the write; otherwise the tool
-reports it as unconfirmed and tells the agent to look, not retry. This helps
-avoid duplicate notes or another overwrite. See
+confirm their results. When a timeout, a dropped connection, a 5xx, or an
+unreadable success reply leaves a write's outcome uncertain, a note update
+reads the note back first and succeeds if the read shows the write; otherwise
+the tool reports it as unconfirmed and tells the agent to look, not retry.
+This helps avoid duplicate notes or another overwrite. See
 [confirmation details](docs/tools.md#editing-a-note) for operation-specific
 limits and the image-upload exception.
 
