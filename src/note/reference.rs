@@ -44,12 +44,21 @@ pub(crate) enum NoteResolution {
 pub(crate) enum NoteRefError {
     #[error("note_ref must be a non-empty internal note ID or https://hackmd.io URL")]
     Empty,
-    #[error("note_ref URL must use https://hackmd.io and contain an ID or @owner/slug path")]
+    #[error(
+        "note_ref URL must use https://hackmd.io and contain an ID, @owner/slug, or s/<shortId> path"
+    )]
     InvalidUrl,
     #[error(
         "team_path {team_path:?} does not match the URL's owner @{owner}; omit team_path, since the URL names the workspace"
     )]
     WorkspaceMismatch { team_path: String, owner: String },
+    #[error(
+        "{source}; this came from a team listing while searching every workspace for s/{short_id}, so pass team_path to search only the team that holds the note"
+    )]
+    ShortLinkTeam {
+        short_id: String,
+        source: HackmdError,
+    },
     #[error(transparent)]
     Api(#[from] HackmdError),
 }
@@ -62,14 +71,20 @@ impl crate::reply::ToolError for NoteRefError {
             Self::Empty | Self::InvalidUrl | Self::WorkspaceMismatch { .. } => {
                 ErrorKind::InvalidInput
             }
-            Self::Api(error) => error.kind(),
+            Self::ShortLinkTeam { source: error, .. } | Self::Api(error) => error.kind(),
         }
     }
 }
 
 enum ParsedNoteRef {
     Direct(String),
-    Scoped { owner: String, slug: String },
+    Scoped {
+        owner: String,
+        slug: String,
+    },
+    /// A legacy `https://hackmd.io/s/<shortId>` share link. It names no
+    /// workspace, so the note is looked up by `shortId`.
+    Short(String),
 }
 
 pub(crate) async fn resolve_note_ref(
@@ -82,6 +97,9 @@ pub(crate) async fn resolve_note_ref(
         ParsedNoteRef::Direct(note_id) => Ok(NoteResolution::Resolved {
             note: ResolvedNoteRef { workspace, note_id },
         }),
+        ParsedNoteRef::Short(short_id) => {
+            resolve_short_id(client, workspace, &short_id, refresh).await
+        }
         ParsedNoteRef::Scoped { owner, slug } => {
             // A URL names its own workspace. A team_path that names another is
             // a mistake to report, not a hint to drop.
@@ -107,20 +125,97 @@ pub(crate) async fn resolve_note_ref(
     }
 }
 
-/// Whether `note_ref` names a note by `@owner/slug`, which only finds notes
-/// that are live in a workspace list.
-pub(crate) fn is_slug_url(note_ref: &str) -> bool {
-    matches!(parse_note_ref(note_ref), Ok(ParsedNoteRef::Scoped { .. }))
+/// Finds a `/s/<shortId>` link's note. A `team_path` limits the search to that
+/// team; without one, personal notes and then every team are listed, and a
+/// `shortId` found in more than one workspace is reported as ambiguous. A team
+/// whose list fails fails the search, since the note may be there, but the
+/// error says that `team_path` narrows it.
+async fn resolve_short_id(
+    client: &HackmdClient,
+    workspace: Workspace,
+    short_id: &str,
+    refresh: bool,
+) -> Result<NoteResolution, NoteRefError> {
+    let searching_all = workspace == Workspace::Personal;
+    let workspaces = if searching_all {
+        std::iter::once(Workspace::Personal)
+            .chain(
+                client
+                    .list_teams(refresh)
+                    .await?
+                    .iter()
+                    .map(|team| Workspace::Team {
+                        team_path: team.path.clone(),
+                    }),
+            )
+            .collect()
+    } else {
+        vec![workspace]
+    };
+    let mut candidates = Vec::new();
+    for workspace in workspaces {
+        let notes = match client.list_notes(&workspace, refresh).await {
+            Ok(notes) => notes,
+            Err(source) => {
+                return Err(if searching_all && workspace != Workspace::Personal {
+                    NoteRefError::ShortLinkTeam {
+                        short_id: short_id.to_owned(),
+                        source,
+                    }
+                } else {
+                    source.into()
+                });
+            }
+        };
+        candidates.extend(
+            notes
+                .iter()
+                .filter(|note| note.short_id.as_deref() == Some(short_id))
+                .map(|note| NoteCandidate {
+                    workspace: workspace.clone(),
+                    note_id: note.id.clone(),
+                    title: note.title.clone(),
+                    short_id: note.short_id.clone(),
+                    permalink: note.permalink.clone(),
+                }),
+        );
+    }
+    let query = format!("s/{short_id}");
+    Ok(match candidates.len() {
+        0 => NoteResolution::NotFound { query },
+        1 => {
+            let only = candidates.remove(0);
+            NoteResolution::Resolved {
+                note: ResolvedNoteRef {
+                    workspace: only.workspace,
+                    note_id: only.note_id,
+                },
+            }
+        }
+        _ => NoteResolution::Ambiguous { query, candidates },
+    })
+}
+
+/// Whether resolving `note_ref` searches workspace lists (`@owner/slug` or
+/// `s/<shortId>`), which hold only live notes.
+pub(crate) fn resolves_by_listing(note_ref: &str) -> bool {
+    matches!(
+        parse_note_ref(note_ref),
+        Ok(ParsedNoteRef::Scoped { .. } | ParsedNoteRef::Short(_))
+    )
 }
 
 fn parse_note_ref(note_ref: &str) -> Result<ParsedNoteRef, NoteRefError> {
+    // The host is case-insensitive, as the URL parser treats it below.
+    const HOST: &str = "hackmd.io/";
     let value = note_ref.trim();
     if value.is_empty() {
         return Err(NoteRefError::Empty);
     }
     let normalized_url = value
-        .strip_prefix("hackmd.io/")
-        .map(|path| format!("https://hackmd.io/{path}"));
+        .get(..HOST.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(HOST))
+        .map(|_| format!("https://{HOST}{}", &value[HOST.len()..]));
     if !value.contains("://") && normalized_url.is_none() {
         return Ok(ParsedNoteRef::Direct(value.to_owned()));
     }
@@ -139,8 +234,21 @@ fn parse_note_ref(note_ref: &str) -> Result<ParsedNoteRef, NoteRefError> {
         .filter(|segment| !segment.is_empty())
         .map(percent_decode)
         .collect::<Result<Vec<_>, _>>()?;
-    match segments.as_slice() {
+    // A trailing `download` is the published Markdown of the same note. It is
+    // dropped only from a complete reference, so a slug that is itself
+    // `download` still names its note.
+    let segments = match segments.as_slice() {
+        [id, last] if last == "download" && !id.starts_with('@') && id != "s" => &segments[..1],
+        [_, _, last] if last == "download" => &segments[..2],
+        all => all,
+    };
+    match segments {
+        // `s` alone is the share-link prefix without its shortId.
+        [note_id] if note_id == "s" => Err(NoteRefError::InvalidUrl),
         [note_id] if !note_id.starts_with('@') => Ok(ParsedNoteRef::Direct(note_id.clone())),
+        [prefix, short_id] if prefix == "s" && !short_id.is_empty() => {
+            Ok(ParsedNoteRef::Short(short_id.clone()))
+        }
         [owner, slug] if owner.starts_with('@') && owner.len() > 1 && !slug.is_empty() => {
             Ok(ParsedNoteRef::Scoped {
                 owner: owner[1..].to_owned(),
@@ -252,6 +360,38 @@ mod tests {
         assert!(
             matches!(parse_note_ref("https://hackmd.io/@core/slug"), Ok(ParsedNoteRef::Scoped { owner, slug }) if owner == "core" && slug == "slug")
         );
+        assert!(
+            matches!(parse_note_ref("https://hackmd.io/@core/slug/download"), Ok(ParsedNoteRef::Scoped { owner, slug }) if owner == "core" && slug == "slug")
+        );
+        assert!(
+            matches!(parse_note_ref("https://hackmd.io/s/SkE33UTHf?type=view"), Ok(ParsedNoteRef::Short(id)) if id == "SkE33UTHf")
+        );
+        // A slug that is itself `download`, with and without the suffix.
+        for url in [
+            "https://hackmd.io/@core/download",
+            "https://hackmd.io/@core/download/download",
+        ] {
+            assert!(
+                matches!(parse_note_ref(url), Ok(ParsedNoteRef::Scoped { owner, slug }) if owner == "core" && slug == "download"),
+                "{url}"
+            );
+        }
+        assert!(
+            matches!(parse_note_ref("https://hackmd.io/api-id/download"), Ok(ParsedNoteRef::Direct(id)) if id == "api-id")
+        );
+        assert!(
+            matches!(parse_note_ref("https://hackmd.io/s/SkE33UTHf/download"), Ok(ParsedNoteRef::Short(id)) if id == "SkE33UTHf")
+        );
+        assert!(
+            matches!(parse_note_ref("hackmd.io/s/SkE33UTHf"), Ok(ParsedNoteRef::Short(id)) if id == "SkE33UTHf")
+        );
+        // The host is case-insensitive, with or without a scheme; the path is not.
+        assert!(
+            matches!(parse_note_ref("HackMD.io/s/SkE33UTHf"), Ok(ParsedNoteRef::Short(id)) if id == "SkE33UTHf")
+        );
+        assert!(
+            matches!(parse_note_ref("HACKMD.IO/@core/slug"), Ok(ParsedNoteRef::Scoped { owner, slug }) if owner == "core" && slug == "slug")
+        );
     }
 
     #[test]
@@ -282,6 +422,12 @@ mod tests {
             "https://example.com/id",
             "http://hackmd.io/id",
             "https://hackmd.io/@owner",
+            "https://hackmd.io/@core/slug/extra",
+            "https://hackmd.io/s",
+            "https://hackmd.io/s/",
+            // Only a lowercase `download` is known to be the published copy.
+            "https://hackmd.io/api-id/Download",
+            "https://hackmd.io/s/SkE33UTHf/Download",
         ] {
             assert!(parse_note_ref(value).is_err(), "accepted {value:?}");
         }
@@ -458,6 +604,240 @@ mod tests {
         ));
 
         assert_eq!(fixture.finish().len(), 4, "one request per resource");
+    }
+
+    fn short_link_fixture() -> SequenceServer {
+        SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Core","path":"core"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes",
+                200,
+                r#"[{"id":"mine","title":"Mine","shortId":"other"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams/core/notes",
+                200,
+                r#"[{"id":"team-id","title":"Team","shortId":"SkE33UTHf","permalink":"c-linked-list"}]"#,
+            ),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_short_link_without_team_path_searches_personal_then_teams() {
+        let fixture = short_link_fixture();
+        let result = resolve_note_ref(
+            &fixture.client(),
+            Workspace::Personal,
+            "https://hackmd.io/s/SkE33UTHf",
+            false,
+        )
+        .await
+        .expect("short link should resolve");
+        assert!(
+            matches!(result, NoteResolution::Resolved { note } if note.workspace == Workspace::Team { team_path: "core".to_owned() } && note.note_id == "team-id")
+        );
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn a_short_link_with_team_path_lists_only_that_team() {
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/teams/core/notes",
+            200,
+            r#"[{"id":"team-id","title":"Team","shortId":"SkE33UTHf"}]"#,
+        )]);
+        let result = resolve_note_ref(
+            &fixture.client(),
+            Workspace::Team {
+                team_path: "core".to_owned(),
+            },
+            "https://hackmd.io/s/missing",
+            false,
+        )
+        .await
+        .expect("lookup should answer");
+        assert!(matches!(result, NoteResolution::NotFound { query } if query == "s/missing"));
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn a_short_id_in_two_workspaces_is_ambiguous() {
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Core","path":"core"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes",
+                200,
+                r#"[{"id":"mine","title":"Mine","shortId":"dup"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams/core/notes",
+                200,
+                r#"[{"id":"team-id","title":"Team","shortId":"dup"}]"#,
+            ),
+        ]);
+        let result = resolve_note_ref(
+            &fixture.client(),
+            Workspace::Personal,
+            "hackmd.io/s/dup",
+            false,
+        )
+        .await
+        .expect("lookup should answer");
+        assert!(
+            matches!(&result, NoteResolution::Ambiguous { candidates, .. } if candidates.len() == 2),
+            "{result:?}"
+        );
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn a_short_download_link_to_a_personal_note_resolves_there() {
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/teams", 200, "[]"),
+            Scenario::new(
+                "GET",
+                "/v1/notes",
+                200,
+                r#"[{"id":"mine","title":"Mine","shortId":"SkE33UTHf"}]"#,
+            ),
+        ]);
+        let result = resolve_note_ref(
+            &fixture.client(),
+            Workspace::Personal,
+            "https://hackmd.io/s/SkE33UTHf/download",
+            false,
+        )
+        .await
+        .expect("short link should resolve");
+        assert!(
+            matches!(result, NoteResolution::Resolved { note } if note.workspace == Workspace::Personal && note.note_id == "mine")
+        );
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn a_short_id_twice_in_one_workspace_is_ambiguous() {
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/teams/core/notes",
+            200,
+            r#"[{"id":"a","title":"A","shortId":"dup"},{"id":"b","title":"B","shortId":"dup"}]"#,
+        )]);
+        let result = resolve_note_ref(
+            &fixture.client(),
+            Workspace::Team {
+                team_path: "core".to_owned(),
+            },
+            "https://hackmd.io/s/dup",
+            false,
+        )
+        .await
+        .expect("lookup should answer");
+        assert!(
+            matches!(&result, NoteResolution::Ambiguous { query, candidates } if query == "s/dup" && candidates.len() == 2),
+            "{result:?}"
+        );
+        fixture.finish();
+    }
+
+    #[tokio::test]
+    async fn repeated_short_links_reuse_the_cache_until_refresh() {
+        let teams = r#"[{"id":"t","name":"Core","path":"core"}]"#;
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new("GET", "/v1/teams", 200, teams),
+            Scenario::new(
+                "GET",
+                "/v1/notes",
+                200,
+                r#"[{"id":"old","title":"Old","shortId":"SkE33UTHf"}]"#,
+            ),
+            Scenario::new("GET", "/v1/teams/core/notes", 200, "[]"),
+            Scenario::new("GET", "/v1/teams", 200, teams),
+            Scenario::new(
+                "GET",
+                "/v1/notes",
+                200,
+                r#"[{"id":"new","title":"New","shortId":"SkE33UTHf"}]"#,
+            ),
+            Scenario::new("GET", "/v1/teams/core/notes", 200, "[]"),
+        ]);
+        let client = fixture.client_with_cache();
+        let resolve = |refresh| {
+            resolve_note_ref(
+                &client,
+                Workspace::Personal,
+                "https://hackmd.io/s/SkE33UTHf",
+                refresh,
+            )
+        };
+        for _ in 0..2 {
+            let cached = resolve(false).await.expect("short link should resolve");
+            assert!(matches!(cached, NoteResolution::Resolved { note } if note.note_id == "old"));
+        }
+        let refreshed = resolve(true).await.expect("short link should resolve");
+        assert!(matches!(refreshed, NoteResolution::Resolved { note } if note.note_id == "new"));
+        assert_eq!(
+            fixture.finish().len(),
+            6,
+            "one request per resource per refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_team_listing_says_team_path_narrows_the_search() {
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Core","path":"core"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes",
+                200,
+                r#"[{"id":"mine","title":"Mine","shortId":"SkE33UTHf"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams/core/notes",
+                403,
+                r#"{"error":"forbidden"}"#,
+            ),
+        ]);
+        let error = resolve_note_ref(
+            &fixture.client(),
+            Workspace::Personal,
+            "https://hackmd.io/s/SkE33UTHf",
+            false,
+        )
+        .await
+        .expect_err("a team that cannot be listed may hold the note");
+        assert!(
+            matches!(&error, super::NoteRefError::ShortLinkTeam { short_id, .. } if short_id == "SkE33UTHf")
+        );
+        assert!(
+            error
+                .to_string()
+                .ends_with("; this came from a team listing while searching every workspace for s/SkE33UTHf, so pass team_path to search only the team that holds the note"),
+            "{error}"
+        );
+        fixture.finish();
     }
 
     #[tokio::test]

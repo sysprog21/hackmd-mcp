@@ -35,14 +35,16 @@ pub(crate) struct PushNoteInput {
     /// reference resolves to the note the sync record names. Omit it to save
     /// the lookup.
     pub(crate) note_ref: Option<String>,
-    /// Team path (from `hackmd_get_me`) for a direct internal `note_ref`.
-    /// Omitted, the tracked note's own workspace is assumed; `@owner/slug`
-    /// URLs name their own. Without `note_ref`, one naming another workspace
-    /// than the sync record is refused.
+    /// Team path (from `hackmd_get_me`) for a direct internal `note_ref`, or
+    /// the one team to search for an `s/<shortId>` link. Omitted, a direct ID
+    /// is read in the tracked note's own workspace and a short link is
+    /// searched for in every workspace; `@owner/slug` URLs name their own.
+    /// Without `note_ref`, one naming another workspace than the sync record
+    /// is refused.
     #[serde(default, rename = "team_path", alias = "workspace")]
     pub(crate) workspace: Workspace,
     /// Bypass the 60-second account and note-list caches when resolving an
-    /// `@owner/slug` `note_ref`.
+    /// `@owner/slug` or `s/<shortId>` `note_ref`.
     #[serde(default)]
     pub(crate) refresh: bool,
     /// `safe` (default) writes only when the remote still matches the
@@ -212,8 +214,10 @@ pub(crate) async fn push_note(
         // A bare note ID without team_path is read in the tracked note's own
         // workspace: the cross-check is about which note, and omitting
         // team_path should not make a team note look like a different one.
+        // A link resolved by listing searches every workspace, so one naming
+        // another workspace's note is reported as a mismatch.
         let workspace = match input.workspace {
-            Workspace::Personal if !crate::note::reference::is_slug_url(note_ref) => {
+            Workspace::Personal if !crate::note::reference::resolves_by_listing(note_ref) => {
                 note.workspace.clone()
             }
             other => other,
@@ -1612,5 +1616,51 @@ mod tests {
             push_note(&client, &files, other).await,
             Err(PushNoteError::TrackingMismatch)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_short_link_to_another_workspaces_note_is_refused() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").expect("local fixture should write");
+        let files = crate::fixture::tracked_files_in(
+            Workspace::Team {
+                team_path: "core".to_owned(),
+            },
+            directory.path(),
+            "note-id",
+            &local_path,
+            "baseline",
+        );
+
+        // The link names no workspace, so every one is searched rather than
+        // only the tracked team, and the personal note it names is reported.
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Core","path":"core"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes",
+                200,
+                r#"[{"id":"mine","title":"Mine","shortId":"SkE33UTHf"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams/core/notes",
+                200,
+                r#"[{"id":"note-id","title":"Note","shortId":"other"}]"#,
+            ),
+        ]);
+        let mut named = input(&local_path, PushStrategy::Safe, false);
+        named.note_ref = Some("https://hackmd.io/s/SkE33UTHf".to_owned());
+        assert!(matches!(
+            push_note(&fixture.client(), &files, named).await,
+            Err(PushNoteError::TrackingMismatch)
+        ));
+        fixture.finish();
     }
 }

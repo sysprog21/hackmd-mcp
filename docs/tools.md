@@ -7,9 +7,13 @@ explains how they fit together.
 ## Finding notes
 
 Every tool that takes a `note_ref` accepts either a note's internal ID or its
-URL, such as `https://hackmd.io/@owner/slug`. If a URL matches no note, or more
-than one, the tool does not guess: it returns the candidates so the agent can
-pick.
+URL, such as `https://hackmd.io/@owner/slug`; a trailing `/download` is
+ignored. A legacy share link, `https://hackmd.io/s/<shortId>`, names no
+workspace: with a `team_path` only that team is searched, and without one the
+personal notes and then every team (a team that cannot be listed fails the
+search, and the error suggests `team_path`). If a URL matches no note, or
+more than one, the tool does not guess: it returns the candidates so the agent
+can pick.
 
 Notes the tools return carry a `note_url`, `https://hackmd.io/<id>`, which opens
 personal and team notes alike. It is a link, not an invite: whoever follows it
