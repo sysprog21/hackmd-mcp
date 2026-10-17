@@ -26,7 +26,12 @@ pub(crate) struct ListNotesInput {
     /// personal workspace. History and trash are account-wide and take no
     /// team; for `tracked` a team narrows the records to that team's notes,
     /// and omitting it lists every workspace's.
-    #[serde(default, rename = "team_path", alias = "workspace")]
+    #[serde(
+        default,
+        rename = "team_path",
+        alias = "workspace",
+        deserialize_with = "crate::models::given"
+    )]
     pub(crate) workspace: Option<Workspace>,
     /// Maximum notes returned after filtering (default 20, maximum 100).
     #[serde(default = "default_limit")]
@@ -218,7 +223,7 @@ pub(crate) async fn list_notes(
     }
     // History and trash are account-wide and never cached.
     let account_wide = |name| {
-        if matches!(input.workspace, Some(Workspace::Team { .. })) {
+        if input.workspace.is_some() {
             Err(ListNotesError::AccountWideSource(name))
         } else if input.refresh {
             Err(ListNotesError::UncachedRefresh(name))
@@ -433,18 +438,6 @@ mod tests {
             panic!("the tracked source should list tracked records");
         };
         assert_eq!(output.notes, []);
-
-        // The personal workspace, named explicitly, keeps this record.
-        let mut personal = input();
-        personal.source = NoteSource::Tracked;
-        personal.workspace = Some(Workspace::Personal);
-        let ListOutput::Tracked(output) = list_notes(&client, &files, personal)
-            .await
-            .expect("a personal filter should list")
-        else {
-            panic!("the tracked source should list tracked records");
-        };
-        assert_eq!(output.notes.len(), 1);
 
         for refuse in [
             |input: &mut ListNotesInput| input.sort = Some(NoteSort::TitleAsc),

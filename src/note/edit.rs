@@ -140,13 +140,15 @@ pub(crate) async fn edit_note(
     drop(content);
     let mut title_drift = None;
     if changed {
-        let written = client
-            .write_note_body(&note.workspace, &note.note_id, &updated)
-            .await?;
         // Judged against the read-back's title, as push does, so a rename
-        // made meanwhile is respected.
+        // made meanwhile is respected. Only the title is kept: the read-back
+        // body is another full copy of the note.
+        let listed = client
+            .write_note_body(&note.workspace, &note.note_id, &updated)
+            .await?
+            .title;
         title_drift = crate::local::offload(|| {
-            crate::note::body::title_drift(&written.title, &updated, || synced_title)
+            crate::note::body::title_drift(&listed, &updated, || synced_title)
         });
     }
     Ok(Ok(EditNoteOutput {
@@ -279,14 +281,11 @@ mod tests {
         old: &str,
         patch_lines: &str,
     ) -> super::EditNoteOutput {
-        let new = crate::note::patch::apply_note_patch(
-            old,
-            &format!(
-                "*** Begin Patch\n*** Update File: notes/note-id.md\n{patch_lines}*** End Patch"
-            ),
-            "notes/note-id.md",
-        )
-        .expect("the test patch applies");
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: notes/note-id.md\n{patch_lines}*** End Patch"
+        );
+        let new = crate::note::patch::apply_note_patch(old, &patch, "notes/note-id.md")
+            .expect("the test patch applies");
         let note = |title: &str, content: &str| {
             serde_json::json!({"id": "note-id", "title": title, "content": content}).to_string()
         };
@@ -300,15 +299,10 @@ mod tests {
                 &note(read_back_title, &new),
             ),
         ]);
-        let output = edit_note(
-            &server.client(),
-            input(&format!(
-                "*** Begin Patch\n*** Update File: notes/note-id.md\n{patch_lines}*** End Patch"
-            )),
-        )
-        .await
-        .expect("edit should succeed")
-        .expect("reference should resolve");
+        let output = edit_note(&server.client(), input(&patch))
+            .await
+            .expect("edit should succeed")
+            .expect("reference should resolve");
         server.finish();
         output
     }

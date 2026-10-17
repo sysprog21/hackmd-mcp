@@ -23,7 +23,12 @@ pub(crate) struct GetNoteInput {
     /// Team path (from `hackmd_get_me`) when a direct internal note ID belongs
     /// to a team; omit for personal notes. `@owner/slug` URLs name their own
     /// workspace. With an `s/<shortId>` link, only this team is searched.
-    #[serde(default, rename = "team_path", alias = "workspace")]
+    #[serde(
+        default,
+        rename = "team_path",
+        alias = "workspace",
+        deserialize_with = "crate::models::given"
+    )]
     pub(crate) workspace: Option<Workspace>,
     /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
     /// `hackmd.io/s/<shortId>` share link.
@@ -227,9 +232,9 @@ mod tests {
         note::reference::ResolvedNoteRef,
     };
 
-    /// `null` is what clients send for an unset optional field, so it means
-    /// "not given", as omission does; only the older tagged form can say
-    /// "personal" explicitly. Both aliases read the same.
+    /// `null` is what clients send for an unset optional field, and older
+    /// clients send the tagged personal object by default, so both mean "not
+    /// given", as omission does. Both aliases read the same.
     #[test]
     fn a_null_team_path_is_the_same_as_none_given() {
         let team_path = |input: serde_json::Value| {
@@ -248,7 +253,7 @@ mod tests {
         );
         assert_eq!(
             team_path(json!({"note_ref": "id", "workspace": {"kind": "personal"}})),
-            Some(Workspace::Personal)
+            None
         );
         let core = Some(Workspace::Team {
             team_path: "core".to_owned(),

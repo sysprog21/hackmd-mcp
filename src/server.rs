@@ -329,6 +329,7 @@ mod tests {
         let tools = HackmdServer::router().list_all();
         for name in [
             "hackmd_get_note",
+            "hackmd_list_notes",
             "hackmd_update_note",
             "hackmd_delete_note",
             "hackmd_pull_note",

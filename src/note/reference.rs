@@ -53,10 +53,6 @@ pub(crate) enum NoteRefError {
     )]
     WorkspaceMismatch { team_path: String, owner: String },
     #[error(
-        "team_path names the personal workspace, but the URL's owner @{owner} is not this account; omit team_path, since the URL names the workspace"
-    )]
-    PersonalMismatch { owner: String },
-    #[error(
         "{source}; this came from a team listing while searching every workspace for s/{short_id}, so pass team_path to search only the team that holds the note"
     )]
     ShortLinkTeam {
@@ -72,10 +68,9 @@ impl crate::reply::ToolError for NoteRefError {
         use crate::reply::ErrorKind;
 
         match self {
-            Self::Empty
-            | Self::InvalidUrl
-            | Self::WorkspaceMismatch { .. }
-            | Self::PersonalMismatch { .. } => ErrorKind::InvalidInput,
+            Self::Empty | Self::InvalidUrl | Self::WorkspaceMismatch { .. } => {
+                ErrorKind::InvalidInput
+            }
             Self::ShortLinkTeam { source: error, .. } | Self::Api(error) => error.kind(),
         }
     }
@@ -134,11 +129,7 @@ pub(crate) async fn resolve_note_ref_from(
                     owner,
                 });
             }
-            let mine = *owner == *client.user_path(refresh).await?;
-            if team_path == Some(Workspace::Personal) && !mine {
-                return Err(NoteRefError::PersonalMismatch { owner });
-            }
-            let workspace = if mine {
+            let workspace = if *owner == *client.user_path(refresh).await? {
                 Workspace::Personal
             } else if client.has_team(&owner, refresh).await? {
                 Workspace::Team { team_path: owner }
@@ -166,57 +157,33 @@ async fn resolve_short_id(
     short_id: &str,
     refresh: bool,
 ) -> Result<NoteResolution, NoteRefError> {
-    let matching = |workspace: &Workspace, notes: &[NoteResponse]| {
-        notes
-            .iter()
-            .filter(|note| note.short_id.as_deref() == Some(short_id))
-            .map(|note| NoteCandidate {
-                workspace: workspace.clone(),
-                note_id: note.id.clone(),
-                title: note.title.clone(),
-                short_id: note.short_id.clone(),
-                permalink: note.permalink.clone(),
-            })
-            .collect::<Vec<_>>()
-    };
-    let mut candidates = Vec::new();
-    if let Some(workspace) = team_path {
-        candidates = matching(&workspace, &client.list_notes(&workspace, refresh).await?);
+    let by_short_id = |note: &NoteResponse, query: &str| note.short_id.as_deref() == Some(query);
+    let candidates = if let Some(workspace) = team_path {
+        let notes = client.list_notes(&workspace, refresh).await?;
+        candidates_in(&workspace, short_id, &notes, by_short_id)
     } else {
         let teams = client.list_teams(refresh).await?;
-        let personal = Workspace::Personal;
-        candidates.extend(matching(
-            &personal,
-            &client.list_notes(&personal, refresh).await?,
-        ));
-        for team in teams.iter() {
-            let workspace = Workspace::Team {
+        let mut candidates = Vec::new();
+        let workspaces =
+            std::iter::once(Workspace::Personal).chain(teams.iter().map(|team| Workspace::Team {
                 team_path: team.path.clone(),
-            };
+            }));
+        for workspace in workspaces {
             let notes = client
                 .list_notes(&workspace, refresh)
                 .await
-                .map_err(|source| NoteRefError::ShortLinkTeam {
-                    short_id: short_id.to_owned(),
-                    source,
+                .map_err(|source| match workspace {
+                    Workspace::Personal => NoteRefError::from(source),
+                    Workspace::Team { .. } => NoteRefError::ShortLinkTeam {
+                        short_id: short_id.to_owned(),
+                        source,
+                    },
                 })?;
-            candidates.extend(matching(&workspace, &notes));
+            candidates.extend(candidates_in(&workspace, short_id, &notes, by_short_id));
         }
-    }
-    let query = format!("s/{short_id}");
-    Ok(match candidates.len() {
-        0 => NoteResolution::NotFound { query },
-        1 => {
-            let only = candidates.remove(0);
-            NoteResolution::Resolved {
-                note: ResolvedNoteRef {
-                    workspace: only.workspace,
-                    note_id: only.note_id,
-                },
-            }
-        }
-        _ => NoteResolution::Ambiguous { query, candidates },
-    })
+        candidates
+    };
+    Ok(resolution(format!("s/{short_id}"), candidates))
 }
 
 /// Whether resolving `note_ref` searches workspace lists (`@owner/slug` or
@@ -269,9 +236,7 @@ fn parse_note_ref(note_ref: &str) -> Result<ParsedNoteRef, NoteRefError> {
         // `s` alone is the share-link prefix without its shortId.
         [note_id] if note_id == "s" => Err(NoteRefError::InvalidUrl),
         [note_id] if !note_id.starts_with('@') => Ok(ParsedNoteRef::Direct(note_id.clone())),
-        [prefix, short_id] if prefix == "s" && !short_id.is_empty() => {
-            Ok(ParsedNoteRef::Short(short_id.clone()))
-        }
+        [prefix, short_id] if prefix == "s" => Ok(ParsedNoteRef::Short(short_id.clone())),
         [owner, slug] if owner.starts_with('@') && owner.len() > 1 && !slug.is_empty() => {
             Ok(ParsedNoteRef::Scoped {
                 owner: owner[1..].to_owned(),
@@ -318,7 +283,22 @@ fn unique_matches<F>(
 where
     F: Fn(&NoteResponse, &str) -> bool,
 {
-    let candidates = notes
+    resolution(
+        query.to_owned(),
+        candidates_in(workspace, query, notes, matches),
+    )
+}
+
+fn candidates_in<F>(
+    workspace: &Workspace,
+    query: &str,
+    notes: &[NoteResponse],
+    matches: F,
+) -> Vec<NoteCandidate>
+where
+    F: Fn(&NoteResponse, &str) -> bool,
+{
+    notes
         .iter()
         .filter(|note| matches(note, query))
         .map(|note| NoteCandidate {
@@ -328,21 +308,20 @@ where
             short_id: note.short_id.clone(),
             permalink: note.permalink.clone(),
         })
-        .collect::<Vec<_>>();
-    match candidates.as_slice() {
-        [] => NoteResolution::NotFound {
-            query: query.to_owned(),
-        },
-        [candidate] => NoteResolution::Resolved {
+        .collect()
+}
+
+/// One candidate resolves; none or several are reported, never guessed.
+fn resolution(query: String, candidates: Vec<NoteCandidate>) -> NoteResolution {
+    match <[NoteCandidate; 1]>::try_from(candidates) {
+        Ok([only]) => NoteResolution::Resolved {
             note: ResolvedNoteRef {
-                workspace: workspace.clone(),
-                note_id: candidate.note_id.clone(),
+                workspace: only.workspace,
+                note_id: only.note_id,
             },
         },
-        _ => NoteResolution::Ambiguous {
-            query: query.to_owned(),
-            candidates,
-        },
+        Err(candidates) if candidates.is_empty() => NoteResolution::NotFound { query },
+        Err(candidates) => NoteResolution::Ambiguous { query, candidates },
     }
 }
 
@@ -480,10 +459,10 @@ mod tests {
         assert!(matches!(&result, NoteResolution::Resolved { note } if note.workspace == core));
         // With no team_path, push reads a direct ID in the tracked note's own
         // workspace; a given team_path still wins.
-        for (team_path, expected) in [
-            (None, &core),
-            (Some(Workspace::Personal), &Workspace::Personal),
-        ] {
+        let other = Workspace::Team {
+            team_path: "other".to_owned(),
+        };
+        for (team_path, expected) in [(None, &core), (Some(other.clone()), &other)] {
             let result = super::resolve_note_ref_from(
                 &client,
                 team_path,
@@ -497,29 +476,6 @@ mod tests {
                 matches!(&result, NoteResolution::Resolved { note } if note.workspace == *expected)
             );
         }
-    }
-
-    #[tokio::test]
-    async fn an_explicit_personal_workspace_contradicting_the_url_is_refused() {
-        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
-            "GET",
-            "/v1/me",
-            200,
-            r#"{"id":"u","name":"User","userPath":"alice"}"#,
-        )]);
-        let error = resolve_note_ref(
-            &fixture.client(),
-            Some(Workspace::Personal),
-            "https://hackmd.io/@core/slug",
-            false,
-        )
-        .await
-        .expect_err("a personal team_path cannot name @core's note");
-        assert_eq!(
-            error.to_string(),
-            "team_path names the personal workspace, but the URL's owner @core is not this account; omit team_path, since the URL names the workspace"
-        );
-        fixture.finish();
     }
 
     #[tokio::test]
@@ -664,32 +620,30 @@ mod tests {
         assert_eq!(fixture.finish().len(), 4, "one request per resource");
     }
 
-    fn short_link_fixture() -> SequenceServer {
-        SequenceServer::spawn_scenarios([
+    /// A search of every workspace: the team list (team `core`), then the
+    /// personal notes, then core's notes, answered with `core`'s status.
+    fn every_workspace(personal: &str, core: (u16, &str)) -> [Scenario; 3] {
+        [
             Scenario::new(
                 "GET",
                 "/v1/teams",
                 200,
                 r#"[{"id":"t","name":"Core","path":"core"}]"#,
             ),
-            Scenario::new(
-                "GET",
-                "/v1/notes",
-                200,
-                r#"[{"id":"mine","title":"Mine","shortId":"other"}]"#,
-            ),
-            Scenario::new(
-                "GET",
-                "/v1/teams/core/notes",
-                200,
-                r#"[{"id":"team-id","title":"Team","shortId":"SkE33UTHf","permalink":"c-linked-list"}]"#,
-            ),
-        ])
+            Scenario::new("GET", "/v1/notes", 200, personal),
+            Scenario::new("GET", "/v1/teams/core/notes", core.0, core.1),
+        ]
     }
 
     #[tokio::test]
     async fn a_short_link_without_team_path_searches_personal_then_teams() {
-        let fixture = short_link_fixture();
+        let fixture = SequenceServer::spawn_scenarios(every_workspace(
+            r#"[{"id":"mine","title":"Mine","shortId":"other"}]"#,
+            (
+                200,
+                r#"[{"id":"team-id","title":"Team","shortId":"SkE33UTHf","permalink":"c-linked-list"}]"#,
+            ),
+        ));
         let result = resolve_note_ref(
             &fixture.client(),
             None,
@@ -727,53 +681,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_short_link_with_an_explicit_personal_workspace_lists_only_it() {
-        // Only the older tagged form can say "personal" explicitly; teams are
-        // then not listed at all.
-        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
-            "GET",
-            "/v1/notes",
-            200,
-            r#"[{"id":"mine","title":"Mine","shortId":"SkE33UTHf"}]"#,
-        )]);
-        let team_path = serde_json::from_value(serde_json::json!({"kind": "personal"}))
-            .expect("the tagged personal form should deserialize");
-        let result = resolve_note_ref(
-            &fixture.client(),
-            Some(team_path),
-            "https://hackmd.io/s/SkE33UTHf",
-            false,
-        )
-        .await
-        .expect("short link should resolve");
-        assert!(
-            matches!(result, NoteResolution::Resolved { note } if note.workspace == Workspace::Personal && note.note_id == "mine")
-        );
-        assert_eq!(fixture.finish().len(), 1, "no team is listed");
-    }
-
-    #[tokio::test]
     async fn a_short_id_in_two_workspaces_is_ambiguous() {
-        let fixture = SequenceServer::spawn_scenarios([
-            Scenario::new(
-                "GET",
-                "/v1/teams",
-                200,
-                r#"[{"id":"t","name":"Core","path":"core"}]"#,
-            ),
-            Scenario::new(
-                "GET",
-                "/v1/notes",
-                200,
-                r#"[{"id":"mine","title":"Mine","shortId":"dup"}]"#,
-            ),
-            Scenario::new(
-                "GET",
-                "/v1/teams/core/notes",
-                200,
-                r#"[{"id":"team-id","title":"Team","shortId":"dup"}]"#,
-            ),
-        ]);
+        let fixture = SequenceServer::spawn_scenarios(every_workspace(
+            r#"[{"id":"mine","title":"Mine","shortId":"dup"}]"#,
+            (200, r#"[{"id":"team-id","title":"Team","shortId":"dup"}]"#),
+        ));
         let result = resolve_note_ref(&fixture.client(), None, "hackmd.io/s/dup", false)
             .await
             .expect("lookup should answer");
@@ -836,25 +748,16 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_short_links_reuse_the_cache_until_refresh() {
-        let teams = r#"[{"id":"t","name":"Core","path":"core"}]"#;
-        let fixture = SequenceServer::spawn_scenarios([
-            Scenario::new("GET", "/v1/teams", 200, teams),
-            Scenario::new(
-                "GET",
-                "/v1/notes",
-                200,
-                r#"[{"id":"old","title":"Old","shortId":"SkE33UTHf"}]"#,
-            ),
-            Scenario::new("GET", "/v1/teams/core/notes", 200, "[]"),
-            Scenario::new("GET", "/v1/teams", 200, teams),
-            Scenario::new(
-                "GET",
-                "/v1/notes",
-                200,
-                r#"[{"id":"new","title":"New","shortId":"SkE33UTHf"}]"#,
-            ),
-            Scenario::new("GET", "/v1/teams/core/notes", 200, "[]"),
-        ]);
+        let [teams, old, core] = every_workspace(
+            r#"[{"id":"old","title":"Old","shortId":"SkE33UTHf"}]"#,
+            (200, "[]"),
+        );
+        let [teams_again, new, core_again] = every_workspace(
+            r#"[{"id":"new","title":"New","shortId":"SkE33UTHf"}]"#,
+            (200, "[]"),
+        );
+        let fixture =
+            SequenceServer::spawn_scenarios([teams, old, core, teams_again, new, core_again]);
         let client = fixture.client_with_cache();
         let resolve =
             |refresh| resolve_note_ref(&client, None, "https://hackmd.io/s/SkE33UTHf", refresh);
@@ -873,26 +776,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_team_listing_says_team_path_narrows_the_search() {
-        let fixture = SequenceServer::spawn_scenarios([
-            Scenario::new(
-                "GET",
-                "/v1/teams",
-                200,
-                r#"[{"id":"t","name":"Core","path":"core"}]"#,
-            ),
-            Scenario::new(
-                "GET",
-                "/v1/notes",
-                200,
-                r#"[{"id":"mine","title":"Mine","shortId":"SkE33UTHf"}]"#,
-            ),
-            Scenario::new(
-                "GET",
-                "/v1/teams/core/notes",
-                403,
-                r#"{"error":"forbidden"}"#,
-            ),
-        ]);
+        let fixture = SequenceServer::spawn_scenarios(every_workspace(
+            r#"[{"id":"mine","title":"Mine","shortId":"SkE33UTHf"}]"#,
+            (403, r#"{"error":"forbidden"}"#),
+        ));
         let error = resolve_note_ref(
             &fixture.client(),
             None,

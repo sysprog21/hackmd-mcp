@@ -25,7 +25,12 @@ pub(crate) struct UploadNoteImageInput {
     /// outright. Not advertised: the upload route is the same for every note,
     /// so this only cross-checks the owner of an `@owner/slug` URL and limits
     /// the search for an `s/<shortId>` link to that team.
-    #[serde(default, rename = "team_path", alias = "workspace")]
+    #[serde(
+        default,
+        rename = "team_path",
+        alias = "workspace",
+        deserialize_with = "crate::models::given"
+    )]
     #[schemars(skip)]
     pub(crate) workspace: Option<Workspace>,
     /// Internal note ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy

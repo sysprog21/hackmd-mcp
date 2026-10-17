@@ -41,7 +41,12 @@ pub(crate) struct PushNoteInput {
     /// searched for in every workspace; `@owner/slug` URLs name their own.
     /// Without `note_ref`, one naming another workspace than the sync record
     /// is refused.
-    #[serde(default, rename = "team_path", alias = "workspace")]
+    #[serde(
+        default,
+        rename = "team_path",
+        alias = "workspace",
+        deserialize_with = "crate::models::given"
+    )]
     pub(crate) workspace: Option<Workspace>,
     /// Bypass the 60-second account and note-list caches when resolving an
     /// `@owner/slug` or `s/<shortId>` `note_ref`.
@@ -1486,19 +1491,6 @@ mod tests {
             "baseline",
         );
 
-        // An explicit personal workspace (the older tagged form) on a team
-        // note disagrees as much as another team does.
-        assert!(matches!(
-            push_note(&client, &files, pushing(Some(Workspace::Personal), false)).await,
-            Err(PushNoteError::TrackedWorkspaceMismatch)
-        ));
-        // So does it beside a bare ID, which is then read as a personal note.
-        let mut named = pushing(Some(Workspace::Personal), false);
-        named.note_ref = Some("note-id".to_owned());
-        assert!(matches!(
-            push_note(&client, &files, named).await,
-            Err(PushNoteError::TrackingMismatch)
-        ));
         // The record's own team and an unused refresh go through, as they did
         // before the check existed: they get as far as the network.
         for (workspace, refresh) in [(Some(team("core")), false), (None, true)] {

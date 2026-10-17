@@ -72,7 +72,12 @@ pub(crate) struct UpdateNoteInput {
     /// Team path (from `hackmd_get_me`) when a direct internal note ID belongs
     /// to a team; omit for personal notes. `@owner/slug` URLs name their own
     /// workspace. With an `s/<shortId>` link, only this team is searched.
-    #[serde(default, rename = "team_path", alias = "workspace")]
+    #[serde(
+        default,
+        rename = "team_path",
+        alias = "workspace",
+        deserialize_with = "crate::models::given"
+    )]
     pub(crate) workspace: Option<Workspace>,
     /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
     /// `hackmd.io/s/<shortId>` share link.
@@ -163,7 +168,12 @@ pub(crate) struct DeleteNoteInput {
     /// Team path (from `hackmd_get_me`) when a direct internal note ID belongs
     /// to a team; omit for personal notes. `@owner/slug` URLs name their own
     /// workspace. With an `s/<shortId>` link, only this team is searched.
-    #[serde(default, rename = "team_path", alias = "workspace")]
+    #[serde(
+        default,
+        rename = "team_path",
+        alias = "workspace",
+        deserialize_with = "crate::models::given"
+    )]
     pub(crate) workspace: Option<Workspace>,
     /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
     /// `hackmd.io/s/<shortId>` share link.
