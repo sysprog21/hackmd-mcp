@@ -394,9 +394,10 @@ impl HackmdClient {
         note_id: &str,
         body: &str,
     ) -> Result<NoteResponse, HackmdError> {
-        self.update_note(workspace, note_id, &UpdateNoteRequest::new(body))
-            .await?;
-        self.confirm_note_write(workspace, note_id, body.len(), |note| {
+        let sent = self
+            .update_note(workspace, note_id, &UpdateNoteRequest::new(body))
+            .await;
+        self.confirm_note_write(sent, workspace, note_id, body.len(), |note, _| {
             note.content.as_deref() == Some(body)
         })
         .await
@@ -404,15 +405,27 @@ impl HackmdClient {
 
     /// Reads a just-written note until `accepted` holds, returning that read.
     /// A write that never shows up within the read-back window is
-    /// `ReadbackMismatch`, not a success.
+    /// `ReadbackMismatch`, not a success. A PATCH whose outcome is unknown (a
+    /// 5xx, a timeout, a dropped connection) gets the same read-back: a read
+    /// showing the note as sent settles it, and anything else keeps the
+    /// original `WriteUnconfirmed`, since the write may still land. It is
+    /// never sent again from here. `accepted` is told when the read must
+    /// prove the write that way, so it can check what it otherwise leaves
+    /// alone.
     pub(crate) async fn confirm_note_write(
         &self,
+        sent: Result<(), HackmdError>,
         workspace: &Workspace,
         note_id: &str,
         written_bytes: usize,
-        accepted: impl Fn(&NoteResponse) -> bool,
+        accepted: impl Fn(&NoteResponse, bool) -> bool,
     ) -> Result<NoteResponse, HackmdError> {
-        let (note, validator) = self
+        let unconfirmed = match sent {
+            Ok(()) => None,
+            Err(error @ HackmdError::WriteUnconfirmed { .. }) => Some(error),
+            Err(error) => return Err(error),
+        };
+        let readback = self
             .poll_readback(
                 written_bytes,
                 || async {
@@ -431,12 +444,16 @@ impl HackmdClient {
                     })?;
                     Ok((note, validator))
                 },
-                |(note, _)| accepted(note),
+                |(note, _)| accepted(note, unconfirmed.is_some()),
             )
-            .await?
-            .confirmed_or(|| HackmdError::ReadbackMismatch {
-                note_id: note_id.to_owned(),
-            })?;
+            .await;
+        let (note, validator) = readback
+            .and_then(|read| {
+                read.confirmed_or(|| HackmdError::ReadbackMismatch {
+                    note_id: note_id.to_owned(),
+                })
+            })
+            .map_err(|error| unconfirmed.unwrap_or(error))?;
         self.seed_snapshot(workspace, note_id, validator, &note);
         Ok(note)
     }
@@ -1749,53 +1766,89 @@ mod tests {
 
     #[tokio::test]
     async fn push_readback_seeds_only_after_confirmation() {
-        let server = SequenceServer::spawn_scenarios([
-            Scenario::new(
-                "GET",
-                "/v1/notes/id",
-                200,
-                r#"{"id":"id","title":"Note","content":"old"}"#,
-            )
-            .response_header("etag", "W/\"old\""),
-            Scenario::new("PATCH", "/v1/notes/id", 202, ""),
-            Scenario::new(
-                "GET",
-                "/v1/notes/id",
-                200,
-                r#"{"id":"id","title":"Note","content":"old"}"#,
-            )
-            .response_header("etag", "W/\"old\""),
-            Scenario::new(
-                "GET",
-                "/v1/notes/id",
-                200,
-                r#"{"id":"id","title":"Note","content":"new"}"#,
-            )
-            .response_header("etag", "W/\"new\""),
-            Scenario::new("GET", "/v1/notes/id", 304, "")
-                .expect_header("if-none-match", "W/\"new\""),
-        ]);
-        let client = snapshot_client(&server);
-        client
-            .get_note_snapshot(&Workspace::Personal, "id")
-            .await
-            .unwrap();
-        client
-            .write_note_body(&Workspace::Personal, "id", "new")
-            .await
-            .unwrap();
-        assert_eq!(
-            &*client
+        // A PATCH whose outcome is unknown seeds from its read-back too.
+        for patch in [202, 502] {
+            let server = SequenceServer::spawn_scenarios([
+                Scenario::new(
+                    "GET",
+                    "/v1/notes/id",
+                    200,
+                    r#"{"id":"id","title":"Note","content":"old"}"#,
+                )
+                .response_header("etag", "W/\"old\""),
+                Scenario::new("PATCH", "/v1/notes/id", patch, ""),
+                Scenario::new(
+                    "GET",
+                    "/v1/notes/id",
+                    200,
+                    r#"{"id":"id","title":"Note","content":"old"}"#,
+                )
+                .response_header("etag", "W/\"old\""),
+                Scenario::new(
+                    "GET",
+                    "/v1/notes/id",
+                    200,
+                    r#"{"id":"id","title":"Note","content":"new"}"#,
+                )
+                .response_header("etag", "W/\"new\""),
+                Scenario::new("GET", "/v1/notes/id", 304, "")
+                    .expect_header("if-none-match", "W/\"new\""),
+            ]);
+            let client = snapshot_client(&server);
+            client
                 .get_note_snapshot(&Workspace::Personal, "id")
                 .await
-                .unwrap()
-                .content,
-            "new"
+                .unwrap();
+            client
+                .write_note_body(&Workspace::Personal, "id", "new")
+                .await
+                .unwrap();
+            assert_eq!(
+                &*client
+                    .get_note_snapshot(&Workspace::Personal, "id")
+                    .await
+                    .unwrap()
+                    .content,
+                "new"
+            );
+            let requests = server.finish();
+            assert_eq!(requests.len(), 5);
+            assert!(!requests[2].to_ascii_lowercase().contains("if-none-match:"));
+            assert!(!requests[3].to_ascii_lowercase().contains("if-none-match:"));
+        }
+    }
+
+    /// An unknown PATCH outcome that the read-back cannot settle keeps its own
+    /// error, and any other PATCH error is returned as it is.
+    #[tokio::test]
+    async fn an_unsettled_note_write_keeps_the_patch_error() {
+        let server = SequenceServer::spawn_scenarios([
+            Scenario::new("PATCH", "/v1/notes/id", 502, ""),
+            Scenario::new("GET", "/v1/notes/id", 403, ""),
+        ]);
+        let error = server
+            .client()
+            .write_note_body(&Workspace::Personal, "id", "new")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HackmdError::WriteUnconfirmed { method, .. } if method == "PATCH"),
+            "{error}"
         );
-        let requests = server.finish();
-        assert_eq!(requests.len(), 5);
-        assert!(!requests[2].to_ascii_lowercase().contains("if-none-match:"));
-        assert!(!requests[3].to_ascii_lowercase().contains("if-none-match:"));
+        assert_eq!(server.finish().len(), 2);
+
+        let server =
+            SequenceServer::spawn_scenarios([Scenario::new("PATCH", "/v1/notes/id", 422, "")]);
+        let error = server
+            .client()
+            .write_note_body(&Workspace::Personal, "id", "new")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, HackmdError::Api { status, .. } if status == 422),
+            "{error}"
+        );
+        server.finish();
     }
 
     #[tokio::test]

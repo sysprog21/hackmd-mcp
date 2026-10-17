@@ -143,6 +143,17 @@ impl UpdateNoteInput {
             || self.comment_permission.is_some()
             || self.suggest_edit_permission.is_some()
     }
+
+    /// The field checks an update makes before any request.
+    fn validate_fields(&self) -> Result<(), CrudError> {
+        if !self.changes_fields() {
+            return Err(CrudError::NothingToUpdate);
+        }
+        if self.comment_permission.is_some() || self.suggest_edit_permission.is_some() {
+            return Err(CrudError::UnsupportedPermissionField);
+        }
+        validate_permission_order(self.read_permission, self.write_permission).map_err(Into::into)
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -289,11 +300,18 @@ impl crate::reply::ToolError for CrudError {
 /// read is an ancestor list of unverified order (and unmeasured for teams), so
 /// a move to an ancestor would match before it landed.
 fn shows_metadata(sent: &UpdateNoteRequest<'_>, note: &NoteResponse) -> bool {
-    unshown_metadata(sent, note).is_empty()
+    unshown_metadata(sent, note, false).is_empty()
 }
 
-/// The names of the fields `sent` set that `note` does not show.
-fn unshown_metadata(sent: &UpdateNoteRequest<'_>, note: &NoteResponse) -> Vec<&'static str> {
+/// The names of the fields `sent` set that `note` does not show. With
+/// `proof`, the read must show the write landed, as it must when the PATCH's
+/// outcome is unknown: a blank title and the folder, otherwise left
+/// unchecked, count too, since a read of the unchanged note would pass.
+fn unshown_metadata(
+    sent: &UpdateNoteRequest<'_>,
+    note: &NoteResponse,
+    proof: bool,
+) -> Vec<&'static str> {
     fn tag_set(tags: &[String]) -> std::collections::BTreeSet<&str> {
         tags.iter()
             .map(|tag| tag.trim())
@@ -304,8 +322,20 @@ fn unshown_metadata(sent: &UpdateNoteRequest<'_>, note: &NoteResponse) -> Vec<&'
         (
             "title",
             sent.title.as_deref().is_none_or(|title| {
-                title.trim().is_empty() || crate::note::body::same_title(&note.title, title)
+                if title.trim().is_empty() {
+                    !proof || note.title.trim().is_empty()
+                } else {
+                    crate::note::body::same_title(&note.title, title)
+                }
             }),
+        ),
+        (
+            "folder",
+            !proof
+                || sent
+                    .parent_folder_id
+                    .as_ref()
+                    .is_none_or(|folder| proves_folder(folder.as_deref(), note)),
         ),
         (
             "tags",
@@ -343,6 +373,26 @@ fn unshown_metadata(sent: &UpdateNoteRequest<'_>, note: &NoteResponse) -> Vec<&'
     .into_iter()
     .filter_map(|(field, shown)| (!shown).then_some(field))
     .collect()
+}
+
+/// Whether `note` proves an uncertain move to `sent`, `None` for the root.
+/// The ancestor list's order is unverified, so only a sole folder proves
+/// placement: a move to an ancestor would otherwise match before it landed.
+fn proves_folder(sent: Option<&str>, note: &NoteResponse) -> bool {
+    match sent {
+        Some(id) => matches!(note.folder_paths.as_deref(), Some([path]) if path.id == id),
+        None => shows_folder(None, note),
+    }
+}
+
+/// Whether `note` shows the folder an update sent, `None` for the root.
+fn shows_folder(sent: Option<&str>, note: &NoteResponse) -> bool {
+    match sent {
+        Some(id) => placed_in(note, id),
+        // A read that omits folderPaths says nothing about the folder, so it
+        // cannot confirm a move to the root.
+        None => note.folder_paths.as_ref().is_some_and(Vec::is_empty),
+    }
 }
 
 fn placed_in(note: &NoteResponse, folder_id: &str) -> bool {
@@ -485,7 +535,7 @@ async fn confirm_created_metadata(
     sent: &UpdateNoteRequest<'_>,
     mut note: NoteResponse,
 ) -> (NoteResponse, Vec<&'static str>) {
-    let mut unshown = unshown_metadata(sent, &note);
+    let mut unshown = unshown_metadata(sent, &note, false);
     if !unshown.is_empty()
         && let Ok(readback) = client
             .poll_readback(
@@ -496,7 +546,7 @@ async fn confirm_created_metadata(
             .await
     {
         note = readback.value;
-        unshown = unshown_metadata(sent, &note);
+        unshown = unshown_metadata(sent, &note, false);
     }
     (note, unshown)
 }
@@ -523,13 +573,7 @@ pub(crate) async fn update_note(
             .await?
             .map(UpdateNoteOutput::Patched));
     }
-    if !input.changes_fields() {
-        return Err(CrudError::NothingToUpdate);
-    }
-    if input.comment_permission.is_some() || input.suggest_edit_permission.is_some() {
-        return Err(CrudError::UnsupportedPermissionField);
-    }
-    validate_permission_order(input.read_permission, input.write_permission)?;
+    input.validate_fields()?;
     let resolution = crate::note::reference::resolve_note_ref(
         client,
         input.workspace,
@@ -587,23 +631,30 @@ pub(crate) async fn update_note(
         permalink: input.permalink,
         parent_folder_id: input.parent_folder_id.into_request(),
     };
-    client
+    let sent = client
         .update_note(&note.workspace, &note.note_id, &payload)
-        .await?;
+        .await;
 
     // A body replacement is compared, and only it is kept alive for the
     // read-back; a resent body is not, since an edit can land after the PATCH.
-    // The metadata sent is compared too (see `shows_metadata`).
+    // The metadata sent is compared too (see `unshown_metadata`), strictly
+    // when the PATCH's outcome is unknown and the read must prove it.
     let written_bytes = payload.content.len();
     let body = std::mem::take(&mut payload.content);
     let expected = replacing.then_some(body);
     let written = client
-        .confirm_note_write(&note.workspace, &note.note_id, written_bytes, |readback| {
-            shows_metadata(&payload, readback)
-                && expected
-                    .as_deref()
-                    .is_none_or(|body| readback.content.as_deref() == Some(body))
-        })
+        .confirm_note_write(
+            sent,
+            &note.workspace,
+            &note.note_id,
+            written_bytes,
+            |readback, proof| {
+                unshown_metadata(&payload, readback, proof).is_empty()
+                    && expected
+                        .as_deref()
+                        .is_none_or(|body| readback.content.as_deref() == Some(body))
+            },
+        )
         .await?;
 
     // Judged from the read being returned, like create's flag, so it can never
@@ -611,13 +662,7 @@ pub(crate) async fn update_note(
     let folder_placement_confirmed = payload
         .parent_folder_id
         .as_ref()
-        .map(|folder| match folder {
-            Some(id) => placed_in(&written, id),
-
-            // A read that omits folderPaths says nothing about the folder, so
-            // it cannot confirm a move to the root.
-            None => written.folder_paths.as_ref().is_some_and(Vec::is_empty),
-        });
+        .map(|folder| shows_folder(folder.as_deref(), &written));
     Ok(Ok(UpdateNoteOutput::Updated {
         note: Box::new(crate::local::offload(|| {
             without_content(client.site_url(), note, written)
@@ -1013,6 +1058,44 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_folder_moves_require_direct_placement() {
+        for (folder, paths, confirmed) in [
+            (Some("target"), json!([{"id": "target"}]), true),
+            (Some("target"), json!([{"id": "other"}]), false),
+            (
+                Some("target"),
+                json!([{"id": "target"}, {"id": "child"}]),
+                false,
+            ),
+            (
+                Some("target"),
+                json!([{"id": "child"}, {"id": "target"}]),
+                false,
+            ),
+            (Some("target"), json!([]), false),
+            (Some("target"), json!(null), false),
+            (None, json!([]), true),
+            (None, json!([{"id": "old"}]), false),
+            (None, json!(null), false),
+        ] {
+            let sent = super::UpdateNoteRequest {
+                parent_folder_id: Some(folder.map(str::to_owned)),
+                ..super::UpdateNoteRequest::new("body")
+            };
+            let note = serde_json::from_value(json!({
+                "id": "id", "title": "T", "folderPaths": paths
+            }))
+            .expect("note should deserialize");
+            assert_eq!(
+                super::unshown_metadata(&sent, &note, true).is_empty(),
+                confirmed,
+                "folder {folder:?}, paths {paths}"
+            );
+            assert!(super::shows_metadata(&sent, &note));
+        }
+    }
+
+    #[test]
     fn metadata_is_compared_the_way_hackmd_may_normalize_it() {
         use super::{NoteResponse, UpdateNoteRequest, shows_metadata};
         use crate::dto::NotePermission;
@@ -1131,6 +1214,32 @@ mod tests {
         assert_eq!(note.folder_ids, ["old"]);
     }
 
+    /// A blank title and a folder move are otherwise unchecked, but a failed
+    /// PATCH needs proof: a read still showing the old note proves nothing
+    /// landed.
+    #[tokio::test]
+    async fn a_failed_patch_of_unchecked_fields_stays_unconfirmed() {
+        const OLD: &str = r#"{"id":"id","title":"Old","content":"body","folderPaths":[{"id":"ancestor","name":"Ancestor"},{"id":"old","name":"Old"}]}"#;
+        for input in [
+            json!({"note_ref": "id", "title": " "}),
+            json!({"note_ref": "id", "parent_folder_id": "new"}),
+            json!({"note_ref": "id", "parent_folder_id": "ancestor"}),
+        ] {
+            let server = SequenceServer::spawn_repeating([(200, OLD), (502, ""), (200, OLD)]);
+            let input = serde_json::from_value(input).expect("input should deserialize");
+            let error = update_note(&server.client(), input)
+                .await
+                .expect_err("a change nothing shows should stay unconfirmed");
+            assert!(
+                matches!(
+                    error,
+                    CrudError::Api(crate::client::HackmdError::WriteUnconfirmed { .. })
+                ),
+                "{error}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_move_to_root_is_not_confirmed_by_a_read_without_folder_paths() {
         // A read that leaves out folderPaths (as a team read may) is not the
@@ -1228,6 +1337,61 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "HackMD accepted the update for note note-id, but no read-back showed it; call hackmd_get_note and compare before writing again"
+        );
+    }
+
+    /// A gateway can fail a PATCH that `HackMD` applied. The read-back the
+    /// update makes anyway settles it, rather than leaving the caller to look.
+    #[tokio::test]
+    async fn a_failed_patch_the_read_back_shows_is_confirmed() {
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new("PATCH", "/v1/notes/note-id", 502, ""),
+            Scenario::new(
+                "GET",
+                "/v1/notes/note-id",
+                200,
+                r#"{"id":"note-id","title":"New","content":"new"}"#,
+            ),
+        ]);
+        let input = serde_json::from_value(json!({
+            "note_ref": "note-id",
+            "title": "New",
+            "content": "new"
+        }))
+        .expect("update input should deserialize");
+        let Ok(super::UpdateNoteOutput::Updated { note, .. }) =
+            update_note(&fixture.client(), input)
+                .await
+                .expect("a write the read-back shows should succeed")
+        else {
+            panic!("a content update should update the note");
+        };
+        assert_eq!(note.title, "New");
+        assert_eq!(fixture.finish().len(), 2, "the PATCH is never sent twice");
+    }
+
+    /// A read that does not show the write keeps the original error: the write
+    /// may still land, so the caller must look before sending it again.
+    #[tokio::test]
+    async fn a_failed_patch_the_read_back_does_not_show_stays_unconfirmed() {
+        let fixture = SequenceServer::spawn_repeating([
+            (502, ""),
+            (200, r#"{"id":"note-id","title":"T","content":"old"}"#),
+        ]);
+        let input = serde_json::from_value(json!({
+            "note_ref": "note-id",
+            "content": "new"
+        }))
+        .expect("update input should deserialize");
+        let error = update_note(&fixture.client(), input)
+            .await
+            .expect_err("an unconfirmed write should fail");
+        assert!(
+            matches!(
+                error,
+                CrudError::Api(crate::client::HackmdError::WriteUnconfirmed { .. })
+            ),
+            "{error}"
         );
     }
 
