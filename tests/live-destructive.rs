@@ -328,6 +328,7 @@ async fn personal_crud_folder_order_trash_and_restore() {
             Some(&json!({"content": edited})),
         )
         .await;
+
         // The body already reads `edited`, so waiting for that proves nothing.
         // Watch the whole read-back window for anything else instead.
         let changed = api

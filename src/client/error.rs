@@ -238,6 +238,10 @@ pub(crate) enum HackmdError {
     ImageTooLarge { path: String },
     #[error("team workspace {team_path:?} is not available to this HackMD account")]
     UnknownTeam { team_path: String },
+    #[error(
+        "team workspace {team_path:?} is spelled {spelled:?} by HackMD; pass team_path {spelled:?}"
+    )]
+    TeamPathCase { team_path: String, spelled: String },
     #[error("{method} {path}: request timed out; check network connectivity and retry")]
     Timeout { method: String, path: String },
     #[error(
@@ -357,9 +361,10 @@ impl crate::reply::ToolError for HackmdError {
             | Self::WriteUnconfirmed { .. } => ErrorKind::Readback,
             Self::MissingContent { .. } => ErrorKind::Upstream,
             Self::ResponseTooLarge { .. } | Self::ImageTooLarge { .. } => ErrorKind::TooLarge,
-            Self::EmptyPathSegment | Self::DotPathSegment | Self::ControlInPathSegment => {
-                ErrorKind::InvalidInput
-            }
+            Self::EmptyPathSegment
+            | Self::DotPathSegment
+            | Self::ControlInPathSegment
+            | Self::TeamPathCase { .. } => ErrorKind::InvalidInput,
 
             // Serializing a payload this server validated cannot fail on
             // anything the caller sent.
@@ -439,6 +444,13 @@ mod tests {
             (HackmdError::EmptyPathSegment, ErrorKind::InvalidInput),
             (HackmdError::DotPathSegment, ErrorKind::InvalidInput),
             (HackmdError::ControlInPathSegment, ErrorKind::InvalidInput),
+            (
+                HackmdError::TeamPathCase {
+                    team_path: d(),
+                    spelled: d(),
+                },
+                ErrorKind::InvalidInput,
+            ),
             (
                 HackmdError::ResponseTooLarge {
                     method: m(),

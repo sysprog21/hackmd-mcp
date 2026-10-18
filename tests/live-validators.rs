@@ -60,6 +60,7 @@ async fn edit_invalidates(
     assert_eq!(note["title"], title, "{step} edit title");
     assert_eq!(note["content"], content, "{step} edit content");
     let current = etag(&after);
+
     // Stated outright rather than left to the 200 and 304 above: the snapshot
     // cache relies on the value itself changing with every edit.
     assert_ne!(current, old, "{step} edit must change the ETag");
@@ -130,8 +131,8 @@ async fn probe_workspace(api: &LiveApi, team: Option<&str>, suffix: u128) {
     .await;
 
     // Delete only this new note; no purge request. Team trash placement is
-    // unchecked. After a failed probe a failed cleanup is only reported, so
-    // the probe's own panic is the one that surfaces.
+    // unchecked. After a failed probe a failed cleanup is only reported, so the
+    // probe's own panic is the one that surfaces.
     if let Err(panic) = outcome {
         api.cleanup_delete(&route, "validator probe note").await;
         std::panic::resume_unwind(panic);

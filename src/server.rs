@@ -971,6 +971,42 @@ mod tests {
         fixture.finish();
     }
 
+    /// A write naming another account's note is a successful result carrying
+    /// `outside_account`, not an error.
+    #[tokio::test]
+    async fn a_write_to_a_note_outside_the_account_reports_outside_account() {
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/me",
+                200,
+                r#"{"id":"u","name":"User","userPath":"alice"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Core","path":"core"}]"#,
+            ),
+        ]);
+        let (client, server_task) = protocol_client(
+            Config::for_loopback_test(&fixture.api_url, Some("fixture-token")).with_site(),
+        )
+        .await;
+        let result = client
+            .call_tool(call(
+                "hackmd_update_note",
+                json!({"note_ref": "https://hackmd.io/community/@stranger/book", "content": "x"}),
+            ))
+            .await
+            .expect("tools/call should succeed");
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.expect("structured result");
+        assert_eq!(structured["resolution"]["status"], "outside_account");
+        stop_protocol(client, server_task).await;
+        fixture.finish();
+    }
+
     #[tokio::test]
     async fn rmcp_note_lifecycle_covers_resolution_edit_folder_delete_and_restore() {
         let fixture = note_lifecycle_fixture();

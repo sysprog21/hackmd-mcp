@@ -110,14 +110,29 @@ impl HackmdClient {
         Ok(teams)
     }
 
-    /// Whether the account belongs to `team_path`, by the same cache rules as
-    /// `list_teams`.
-    pub(crate) async fn has_team(
+    /// The account's team whose path is `path`, ignoring ASCII case as the
+    /// API and site do, spelled the way the API reports it. A team the
+    /// cached list lacks gets one fresh look before the answer is none, so
+    /// joining a team takes effect immediately; a cold cache is filled by that
+    /// same look, never fetched twice. `refresh` skips the cache outright.
+    pub(crate) async fn team_path(
         &self,
-        team_path: &str,
+        path: &str,
         refresh: bool,
-    ) -> Result<bool, HackmdError> {
-        Ok(includes_team(&self.list_teams(refresh).await?, team_path))
+    ) -> Result<Option<String>, HackmdError> {
+        let find = |teams: &[TeamResponse]| {
+            teams
+                .iter()
+                .find(|team| team.path.eq_ignore_ascii_case(path))
+                .map(|team| team.path.clone())
+        };
+        if !refresh
+            && let Some(found) =
+                fresh(&self.account.teams, self.account.ttl).and_then(|teams| find(&teams))
+        {
+            return Ok(Some(found));
+        }
+        Ok(find(&self.list_teams(true).await?))
     }
 
     pub(crate) async fn ensure_team_exists(
@@ -128,17 +143,17 @@ impl HackmdClient {
             return Ok(());
         };
 
-        // A write into a team the cache has not seen yet gets one fresh look
-        // before being refused, so joining a team takes effect immediately. A
-        // cold cache is filled by that same look, never fetched twice.
-        let cached = fresh(&self.account.teams, self.account.ttl)
-            .is_some_and(|teams| includes_team(&teams, team_path));
-        if cached || self.has_team(team_path, true).await? {
-            Ok(())
-        } else {
-            Err(HackmdError::UnknownTeam {
+        // Exact: a write through another spelling of the path is unmeasured, so
+        // one is refused with the spelling to use instead.
+        match self.team_path(team_path, false).await? {
+            Some(spelled) if spelled == *team_path => Ok(()),
+            Some(spelled) => Err(HackmdError::TeamPathCase {
                 team_path: team_path.clone(),
-            })
+                spelled,
+            }),
+            None => Err(HackmdError::UnknownTeam {
+                team_path: team_path.clone(),
+            }),
         }
     }
 
@@ -279,8 +294,9 @@ impl HackmdClient {
                 snapshot::Lookup::Disabled => {
                     return self.fetch_snapshot(workspace, note_id, None).await;
                 }
-                // A read cancelled before it answered leaves nothing to
-                // share; look again, and most likely send this one.
+
+                // A read cancelled before it answered leaves nothing to share;
+                // look again, and most likely send this one.
                 snapshot::Lookup::Wait(flight) => {
                     if let Some(outcome) = flight.wait().await {
                         return outcome;
@@ -1198,10 +1214,6 @@ impl Reply {
 /// Names the absent body at the many call sites that have none: `None` alone
 /// cannot infer the payload type once the parameter is generic.
 const NO_BODY: Option<&Value> = None;
-
-fn includes_team(teams: &[TeamResponse], team_path: &str) -> bool {
-    teams.iter().any(|team| team.path == team_path)
-}
 
 /// Whether a redirect target looks like a presigned S3 URL: https, carrying a
 /// non-empty access key, signature, and expiry. `HackMD` sends a
@@ -2633,6 +2645,31 @@ mod tests {
             .await
             .expect_err("a team the account lacks should be refused");
         assert!(matches!(error, HackmdError::UnknownTeam { .. }));
+        assert_eq!(fixture.finish().len(), 1);
+    }
+
+    /// A written team path must match exactly, since a write through another
+    /// spelling is unmeasured; the refusal names the spelling to pass.
+    #[tokio::test]
+    async fn a_team_path_in_another_case_is_refused_with_its_spelling() {
+        let fixture =
+            crate::fixture::SequenceServer::spawn_scenarios([crate::fixture::Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Core","path":"core"}]"#,
+            )]);
+        let error = fixture
+            .client()
+            .ensure_team_exists(&crate::models::Workspace::Team {
+                team_path: "CORE".to_owned(),
+            })
+            .await
+            .expect_err("another spelling should be refused");
+        assert_eq!(
+            error.to_string(),
+            r#"team workspace "CORE" is spelled "core" by HackMD; pass team_path "core""#
+        );
         assert_eq!(fixture.finish().len(), 1);
     }
 

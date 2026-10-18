@@ -129,8 +129,9 @@ pub(crate) async fn edit_note(
         let updated = crate::note::patch::apply_note_patch(&content, &input.patch, &patch_path)
             .map(into_stored)?;
         let changed = updated.as_str() != content.as_str();
-        // The body before the patch stands in for the last-synced one: drift
-        // is reported only when its title matched the listing.
+
+        // The body before the patch stands in for the last-synced one: drift is
+        // reported only when its title matched the listing.
         let synced_title = changed.then(|| body_title(&content)).flatten();
         Ok::<_, PatchError>((updated, changed, synced_title))
     })?;
@@ -140,9 +141,9 @@ pub(crate) async fn edit_note(
     drop(content);
     let mut title_drift = None;
     if changed {
-        // Judged against the read-back's title, as push does, so a rename
-        // made meanwhile is respected. Only the title is kept: the read-back
-        // body is another full copy of the note.
+        // Judged against the read-back's title, as push does, so a rename made
+        // meanwhile is respected. Only the title is kept: the read-back body is
+        // another full copy of the note.
         let listed = client
             .write_note_body(&note.workspace, &note.note_id, &updated)
             .await?
@@ -339,7 +340,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_heading_that_never_matched_the_listing_is_not_drift() {
-        // A listed title set apart from the H1 on purpose stays silent, as in push.
+        // A listed title set apart from the H1 on purpose stays silent, as in
+        // push.
         let output = patch_once(
             "Listed",
             "# Heading\n\nbody\n",

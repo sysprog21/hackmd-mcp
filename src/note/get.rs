@@ -31,8 +31,9 @@ pub(crate) struct GetNoteInput {
         deserialize_with = "crate::models::given"
     )]
     pub(crate) workspace: Option<Workspace>,
-    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
-    /// `hackmd.io/s/<shortId>` share link. A trailing `/download` is ignored.
+    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/[community/]@owner/slug`
+    /// URL, or legacy `hackmd.io/s/<shortId>` share link. A trailing
+    /// `/download` is ignored, except on a community link, where it is refused.
     /// Give this or `local_path`, not both.
     pub(crate) note_ref: Option<String>,
     /// Bypass the 60-second account and note-list caches when resolving an
@@ -47,8 +48,8 @@ pub(crate) struct GetNoteInput {
     pub(crate) local_path: Option<PathBuf>,
     /// With `note_ref`, `false` leaves the body out of the result and keeps
     /// everything else, `body_hash` included, for a caller that wants only the
-    /// metadata or the hash of many notes. `HackMD` still sends the whole note; this only
-    /// keeps the body out of the agent's context.
+    /// metadata or the hash of many notes. `HackMD` still sends the whole note;
+    /// this only keeps the body out of the agent's context.
     #[serde(default = "include_content_default")]
     pub(crate) include_content: bool,
 }

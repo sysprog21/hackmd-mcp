@@ -26,18 +26,16 @@ pub(crate) fn structured<T: Serialize>(summary: impl Into<String>, output: T) ->
     result
 }
 
-/// The reply for a `note_ref` that named no note, or more than one. It is a
-/// successful result carrying candidates, not an error, so the caller can pick
-/// one and retry.
+/// The reply for a `note_ref` that named no note, more than one, or one
+/// outside the account. It is a successful result, not an error: candidates
+/// let the caller pick one and retry, and `published_markdown` says where an
+/// outside note can be read instead.
 pub(crate) fn unresolved(resolution: &crate::note::reference::NoteResolution) -> CallToolResult {
     #[derive(Serialize)]
     struct Unresolved<'a> {
         resolution: &'a crate::note::reference::NoteResolution,
     }
-    structured(
-        "The note reference did not resolve uniquely",
-        &Unresolved { resolution },
-    )
+    structured(resolution.summary(), &Unresolved { resolution })
 }
 
 /// A tool's reply from its result: `summary` names a success, and an error
@@ -150,7 +148,33 @@ pub(crate) fn error(error: &impl ToolError) -> CallToolResult {
 mod tests {
     use serde_json::json;
 
-    use super::{error, structured};
+    use super::{error, structured, unresolved};
+    use crate::note::reference::NoteResolution;
+
+    /// Resolution statuses are a wire contract: the new one is spelled
+    /// `outside_account` and carries its link; `not_found` keeps its name.
+    #[test]
+    fn unresolved_reports_outside_and_not_found_on_the_wire() {
+        let outside = unresolved(&NoteResolution::OutsideAccount {
+            query: "@o/s".to_owned(),
+            published_markdown: "https://hackmd.io/@o/s/download".to_owned(),
+        });
+        assert_eq!(
+            outside.structured_content,
+            Some(json!({"resolution": {
+                "status": "outside_account",
+                "query": "@o/s",
+                "published_markdown": "https://hackmd.io/@o/s/download",
+            }}))
+        );
+        let missing = unresolved(&NoteResolution::NotFound {
+            query: "@o/s".to_owned(),
+        });
+        assert_eq!(
+            missing.structured_content,
+            Some(json!({"resolution": {"status": "not_found", "query": "@o/s"}}))
+        );
+    }
 
     #[test]
     fn success_has_summary_json_text_and_structured_json() {

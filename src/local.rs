@@ -519,9 +519,10 @@ pub(crate) fn replace_atomic(
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
+
     // Created private (0600 on unix) and invisible until persisted, so
-    // `before_persist` may set permissions after the write; it runs last so
-    // a check it makes is as close to the rename as it can be.
+    // `before_persist` may set permissions after the write; it runs last so a
+    // check it makes is as close to the rename as it can be.
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(contents)?;
     temporary.as_file().sync_all()?;

@@ -213,7 +213,7 @@ pub(crate) async fn push_note(
         && input
             .workspace
             .as_ref()
-            .is_some_and(|workspace| *workspace != note.workspace)
+            .is_some_and(|workspace| !workspace.same_as(&note.workspace))
     {
         return Err(PushNoteError::TrackedWorkspaceMismatch);
     }
@@ -232,7 +232,7 @@ pub(crate) async fn push_note(
         let NoteResolution::Resolved { note: named } = resolution else {
             return Ok(Err(resolution));
         };
-        if named != note {
+        if !named.same_as(&note) {
             return Err(PushNoteError::TrackingMismatch);
         }
     }
@@ -302,8 +302,8 @@ async fn push_resolved(
         baseline_path: &tracked.baseline_path,
     };
     let write = if matches!(guard.strategy, PushStrategy::Safe) {
-        // The remote digest is the snapshot's, computed once however often
-        // the note is read.
+        // The remote digest is the snapshot's, computed once however often the
+        // note is read.
         let remote_digest = snapshot.digest();
         let local_digest = crate::local::offload(|| body_digest(&local));
         let remote_hash = body_hash_from_digest(&remote_digest);
@@ -1491,14 +1491,27 @@ mod tests {
             "baseline",
         );
 
-        // The record's own team and an unused refresh go through, as they did
-        // before the check existed: they get as far as the network.
-        for (workspace, refresh) in [(Some(team("core")), false), (None, true)] {
+        // The record's own team, in any case as HackMD reads it, and an unused
+        // refresh go through, as they did before the check existed: they get as
+        // far as the network. So does a bare ID cross-checked in that team.
+        for (workspace, refresh) in [
+            (Some(team("core")), false),
+            (Some(team("CORE")), false),
+            (None, true),
+        ] {
             assert!(matches!(
                 push_note(&client, &files, pushing(workspace, refresh)).await,
                 Err(PushNoteError::Api(_))
             ));
         }
+        let cross_checked = PushNoteInput {
+            note_ref: Some("note-id".to_owned()),
+            ..pushing(Some(team("CORE")), false)
+        };
+        assert!(matches!(
+            push_note(&client, &files, cross_checked).await,
+            Err(PushNoteError::Api(_))
+        ));
     }
 
     #[tokio::test]

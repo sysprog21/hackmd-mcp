@@ -32,8 +32,9 @@ pub(crate) struct PullNoteInput {
         deserialize_with = "crate::models::given"
     )]
     pub(crate) workspace: Option<Workspace>,
-    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
-    /// `hackmd.io/s/<shortId>` share link. A trailing `/download` is ignored.
+    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/[community/]@owner/slug`
+    /// URL, or legacy `hackmd.io/s/<shortId>` share link. A trailing
+    /// `/download` is ignored, except on a community link, where it is refused.
     pub(crate) note_ref: String,
     /// Bypass the 60-second account and note-list caches when resolving an
     /// `@owner/slug` URL or `s/<shortId>` link.
@@ -182,12 +183,14 @@ pub(crate) async fn pull_note(
     let read = exists.then(|| files.read_stamped(&input.local_path, BODY_MAX_BYTES + 1));
     let (previous, stamp) = match read {
         Some(Ok((bytes, stamp))) => (Some(bytes), Some(stamp)),
+
         // Reading is only for the optional diff when discarding the file, so
         // one that cannot be read is still guarded, by its metadata.
         Some(Err(_)) if input.discard_local_changes => (None, files.stamp(&input.local_path)?),
         Some(Err(error)) => return Err(error.into()),
         None => (None, None),
     };
+
     // When the write lands, the file must still be the one seen here, or still
     // be absent, so an editor's save meanwhile is not lost.
     let expect = stamp.map_or(Expect::Absent, Expect::Stamp);

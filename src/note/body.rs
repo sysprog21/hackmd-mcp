@@ -110,6 +110,7 @@ fn front_matter_title<'a>(front: impl Iterator<Item = &'a str>) -> ControlFlow<O
         if content.is_empty() || content.starts_with('#') {
             continue;
         }
+
         // YAML indents with spaces only, so a tab there leaves the block
         // unparsed, title and all.
         if line[..line.len() - content.len()].contains('\t') {
@@ -340,6 +341,7 @@ fn link_text(markdown: &str) -> Option<String> {
         }
         text.push_str(&rest[..open]);
         let after = &rest[open + 1..];
+
         // Brackets nested in the text are markup `heading_title` refuses, so
         // the first `]` is the only close worth trying.
         let link = after
@@ -614,6 +616,7 @@ mod tests {
             Some("Alpha  Beta")
         );
         assert_eq!(drift("Untitled", "no heading\n"), None);
+
         // A title the synced body already gave differently was chosen on
         // purpose, and with no synced body nothing says otherwise.
         assert_eq!(
@@ -625,6 +628,7 @@ mod tests {
             None
         );
         assert_eq!(title_drift("Weekly", "# Minutes\n", || None), None);
+
         // The synced title costs a baseline read, so it is not asked for when
         // the body's title already matches the listing.
         assert_eq!(
