@@ -100,7 +100,7 @@ pub(crate) fn list_tracked_notes(
         .state()
         .list_tracked()?
         .into_iter()
-        .filter(|state| input.team.is_none_or(|team| state.workspace == *team))
+        .filter(|state| input.team.is_none_or(|team| state.workspace.same_as(team)))
         .filter(|state| {
             query.as_deref().is_none_or(|query| {
                 contains_folded(&state.internal_id, query)
@@ -183,6 +183,40 @@ mod tests {
         assert_eq!(output.notes[0].local_path, local_path);
         assert_eq!(output.notes[0].baseline_hash.len(), 71);
         assert_eq!(output.notes[0].last_observed_remote_timestamp, "1");
+    }
+
+    /// The team filter ignores case, as push does and as `HackMD` reads paths.
+    #[test]
+    fn the_team_filter_ignores_case() {
+        let directory = tempfile::tempdir().expect("temporary directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "baseline").expect("working Markdown should write");
+        let team = |team_path: &str| Workspace::Team {
+            team_path: team_path.to_owned(),
+        };
+        let files = crate::fixture::tracked_files_in(
+            team("core"),
+            directory.path(),
+            "note-id",
+            &local_path,
+            "baseline",
+        );
+        let total = |team_path: &str| {
+            list_tracked_notes(
+                &files,
+                &ListTrackedNotesInput {
+                    limit: 20,
+                    offset: 0,
+                    query: None,
+                    team: Some(&team(team_path)),
+                },
+            )
+            .expect("tracked state should list")
+            .meta
+            .total
+        };
+        assert_eq!(total("CORE"), 1);
+        assert_eq!(total("other"), 0);
     }
 
     #[tokio::test]

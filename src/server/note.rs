@@ -45,7 +45,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_get_note",
-        description = "Get one HackMD note with full content, normalized metadata, folder_ids, the exact patch_path a hackmd_update_note patch needs, and body_hash for its expected_hash; with note_ref, include_content=false leaves the body out and keeps the rest. Given local_path instead of note_ref, report that tracked file's sync state without writing: in_sync, local_changed, remote_changed, or conflict, with SHA-256 hashes. For @owner/slug and s/<shortId> references, refresh=true bypasses the 60-second caches.",
+        description = "Get one HackMD note with full content, normalized metadata, folder_ids, the exact patch_path a hackmd_update_note patch needs, and body_hash for its expected_hash; with note_ref, include_content=false leaves the body out and keeps the rest. Given local_path instead of note_ref, report that tracked file's sync state without writing: in_sync, local_changed, remote_changed, or conflict, with SHA-256 hashes. A community/@owner/slug link is the same note; an owner outside this account and its teams returns status outside_account with published_markdown, the /download URL where a guest-readable note (a book's table of contents too) can be read signed out, unconfirmed (not_found when no such URL can be built). For @owner/slug and s/<shortId> references, refresh=true bypasses the 60-second caches.",
         annotations(
             title = "Get HackMD Note",
             read_only_hint = true,

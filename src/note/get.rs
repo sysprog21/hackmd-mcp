@@ -31,8 +31,9 @@ pub(crate) struct GetNoteInput {
         deserialize_with = "crate::models::given"
     )]
     pub(crate) workspace: Option<Workspace>,
-    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
-    /// `hackmd.io/s/<shortId>` share link. A trailing `/download` is ignored.
+    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/[community/]@owner/slug`
+    /// URL, or legacy `hackmd.io/s/<shortId>` share link. A trailing
+    /// `/download` is ignored, except on a community link, where it is refused.
     /// Give this or `local_path`, not both.
     pub(crate) note_ref: Option<String>,
     /// Bypass the 60-second account and note-list caches when resolving an

@@ -33,8 +33,9 @@ pub(crate) struct UploadNoteImageInput {
     )]
     #[schemars(skip)]
     pub(crate) workspace: Option<Workspace>,
-    /// Internal note ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
-    /// `hackmd.io/s/<shortId>` share link. A trailing `/download` is ignored.
+    /// Internal note ID, `hackmd.io/<id>`, `hackmd.io/[community/]@owner/slug`
+    /// URL, or legacy `hackmd.io/s/<shortId>` share link. A trailing
+    /// `/download` is ignored, except on a community link, where it is refused.
     /// Personal and team notes both accept uploads.
     pub(crate) note_ref: String,
     /// Bypass the 60-second account and note-list caches when resolving an

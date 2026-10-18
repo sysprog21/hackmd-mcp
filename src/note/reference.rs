@@ -15,6 +15,14 @@ pub(crate) struct ResolvedNoteRef {
     pub(crate) note_id: String,
 }
 
+impl ResolvedNoteRef {
+    /// Whether both name the same note, its workspace compared as
+    /// [`Workspace::same_as`] does.
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        self.note_id == other.note_id && self.workspace.same_as(&other.workspace)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct NoteCandidate {
     #[serde(rename = "team_path")]
@@ -38,6 +46,29 @@ pub(crate) enum NoteResolution {
         query: String,
         candidates: Vec<NoteCandidate>,
     },
+    /// An `@owner/slug` whose owner is neither this account nor one of its
+    /// teams. The API reads only those workspaces, but a guest-readable note
+    /// is published as Markdown at `published_markdown`, signed out.
+    OutsideAccount {
+        query: String,
+        published_markdown: String,
+    },
+}
+
+impl NoteResolution {
+    /// The one-line summary of a reply carrying this resolution.
+    pub(crate) fn summary(&self) -> &'static str {
+        match self {
+            Self::Resolved { .. } => "The note reference resolved",
+            Self::NotFound { .. } => "The note reference matched no note",
+            Self::Ambiguous { .. } => {
+                "The note reference matched more than one note; pick one of the candidates"
+            }
+            Self::OutsideAccount { .. } => {
+                "The note is outside this account and its teams; published_markdown is where a guest could read it, unconfirmed"
+            }
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -45,7 +76,7 @@ pub(crate) enum NoteRefError {
     #[error("note_ref must be a non-empty internal note ID or https://hackmd.io URL")]
     Empty,
     #[error(
-        "note_ref URL must use https://hackmd.io and contain an ID, @owner/slug, or s/<shortId> path"
+        "note_ref URL must use https://hackmd.io and contain an ID, [community/]@owner/slug, or s/<shortId> path"
     )]
     InvalidUrl,
     #[error(
@@ -122,20 +153,31 @@ pub(crate) async fn resolve_note_ref_from(
             // A URL names its own workspace. A team_path that names another is
             // a mistake to report, not a hint to drop.
             if let Some(Workspace::Team { team_path }) = &team_path
-                && *team_path != owner
+                && !team_path.eq_ignore_ascii_case(&owner)
             {
                 return Err(NoteRefError::WorkspaceMismatch {
                     team_path: team_path.clone(),
                     owner,
                 });
             }
-            let workspace = if *owner == *client.user_path(refresh).await? {
+
+            // Owners match ignoring ASCII case, as the site and API do; a team
+            // takes the path the API reports. Slugs stay exact: the site
+            // answers 404 for another case.
+            let workspace = if owner.eq_ignore_ascii_case(&client.user_path(refresh).await?) {
                 Workspace::Personal
-            } else if client.has_team(&owner, refresh).await? {
-                Workspace::Team { team_path: owner }
+            } else if let Some(team_path) = client.team_path(&owner, refresh).await? {
+                Workspace::Team { team_path }
             } else {
-                return Ok(NoteResolution::NotFound {
-                    query: format!("@{owner}/{slug}"),
+                // With no known site (a custom endpoint) or a slug the site
+                // cannot address, there is no published copy to point at.
+                let query = format!("@{owner}/{slug}");
+                return Ok(match published_markdown(client.site_url(), &owner, &slug) {
+                    Some(published_markdown) => NoteResolution::OutsideAccount {
+                        query,
+                        published_markdown,
+                    },
+                    None => NoteResolution::NotFound { query },
                 });
             };
             let notes = client.list_notes(&workspace, refresh).await?;
@@ -144,6 +186,14 @@ pub(crate) async fn resolve_note_ref_from(
             }))
         }
     }
+}
+
+/// `<site>/@owner/slug/download`, the published Markdown, built through the
+/// segment guard like `note_url`: none without a site or a segment it refuses.
+fn published_markdown(site: Option<&Url>, owner: &str, slug: &str) -> Option<String> {
+    crate::client::append_segments(site?, &[&format!("@{owner}"), slug, "download"])
+        .ok()
+        .map(Into::into)
 }
 
 /// Finds a `/s/<shortId>` link's note. A `team_path` limits the search to that
@@ -224,10 +274,25 @@ fn parse_note_ref(note_ref: &str) -> Result<ParsedNoteRef, NoteRefError> {
         .filter(|segment| !segment.is_empty())
         .map(percent_decode)
         .collect::<Result<Vec<_>, _>>()?;
+
+    // A decoded control character names no note; refusing it here keeps it out
+    // of a reply's query.
+    if segments
+        .iter()
+        .any(|segment| segment.chars().any(char::is_control))
+    {
+        return Err(NoteRefError::InvalidUrl);
+    }
+
     // A trailing `download` is the published Markdown of the same note. It is
     // dropped only from a complete reference, so a slug that is itself
     // `download` still names its note.
     let segments = match segments.as_slice() {
+        // `community/@owner/slug` is the same note shown in the community
+        // listing (a book's usual link). Nothing else under `community` names a
+        // note: its `/download` redirects to the listing, not the note.
+        [prefix, owner, slug] if prefix == "community" => return scoped(owner, slug),
+        [prefix, ..] if prefix == "community" => return Err(NoteRefError::InvalidUrl),
         [id, last] if last == "download" && !id.starts_with('@') && id != "s" => &segments[..1],
         [_, _, last] if last == "download" => &segments[..2],
         all => all,
@@ -237,12 +302,18 @@ fn parse_note_ref(note_ref: &str) -> Result<ParsedNoteRef, NoteRefError> {
         [note_id] if note_id == "s" => Err(NoteRefError::InvalidUrl),
         [note_id] if !note_id.starts_with('@') => Ok(ParsedNoteRef::Direct(note_id.clone())),
         [prefix, short_id] if prefix == "s" => Ok(ParsedNoteRef::Short(short_id.clone())),
-        [owner, slug] if owner.starts_with('@') && owner.len() > 1 && !slug.is_empty() => {
-            Ok(ParsedNoteRef::Scoped {
-                owner: owner[1..].to_owned(),
-                slug: slug.clone(),
-            })
-        }
+        [owner, slug] => scoped(owner, slug),
+        _ => Err(NoteRefError::InvalidUrl),
+    }
+}
+
+/// An `@owner` segment and the slug after it.
+fn scoped(owner: &str, slug: &str) -> Result<ParsedNoteRef, NoteRefError> {
+    match owner.strip_prefix('@') {
+        Some(owner) if !owner.is_empty() => Ok(ParsedNoteRef::Scoped {
+            owner: owner.to_owned(),
+            slug: slug.to_owned(),
+        }),
         _ => Err(NoteRefError::InvalidUrl),
     }
 }
@@ -327,7 +398,10 @@ fn resolution(query: String, candidates: Vec<NoteCandidate>) -> NoteResolution {
 
 #[cfg(test)]
 mod tests {
-    use super::{NoteResolution, ParsedNoteRef, parse_note_ref, resolve_note_ref, unique_matches};
+    use super::{
+        NoteResolution, ParsedNoteRef, parse_note_ref, published_markdown, resolve_note_ref,
+        unique_matches,
+    };
     use crate::{
         client::HackmdClient,
         config::Config,
@@ -365,6 +439,25 @@ mod tests {
         assert!(
             matches!(parse_note_ref("https://hackmd.io/@core/slug/download"), Ok(ParsedNoteRef::Scoped { owner, slug }) if owner == "core" && slug == "slug")
         );
+
+        // The community listing's link to a note, such as a book, including one
+        // whose slug is `download`.
+        for (url, want) in [
+            ("https://hackmd.io/community/@core/book", "book"),
+            ("https://hackmd.io/community/@core/book/", "book"),
+            (
+                "https://hackmd.io/community/@core/book?type=view#top",
+                "book",
+            ),
+            ("https://hackmd.io/community/@core/download", "download"),
+            // Empty segments are skipped, as for every other form.
+            ("https://hackmd.io/community//@core//book/", "book"),
+        ] {
+            assert!(
+                matches!(parse_note_ref(url), Ok(ParsedNoteRef::Scoped { owner, slug }) if owner == "core" && slug == want),
+                "{url}"
+            );
+        }
         assert!(
             matches!(parse_note_ref("https://hackmd.io/s/SkE33UTHf?type=view"), Ok(ParsedNoteRef::Short(id)) if id == "SkE33UTHf")
         );
@@ -427,6 +520,20 @@ mod tests {
             "http://hackmd.io/id",
             "https://hackmd.io/@owner",
             "https://hackmd.io/@core/slug/extra",
+            // Measured to redirect to the community listing, not the note.
+            "https://hackmd.io/community/@core/book/download",
+            "https://hackmd.io/community/@core/download/download",
+            "https://hackmd.io/community",
+            "https://hackmd.io/community/download",
+            "https://hackmd.io/other/@core/book",
+            "https://hackmd.io/community/core/book",
+            "https://hackmd.io/community/@/book",
+            // A control character names no note.
+            "https://hackmd.io/@core/a%0Ab",
+            "https://hackmd.io/@vic%0Atim/x",
+            "https://hackmd.io/@core/.%09.",
+            "https://hackmd.io/community/@core/a%09b",
+            "https://hackmd.io/id%0D",
             "https://hackmd.io/s",
             "https://hackmd.io/s/",
             // Only a lowercase `download` is known to be the published copy.
@@ -505,6 +612,22 @@ mod tests {
             matches!(result, NoteResolution::Resolved { note } if note.workspace == Workspace::Personal && note.note_id == "personal-id")
         );
         fixture.finish();
+    }
+
+    /// Reserved URL characters in a decoded slug are encoded again, so the
+    /// published link names the same note; a slug the segment guard refuses
+    /// gets no link at all.
+    #[test]
+    fn published_markdown_round_trips_reserved_characters() {
+        let site = crate::fixture::site();
+        assert_eq!(
+            published_markdown(Some(&site), "o", "a%b/c?d#e").as_deref(),
+            Some("https://hackmd.io/@o/a%25b%2Fc%3Fd%23e/download")
+        );
+        for slug in [" ", "..", "a\tb"] {
+            assert_eq!(published_markdown(Some(&site), "o", slug), None, "{slug:?}");
+        }
+        assert_eq!(published_markdown(None, "o", "s"), None, "no site");
     }
 
     /// A `team_path` that contradicts the URL is refused before any request.
@@ -597,6 +720,13 @@ mod tests {
                 200,
                 r#"[{"id":"mine","title":"Mine","permalink":"slug"}]"#,
             ),
+            // An owner the cached list lacks gets one fresh look.
+            Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Core","path":"core"}]"#,
+            ),
         ]);
         let client = fixture.client_with_cache();
         let resolve = |url: &'static str| resolve_note_ref(&client, None, url, false);
@@ -612,15 +742,137 @@ mod tests {
             .await
             .expect("personal URL should resolve");
         assert!(matches!(mine, NoteResolution::Resolved { note } if note.note_id == "mine"));
-        // A fresh cached team list also answers "not a member".
+        // The community form of an in-account note is that note.
+        let listed = resolve("https://hackmd.io/community/@core/slug")
+            .await
+            .expect("community URL should resolve");
+        assert!(matches!(listed, NoteResolution::Resolved { note } if note.note_id == "team-id"));
+        // With no known site (a custom endpoint) there is no link to offer.
         assert!(matches!(
             resolve("https://hackmd.io/@stranger/slug")
                 .await
-                .expect("unknown owner should resolve to not found"),
+                .expect("no site"),
             NoteResolution::NotFound { .. }
         ));
 
-        assert_eq!(fixture.finish().len(), 4, "one request per resource");
+        assert_eq!(fixture.finish().len(), 5, "one request per resource");
+    }
+
+    /// An owner the cached team list lacks gets one fresh look before it is
+    /// called outside the account, so a team joined a moment ago resolves.
+    #[tokio::test]
+    async fn an_owner_outside_the_account_gets_one_fresh_team_look() {
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/me",
+                200,
+                r#"{"id":"u","name":"User","userPath":"alice"}"#,
+            ),
+            // A cold cache is filled by the one look, never fetched twice.
+            Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Core","path":"core"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Core","path":"core"},{"id":"j","name":"New","path":"joined"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams/joined/notes",
+                200,
+                r#"[{"id":"j-id","title":"Joined","shortId":"slug"}]"#,
+            ),
+        ]);
+        let client =
+            HackmdClient::new(Config::for_loopback_test_with_cache(&fixture.api_url).with_site())
+                .expect("client should build");
+        let resolve = |url: &'static str| resolve_note_ref(&client, None, url, false);
+
+        // The reply points at the published copy, encoded, a guest can read.
+        let outside = resolve("https://hackmd.io/community/@stranger/%E4%B8%AD%E6%96%87")
+            .await
+            .expect("unknown owner should resolve to outside the account");
+        assert!(
+            matches!(&outside, NoteResolution::OutsideAccount { query, published_markdown }
+                if query == "@stranger/中文"
+                    && published_markdown == "https://hackmd.io/@stranger/%E4%B8%AD%E6%96%87/download"),
+            "{outside:?}"
+        );
+        let joined = resolve("https://hackmd.io/@joined/slug")
+            .await
+            .expect("a newly joined team should resolve");
+        assert!(matches!(joined, NoteResolution::Resolved { note } if note.note_id == "j-id"));
+        assert_eq!(fixture.finish().len(), 4);
+    }
+
+    /// Owners match ignoring case, as the site and API do (measured
+    /// 2026-10-18), and a team takes the path the API spells; slugs stay
+    /// exact, since the site answers 404 for another case.
+    #[tokio::test]
+    async fn owners_match_ignoring_case_and_slugs_do_not() {
+        let fixture = SequenceServer::spawn_scenarios([
+            Scenario::new(
+                "GET",
+                "/v1/me",
+                200,
+                r#"{"id":"u","name":"User","userPath":"alice"}"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/notes",
+                200,
+                r#"[{"id":"mine","title":"Mine","permalink":"slug"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams",
+                200,
+                r#"[{"id":"t","name":"Core","path":"core"}]"#,
+            ),
+            Scenario::new(
+                "GET",
+                "/v1/teams/core/notes",
+                200,
+                r#"[{"id":"c-id","title":"Core","shortId":"slug"}]"#,
+            ),
+        ]);
+        let client = fixture.client_with_cache();
+        let resolve = |url: &'static str| resolve_note_ref(&client, None, url, false);
+        let core = Workspace::Team {
+            team_path: "core".to_owned(),
+        };
+
+        assert!(matches!(
+            resolve("https://hackmd.io/@Alice/slug").await.expect("user case"),
+            NoteResolution::Resolved { note }
+                if note.note_id == "mine" && note.workspace == Workspace::Personal
+        ));
+        assert!(matches!(
+            resolve("https://hackmd.io/@CORE/slug").await.expect("team case"),
+            NoteResolution::Resolved { note } if note.note_id == "c-id" && note.workspace == core
+        ));
+        let given = Workspace::Team {
+            team_path: "CORE".to_owned(),
+        };
+        assert!(matches!(
+            resolve_note_ref(&client, Some(given), "https://hackmd.io/@core/slug", false)
+                .await
+                .expect("a team_path in another case is no mismatch"),
+            NoteResolution::Resolved { note } if note.workspace == core
+        ));
+        assert!(matches!(
+            resolve("https://hackmd.io/@core/SLUG")
+                .await
+                .expect("slug case"),
+            NoteResolution::NotFound { .. }
+        ));
+        assert_eq!(fixture.finish().len(), 4, "the rest come from the caches");
     }
 
     /// A search of every workspace: the team list (team `core`), then the

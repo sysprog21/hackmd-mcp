@@ -80,8 +80,9 @@ pub(crate) struct UpdateNoteInput {
         deserialize_with = "crate::models::given"
     )]
     pub(crate) workspace: Option<Workspace>,
-    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
-    /// `hackmd.io/s/<shortId>` share link. A trailing `/download` is ignored.
+    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/[community/]@owner/slug`
+    /// URL, or legacy `hackmd.io/s/<shortId>` share link. A trailing
+    /// `/download` is ignored, except on a community link, where it is refused.
     pub(crate) note_ref: String,
     /// Bypass the 60-second account and note-list caches when resolving an
     /// `@owner/slug` URL or `s/<shortId>` link.
@@ -177,8 +178,9 @@ pub(crate) struct DeleteNoteInput {
         deserialize_with = "crate::models::given"
     )]
     pub(crate) workspace: Option<Workspace>,
-    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/@owner/slug` URL, or legacy
-    /// `hackmd.io/s/<shortId>` share link. A trailing `/download` is ignored.
+    /// Internal API ID, `hackmd.io/<id>`, `hackmd.io/[community/]@owner/slug`
+    /// URL, or legacy `hackmd.io/s/<shortId>` share link. A trailing
+    /// `/download` is ignored, except on a community link, where it is refused.
     /// With `restore`, the internal ID from `hackmd_list_notes` with source
     /// `trash`.
     #[serde(alias = "note_id")]

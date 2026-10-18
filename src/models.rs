@@ -23,6 +23,19 @@ pub(crate) enum Workspace {
     },
 }
 
+impl Workspace {
+    /// Whether both name the same workspace. `HackMD` reads a team path in any
+    /// ASCII case (measured 2026-10-18), so a reference resolved to the API's
+    /// spelling still names a note stored under the spelling a caller typed.
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Personal, Self::Personal) => true,
+            (Self::Team { team_path: a }, Self::Team { team_path: b }) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        }
+    }
+}
+
 /// The older tagged form, still accepted on input and still written to sync
 /// state, whose on-disk format predates the flat one.
 #[derive(Deserialize, Serialize)]

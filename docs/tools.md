@@ -13,7 +13,19 @@ workspace: with a `team_path` only that team is searched, and without one the
 personal notes and then every team (a team that cannot be listed fails the
 search, and the error suggests `team_path`). If a URL matches no note, or
 more than one, the tool does not guess: it returns the candidates so the agent
-can pick.
+can pick. A community link, `https://hackmd.io/community/@owner/slug` (how
+a book is usually shared), names the same note as `@owner/slug`; its
+`/download` form is refused, since HackMD redirects it to the community listing
+instead of the note. When the owner is neither you nor one of your teams
+(matched ignoring case, as HackMD does, after one fresh look at your team
+list), this server cannot look the note up, and any tool that takes a
+`note_ref` returns `status: outside_account` with `published_markdown`, the
+note's `/download` URL: a guest-readable note answers it signed out. That
+status says only who the owner is not; it does not prove the note exists.
+When no `/download` URL can be built, because a custom `HACKMD_API_URL` has no
+known site or the slug cannot be addressed there, it is `not_found` instead.
+A book's body is its table of contents, so read that URL first, then each
+linked note's `/download` in turn.
 
 Notes the tools return carry a `note_url`, `https://hackmd.io/<id>`, which opens
 personal and team notes alike. It is a link, not an invite: whoever follows it
