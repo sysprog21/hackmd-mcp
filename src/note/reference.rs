@@ -387,7 +387,9 @@ mod tests {
         assert!(
             matches!(parse_note_ref("hackmd.io/s/SkE33UTHf"), Ok(ParsedNoteRef::Short(id)) if id == "SkE33UTHf")
         );
-        // The host is case-insensitive, with or without a scheme; the path is not.
+
+        // The host is case-insensitive, with or without a scheme; the path is
+        // not.
         assert!(
             matches!(parse_note_ref("HackMD.io/s/SkE33UTHf"), Ok(ParsedNoteRef::Short(id)) if id == "SkE33UTHf")
         );
@@ -457,6 +459,7 @@ mod tests {
             .await
             .expect("a direct ID should resolve");
         assert!(matches!(&result, NoteResolution::Resolved { note } if note.workspace == core));
+
         // With no team_path, push reads a direct ID in the tracked note's own
         // workspace; a given team_path still wins.
         let other = Workspace::Team {

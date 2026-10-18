@@ -279,8 +279,9 @@ impl HackmdClient {
                 snapshot::Lookup::Disabled => {
                     return self.fetch_snapshot(workspace, note_id, None).await;
                 }
-                // A read cancelled before it answered leaves nothing to
-                // share; look again, and most likely send this one.
+
+                // A read cancelled before it answered leaves nothing to share;
+                // look again, and most likely send this one.
                 snapshot::Lookup::Wait(flight) => {
                     if let Some(outcome) = flight.wait().await {
                         return outcome;

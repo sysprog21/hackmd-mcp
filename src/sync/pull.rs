@@ -182,12 +182,14 @@ pub(crate) async fn pull_note(
     let read = exists.then(|| files.read_stamped(&input.local_path, BODY_MAX_BYTES + 1));
     let (previous, stamp) = match read {
         Some(Ok((bytes, stamp))) => (Some(bytes), Some(stamp)),
+
         // Reading is only for the optional diff when discarding the file, so
         // one that cannot be read is still guarded, by its metadata.
         Some(Err(_)) if input.discard_local_changes => (None, files.stamp(&input.local_path)?),
         Some(Err(error)) => return Err(error.into()),
         None => (None, None),
     };
+
     // When the write lands, the file must still be the one seen here, or still
     // be absent, so an editor's save meanwhile is not lost.
     let expect = stamp.map_or(Expect::Absent, Expect::Stamp);

@@ -47,8 +47,8 @@ pub(crate) struct GetNoteInput {
     pub(crate) local_path: Option<PathBuf>,
     /// With `note_ref`, `false` leaves the body out of the result and keeps
     /// everything else, `body_hash` included, for a caller that wants only the
-    /// metadata or the hash of many notes. `HackMD` still sends the whole note; this only
-    /// keeps the body out of the agent's context.
+    /// metadata or the hash of many notes. `HackMD` still sends the whole note;
+    /// this only keeps the body out of the agent's context.
     #[serde(default = "include_content_default")]
     pub(crate) include_content: bool,
 }

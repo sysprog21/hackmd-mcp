@@ -403,6 +403,7 @@ fn proves_folder(sent: Option<&str>, note: &NoteResponse) -> bool {
 fn shows_folder(sent: Option<&str>, note: &NoteResponse) -> bool {
     match sent {
         Some(id) => placed_in(note, id),
+
         // A read that omits folderPaths says nothing about the folder, so it
         // cannot confirm a move to the root.
         None => note.folder_paths.as_ref().is_some_and(Vec::is_empty),
@@ -608,6 +609,7 @@ pub(crate) async fn update_note(
     // A body converts only when the caller supplied it; a resent one goes back
     // exactly as read.
     let replacement = crate::local::offload(|| input.content.map(into_stored));
+
     // A resent body is borrowed from the read, which the snapshot cache may
     // share, rather than copied.
     let current;
@@ -625,6 +627,7 @@ pub(crate) async fn update_note(
                     other => other.into(),
                 })?;
             ensure_unchanged(&note.note_id, || snapshot.digest(), expected)?;
+
             // A replacement lets the read go here; only a resent body keeps it
             // alive through the write.
             if let Some(content) = replacement {
@@ -651,8 +654,8 @@ pub(crate) async fn update_note(
 
     // A body replacement is compared, and only it is kept alive for the
     // read-back; a resent body is not, since an edit can land after the PATCH.
-    // The metadata sent is compared too (see `unshown_metadata`), strictly
-    // when the PATCH's outcome is unknown and the read must prove it.
+    // The metadata sent is compared too (see `unshown_metadata`), strictly when
+    // the PATCH's outcome is unknown and the read must prove it.
     let written_bytes = payload.content.len();
     let body = std::mem::take(&mut payload.content);
     let expected = replacing.then_some(body);

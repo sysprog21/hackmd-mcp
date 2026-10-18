@@ -302,8 +302,8 @@ async fn push_resolved(
         baseline_path: &tracked.baseline_path,
     };
     let write = if matches!(guard.strategy, PushStrategy::Safe) {
-        // The remote digest is the snapshot's, computed once however often
-        // the note is read.
+        // The remote digest is the snapshot's, computed once however often the
+        // note is read.
         let remote_digest = snapshot.digest();
         let local_digest = crate::local::offload(|| body_digest(&local));
         let remote_hash = body_hash_from_digest(&remote_digest);

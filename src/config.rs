@@ -38,14 +38,14 @@ const ENV_KEYS: [(&str, Dotenv); 6] = [
     // The token and URL also carry the inherited-token rule in `from_env`.
     ("HACKMD_API_TOKEN", Dotenv::Honored),
     ("HACKMD_API_URL", Dotenv::Honored),
-    // Honored, so a user who confines the server there stays confined, but
-    // not trusted: see `Config::workspace_root_trusted`.
+    // Honored, so a user who confines the server there stays confined, but not
+    // trusted: see `Config::workspace_root_trusted`.
     ("HACKMD_MCP_WORKSPACE_ROOT", Dotenv::Honored),
-    // It holds full private note bodies, which such a file could otherwise
-    // have written into its own tree.
+    // It holds full private note bodies, which such a file could otherwise have
+    // written into its own tree.
     ("HACKMD_MCP_STATE_DIR", Dotenv::EnvironmentOnly),
-    // How long private note bodies stay in memory, which such a file must
-    // not lengthen.
+    // How long private note bodies stay in memory, which such a file must not
+    // lengthen.
     ("HACKMD_MCP_SNAPSHOT_TTL_SECONDS", Dotenv::EnvironmentOnly),
     // How much memory they may use, which such a file must not raise.
     ("HACKMD_MCP_SNAPSHOT_MAX_BYTES", Dotenv::EnvironmentOnly),
@@ -144,9 +144,10 @@ impl Config {
             "HACKMD_MCP_SNAPSHOT_TTL_SECONDS",
             60,
         )?);
-        // Snapshots are safe only where an edit changes the ETag, measured
-        // for the public API alone. Elsewhere they stay off unless the user
-        // sets a budget.
+
+        // Snapshots are safe only where an edit changes the ETag, measured for
+        // the public API alone. Elsewhere they stay off unless the user sets a
+        // budget.
         let snapshot_max_bytes = config_number(
             get("HACKMD_MCP_SNAPSHOT_MAX_BYTES"),
             "HACKMD_MCP_SNAPSHOT_MAX_BYTES",

@@ -78,10 +78,11 @@ fn assert_waiting_then_stop(mut child: Child) -> Output {
     let output = child
         .wait_with_output()
         .expect("server output should be collected");
-    // The liveness check above is one sample, and a server that failed after
-    // it would still get here. This line is logged once config and the client
-    // are built, just before the transport starts: a config error never logs
-    // it. It does not prove the MCP handshake, which these tests never send.
+
+    // The liveness check above is one sample, and a server that failed after it
+    // would still get here. This line is logged once config and the client are
+    // built, just before the transport starts: a config error never logs it. It
+    // does not prove the MCP handshake, which these tests never send.
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("serving MCP on stdio"),
         "server did not reach the transport: {output:?}"
@@ -298,6 +299,7 @@ fn tool_calls_emit_request_scoped_json_only_to_stderr() {
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hackmd_get_me","arguments":{}}}"#,
         "\n"
     );
+
     // A loopback port that closes every connection it accepts: the call fails
     // at once, offline, without reaching api.hackmd.io from CI. Held for the
     // test, so no other fixture can take the port meanwhile.
