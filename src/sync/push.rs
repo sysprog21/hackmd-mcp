@@ -468,9 +468,9 @@ fn synced(
     }
 }
 
-const REMOTE_CHANGED_INSTRUCTIONS: &str = "Only the remote changed since the last sync; hackmd_pull_note with overwrite_local: true brings the local file up to date.";
+pub(crate) const REMOTE_CHANGED_INSTRUCTIONS: &str = "Only the remote changed since the last sync; hackmd_pull_note with note_ref: note_id, team_path: this team_path, and overwrite_local: true brings the local file up to date.";
 
-const CONFLICT_INSTRUCTIONS: &str = "Both sides changed since the last sync. Merge snapshot_path (the current remote body) into local_path, then push again with expected_remote_hash set to remote_body_hash; that push writes only if the remote has not changed again. Do not use strategy: overwrite until the merge is reviewed.";
+pub(crate) const CONFLICT_INSTRUCTIONS: &str = "Both sides changed since the last sync. Merge snapshot_path (the current remote body) into local_path, then push again with expected_remote_hash set to remote_body_hash; that push writes only if the remote has not changed again. If snapshot_error is set instead of snapshot_path, resolve what it names and push again. Do not use strategy: overwrite until the merge is reviewed.";
 
 /// Saves the remote body as `<name>.remote.md` beside the working file, and
 /// records its hash so the next conflict knows the file is its own. An
