@@ -7,6 +7,7 @@ use crate::{
     client::{HackmdClient, HackmdError},
     hash::{body_digest, body_hash_from_digest},
     local::{LocalAccessError, LocalFiles},
+    models::Workspace,
     sync::state::{StateError, timestamp_text},
     sync::{ChangeState, LocalBodyError, classify_changes, read_local_body},
 };
@@ -25,6 +26,10 @@ pub(crate) struct CheckNoteSyncOutput {
     pub(crate) status: SyncStatus,
     pub(crate) local_path: PathBuf,
     pub(crate) baseline_path: PathBuf,
+    /// With `note_id`, the `note_ref` and `team_path` a pull of this note
+    /// takes.
+    #[serde(rename = "team_path")]
+    pub(crate) workspace: Workspace,
     pub(crate) note_id: String,
     pub(crate) remote_timestamp: String,
     pub(crate) baseline_body_hash: String,
@@ -83,6 +88,7 @@ pub(crate) async fn check_note_sync(
         status,
         local_path: tracked.state.local_path,
         baseline_path: tracked.baseline_path,
+        workspace: tracked.state.workspace,
         note_id: tracked.state.internal_id,
         remote_timestamp: timestamp_text(remote_note.last_changed_at),
         // The loader already verified this hash against the baseline file.
@@ -96,7 +102,7 @@ pub(crate) async fn check_note_sync(
 mod tests {
     use std::fs;
 
-    use super::{SyncStatus, check_note_sync};
+    use super::{SyncStatus, Workspace, check_note_sync};
     use crate::fixture::{Scenario, SequenceServer};
     #[tokio::test]
     async fn conditional_snapshot_checks_still_detect_remote_changes_within_ttl() {
@@ -212,6 +218,38 @@ mod tests {
         );
     }
 
+    /// A team note reports its team as the flat `team_path` a pull takes, not
+    /// the tagged form its sidecar keeps.
+    #[tokio::test]
+    async fn a_team_note_reports_the_team_path_a_pull_takes() {
+        let directory = tempfile::tempdir().expect("temp directory should create");
+        let local_path = directory.path().join("note.md");
+        fs::write(&local_path, "body").expect("local fixture should write");
+        let fixture = SequenceServer::spawn_scenarios([Scenario::new(
+            "GET",
+            "/v1/teams/core/notes/id",
+            200,
+            r#"{"id":"id","title":"Note","content":"remote","lastChangedAt":2}"#,
+        )]);
+        let files = crate::fixture::tracked_files_in(
+            Workspace::Team {
+                team_path: "core".to_owned(),
+            },
+            directory.path(),
+            "id",
+            &local_path,
+            "body",
+        );
+
+        let output = check_note_sync(&fixture.client(), &files, &local_path)
+            .await
+            .expect("team check should succeed");
+        assert_eq!(output.status, SyncStatus::RemoteChanged);
+        let value = serde_json::to_value(&output).expect("output should serialize");
+        assert_eq!(value["team_path"], "core");
+        fixture.finish();
+    }
+
     #[tokio::test]
     async fn timestamp_only_change_remains_in_sync() {
         let directory = tempfile::tempdir().expect("temp directory should create");
@@ -230,6 +268,8 @@ mod tests {
             .expect("timestamp-only check should succeed");
         assert_eq!(output.status, SyncStatus::InSync);
         assert_eq!(output.remote_timestamp, "99");
+        let value = serde_json::to_value(&output).expect("output should serialize");
+        assert_eq!(value["team_path"], serde_json::Value::Null);
         fixture.finish();
     }
 }

@@ -149,13 +149,14 @@ repository can work with:
    must read a new file, widen it with `chmod`.
 2. You or the agent edit the file locally.
 3. `hackmd_get_note` with `local_path` reports where things stand by comparing
-   the file, the baseline, and the remote note:
+   the file, the baseline, and the remote note. It also names the tracked note's
+   `note_id` and `team_path` (`null` for a personal note), which a pull takes:
 
    | State | Meaning |
    |-------|---------|
    | `in_sync` | nothing to do |
    | `local_changed` | only the file changed; push it |
-   | `remote_changed` | only the note changed; pull with `overwrite_local: true` |
+   | `remote_changed` | only the note changed; pull with `note_ref`: its `note_id`, `team_path`: its `team_path`, and `overwrite_local: true` |
    | `conflict` | both changed |
 
 4. `hackmd_push_note` writes the file back. In the default `safe` strategy it

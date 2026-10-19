@@ -89,6 +89,7 @@ pub(crate) async fn run_stdio() -> Result<(), Box<dyn std::error::Error>> {
     name = "hackmd-mcp",
     instructions = "Before editing an existing note, fetch it with hackmd_get_note, preserve unrelated passages, and pass its body_hash as expected_hash to hackmd_update_note. Prefer a context-checked patch. On a conflict, fetch again and rebuild the change; do not blindly retry an uncertain write or create. HackMD has no atomic conditional writes, so concurrent edits can still race.\n\
         Locate notes with hackmd_list_notes metadata filters, then fetch only relevant candidates to search their bodies. There is no full-text search or revision diff; history is the account's history list, not edit history. Do not pick arbitrarily among ambiguous destinations.\n\
+        For a local file kept in sync, hackmd_get_note with local_path compares it with its baseline and the remote note. On remote_changed, hackmd_pull_note with note_ref: its note_id, team_path: its team_path, and overwrite_local: true; on local_changed or conflict, hackmd_push_note with strategy: safe and no expected_remote_hash, then follow any instructions push returns. Never pass the check's remote_body_hash as expected_remote_hash: it would overwrite the remote with an unmerged file. An untracked local_path is refused; hackmd_pull_note with overwrite_local: true adopts a file identical to the note.\n\
         Use hackmd_get_me to identify team_path for shared workspaces. folder_ids is the ancestor chain of the note's folder; parent_folder_id sets that folder.\n\
         When sharing, check the intended audience and read_permission, including unconfirmed_fields after creation. When present, note_url identifies a note but grants no access and is not an invite or published link. This server does not create invite links or publish pages; use the HackMD web UI. The title field always wins; the body supplies a title only when a note is created without one, and editing a body's H1 later never renames the note, so pull, push, and patch edits report title_drift."
 )]
@@ -342,6 +343,72 @@ mod tests {
             let team_path = &tool.input_schema["properties"]["team_path"];
             assert_eq!(team_path["type"], json!(["string", "null"]), "{name}");
             assert!(team_path.get("anyOf").is_none(), "{name}");
+        }
+    }
+
+    /// Every word with an underscore in the instructions, and in the hints a
+    /// push returns, must name a tool, an input parameter, a status value, or a
+    /// listed output field, so a tool, parameter, or status renamed without the
+    /// prose fails here rather than in a client. Output fields are checked only
+    /// against that list.
+    #[test]
+    fn instructions_name_only_real_tools_parameters_and_statuses() {
+        use crate::sync::{
+            check::SyncStatus,
+            push::{CONFLICT_INSTRUCTIONS, PushStatus, REMOTE_CHANGED_INSTRUCTIONS},
+        };
+
+        let client =
+            HackmdClient::new(Config::for_tests()).expect("test client should be constructed");
+        let instructions = HackmdServer::new(Arc::new(client), test_files())
+            .get_info()
+            .instructions
+            .expect("instructions should be advertised");
+        let tools = HackmdServer::router().list_all();
+        // Only the statuses that serialize with an underscore can be named.
+        let statuses = [
+            json!(SyncStatus::InSync),
+            json!(SyncStatus::RemoteChanged),
+            json!(SyncStatus::LocalChanged),
+            json!(PushStatus::NothingToPush),
+        ];
+        let mut known: std::collections::BTreeSet<&str> = [
+            "body_hash",
+            "folder_ids",
+            "note_id",
+            "note_url",
+            "remote_body_hash",
+            "snapshot_error",
+            "snapshot_path",
+            "title_drift",
+            "unconfirmed_fields",
+        ]
+        .into();
+        known.extend(statuses.iter().filter_map(serde_json::Value::as_str));
+        for tool in &tools {
+            known.insert(&tool.name);
+            if let Some(properties) = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+            {
+                known.extend(properties.keys().map(String::as_str));
+            }
+        }
+
+        let prose = [
+            instructions.as_str(),
+            REMOTE_CHANGED_INSTRUCTIONS,
+            CONFLICT_INSTRUCTIONS,
+        ];
+        let words: Vec<&str> = prose
+            .iter()
+            .flat_map(|text| text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
+            .filter(|word| word.contains('_'))
+            .collect();
+        assert_ne!(words.len(), 0);
+        for word in words {
+            assert!(known.contains(word), "{word}");
         }
     }
 
