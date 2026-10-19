@@ -349,13 +349,16 @@ mod tests {
     /// Every word with an underscore in the instructions, and in the hints a
     /// push returns, must name a tool, an input parameter, a status value, or a
     /// listed output field, so a tool, parameter, or status renamed without the
-    /// prose fails here rather than in a client. Output fields are checked only
-    /// against that list.
+    /// prose fails here rather than in a client. Output fields come from a
+    /// fully
+    /// populated push result; the few no sync tool reports are listed.
     #[test]
     fn instructions_name_only_real_tools_parameters_and_statuses() {
         use crate::sync::{
             check::SyncStatus,
-            push::{CONFLICT_INSTRUCTIONS, PushStatus, REMOTE_CHANGED_INSTRUCTIONS},
+            push::{
+                CONFLICT_INSTRUCTIONS, PushNoteOutput, PushStatus, REMOTE_CHANGED_INSTRUCTIONS,
+            },
         };
 
         let client =
@@ -372,18 +375,29 @@ mod tests {
             json!(SyncStatus::LocalChanged),
             json!(PushStatus::NothingToPush),
         ];
-        let mut known: std::collections::BTreeSet<&str> = [
-            "body_hash",
-            "folder_ids",
-            "note_id",
-            "note_url",
-            "remote_body_hash",
-            "snapshot_error",
-            "snapshot_path",
-            "title_drift",
-            "unconfirmed_fields",
-        ]
-        .into();
+        let some = || Some(String::new());
+        let push = json!(PushNoteOutput {
+            status: PushStatus::Conflict,
+            workspace: crate::models::Workspace::Personal,
+            note_id: String::new(),
+            local_path: std::path::PathBuf::new(),
+            baseline_path: std::path::PathBuf::new(),
+            body_hash: some(),
+            remote_timestamp: some(),
+            remote_body_hash: some(),
+            diff_summary: some(),
+            snapshot_path: Some(std::path::PathBuf::new()),
+            snapshot_error: some(),
+            instructions: some(),
+            title_drift: some(),
+        });
+        let mut known: std::collections::BTreeSet<&str> =
+            ["folder_ids", "note_url", "unconfirmed_fields"].into();
+        known.extend(
+            push.as_object()
+                .into_iter()
+                .flat_map(|o| o.keys().map(String::as_str)),
+        );
         known.extend(statuses.iter().filter_map(serde_json::Value::as_str));
         for tool in &tools {
             known.insert(&tool.name);
