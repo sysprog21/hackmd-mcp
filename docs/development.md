@@ -152,18 +152,20 @@ TTL alone never supplies content for conflict detection.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on pushes to `main`, on pull requests, and
-weekly:
+`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests:
 
 | Job | What it checks |
 |-----|----------------|
 | `test` | the full suite with line coverage on Linux, macOS, and Windows |
-| `lint` | formatting, coverage-script tests, unused dependencies, duplicate reporting, and clippy on a pinned toolchain |
-| `coverage` | merged platform reports and the changed-line coverage ratchet; skipped on the weekly run |
+| `lint` | formatting, workflow security (zizmor), coverage-script tests, unused dependencies, duplicate reporting, and clippy on a pinned toolchain |
+| `coverage` | merged platform reports and the changed-line coverage ratchet |
 | `msrv` | the build on the `rust-version` in `Cargo.toml` |
 | `audit` | RustSec advisories against `Cargo.lock` |
-| `build` | release binaries for each tested platform, Linux against glibc 2.17; skipped on the weekly run |
+| `build` | release binaries for each tested platform, Linux against glibc 2.17 |
 | `release` | on pushes to `main` only, after every job above passes, replaces the `latest` GitHub release |
+
+`.github/workflows/security.yml` runs the same `cargo audit` daily and on demand,
+because advisories land without a code change; Dependabot proposes the fix.
 
 The release scripts live in `.ci/`; their header comments explain the
 ordering that keeps a failed run from leaving no release behind.

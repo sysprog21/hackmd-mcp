@@ -4,10 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Advisories land without a code change; surface them on main rather than
-  # on whichever unrelated pull request happens to run next.
-  schedule:
-    - cron: "0 6 * * 1"
 
 permissions:
   contents: read
@@ -15,10 +11,9 @@ permissions:
 # A newer run cancels an older one, except on main, where a run may be holding
 # the release window below open with the previous release already deleted, and
 # cancelling it would leave no release at all. A newer pending run still replaces an older pending one, so
-# only the newest push waiting on main survives. The event is in the key so
-# the weekly scheduled run, which never releases, cannot be what replaces it.
+# only the newest push waiting on main survives.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Every action is pinned to a commit, with its release in a comment for
@@ -45,6 +40,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.PINNED_RUST }}
@@ -72,11 +69,19 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.PINNED_RUST }}
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Workflow security audit (unpinned actions, excess permissions, template
+      # injection). Offline because the online audits need a token.
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: zizmor@1.31.1
+      - run: zizmor --offline .github
       - run: cargo fmt --check
       - run: python3 tests/coverage.py
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
@@ -91,13 +96,13 @@ jobs:
 
   coverage:
     needs: test
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: coverage-*
@@ -145,6 +150,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.88.0
@@ -156,6 +163,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # cargo audit itself rather than rustsec/audit-check, whose releases
       # still run on Node.js 20. Pinned like the lint toolchain.
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
@@ -168,12 +177,8 @@ jobs:
   # Prebuilt binaries, one per platform the test matrix above runs on. A binary
   # for a platform whose suite never ran there is a promise nobody checked, so
   # widen that matrix before adding a row here.
-  #
-  # Not on the weekly schedule: that run exists for the audit and never
-  # releases, so binaries built there would go nowhere.
   build:
     name: Binary ${{ matrix.target }}
-    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
