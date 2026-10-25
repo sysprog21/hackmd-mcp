@@ -6,6 +6,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # A release has a week to be yanked or flagged before it is proposed.
+    # Security updates ignore the cooldown.
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]
@@ -18,6 +22,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # A release has a week to be yanked or flagged before it is proposed.
+    # Security updates ignore the cooldown.
+    cooldown:
+      default-days: 7
     groups:
       cargo:
         update-types: [minor, patch]
