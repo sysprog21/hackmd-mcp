@@ -47,7 +47,7 @@ jobs:
           toolchain: ${{ env.PINNED_RUST }}
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-llvm-cov@0.9.1
       - run: cargo llvm-cov --all-targets --all-features --locked --remap-path-prefix --lcov --output-path lcov.info
@@ -78,13 +78,13 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Workflow security audit (unpinned actions, excess permissions, template
       # injection). Offline because the online audits need a token.
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: zizmor@1.31.1
       - run: zizmor --offline .github
       - run: cargo fmt --check
       - run: python3 tests/coverage.py
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-machete@0.9.1
       - run: cargo machete
@@ -167,7 +167,7 @@ jobs:
           persist-credentials: false
       # cargo audit itself rather than rustsec/audit-check, whose releases
       # still run on Node.js 20. Pinned like the lint toolchain.
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-audit@0.22.2
       # Unsound and yanked crates fail as vulnerabilities do; ignore a specific
