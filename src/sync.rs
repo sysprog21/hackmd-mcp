@@ -1,6 +1,7 @@
 //! Local-first sync: the tracked state store and the tools that move a note
 //! between `HackMD` and a local Markdown file.
 
+pub(crate) mod adopt;
 pub(crate) mod check;
 pub(crate) mod pull;
 pub(crate) mod push;

@@ -248,8 +248,8 @@ impl StateStore {
         self.root.join("by-path").join(name)
     }
 
-    /// Persists sync state atomically per file. Only pull/push handlers should
-    /// call this operation; server startup constructs the store without writes.
+    /// Persists sync state atomically per file. Only the pull, push and publish
+    /// (`sync::adopt`) handlers should call this operation; server startup constructs the store without writes.
     ///
     /// Baseline and sidecar are two renames, not one transaction. A crash
     /// between them leaves a pair whose hashes disagree, which

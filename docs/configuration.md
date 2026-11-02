@@ -54,8 +54,9 @@ only the keys listed above, and it treats the file as untrusted, because a
 ## Workspace root
 
 `HACKMD_MCP_WORKSPACE_ROOT` confines every tool that takes a local path:
-`hackmd_pull_note`, `hackmd_push_note`, `hackmd_get_note` with `local_path`, and
-`hackmd_upload_note_image`. It must be absolute. A path outside the tree is
+`hackmd_pull_note`, `hackmd_push_note`, `hackmd_get_note` with `local_path`,
+`hackmd_create_note` with `local_path`, and `hackmd_upload_note_image`. It
+must be absolute. A path outside the tree is
 refused, whatever a note tells the agent, and the confinement holds even if a
 symlink inside the tree is swapped while an operation runs. The root is opened
 once at startup; on Unix, if it is moved or replaced afterwards, operations are
@@ -72,7 +73,8 @@ a boundary (an instruction file can import any Markdown file), so set a root if
 an agent reads the tree you pull into.
 
 `hackmd_upload_note_image` puts a local file behind a HackMD link, public
-whenever the note is guest-readable, so it requires a root set in the server's
+whenever the note is guest-readable, and `hackmd_create_note` with `local_path`
+publishes a local file as a note, so both require a root set in the server's
 own environment, not only in `.env`, and refuses every local upload otherwise. An
 `image_url` upload reads no local file, so it needs no root. As
 with every setting, a change takes effect only when the server restarts; in
