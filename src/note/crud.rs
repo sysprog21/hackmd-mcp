@@ -36,6 +36,12 @@ pub(crate) struct CreateNoteInput {
     pub(crate) title: Option<String>,
     /// Full Markdown note body.
     pub(crate) content: Option<String>,
+    /// Absolute path of a local `.md` file used as the body instead of
+    /// `content`; see `tracking` in the reply.
+    pub(crate) local_path: Option<std::path::PathBuf>,
+    /// Allows a `local_path` file past the large-file warning size.
+    #[serde(default)]
+    pub(crate) confirm_large_file: bool,
     /// Complete replacement tag list.
     pub(crate) tags: Option<Vec<String>>,
     /// Optional note description.
@@ -244,6 +250,10 @@ pub(crate) enum CrudError {
         "comment_permission and suggest_edit_permission cannot be set through the HackMD API (neither on create nor on PATCH); change them in the HackMD web UI"
     )]
     UnsupportedPermissionField,
+    #[error(
+        "local_path is read by the file-publishing path, not by create_note; this is a server bug, not a caller error"
+    )]
+    LocalPathNotHandled,
     #[error("patch cannot be combined with other fields; send it in a call of its own")]
     PatchWithFields,
     #[error("nothing to update: give a patch, content, or the metadata fields to change")]
@@ -297,6 +307,7 @@ impl crate::reply::ToolError for CrudError {
             | Self::TeamRestore => ErrorKind::InvalidInput,
             Self::BodyChanged(_) => ErrorKind::Conflict,
             Self::NoBodyToResend { .. } => ErrorKind::Upstream,
+            Self::LocalPathNotHandled => ErrorKind::Internal,
             Self::Edit(error) => error.kind(),
             Self::Payload(error) => error.kind(),
             Self::Reference(error) => error.kind(),
@@ -427,6 +438,9 @@ pub(crate) async fn create_note(
     // PATCH, so refuse rather than appear to set something that never takes.
     if input.comment_permission.is_some() || input.suggest_edit_permission.is_some() {
         return Err(CrudError::UnsupportedPermissionField);
+    }
+    if input.local_path.is_some() {
+        return Err(CrudError::LocalPathNotHandled);
     }
     let folder = input.parent_folder_id;
     let mut payload = CreateNoteRequest {

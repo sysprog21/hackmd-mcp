@@ -646,6 +646,11 @@ pub(crate) fn unconfined_files(state_dir: PathBuf) -> LocalFiles {
     LocalFiles::new(state_dir, None)
 }
 
+/// Local storage confined to `dir`, with its state under `dir/state`.
+pub(crate) fn confined_files(dir: &std::path::Path) -> LocalFiles {
+    LocalFiles::new(dir.join("state"), Some(dir.into()))
+}
+
 /// A state directory for a test that never inspects it.
 pub(crate) fn scratch_files() -> LocalFiles {
     unconfined_files(std::env::temp_dir().join("hackmd-mcp-test"))

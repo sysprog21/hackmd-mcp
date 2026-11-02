@@ -73,7 +73,7 @@ impl HackmdServer {
 
     #[tool(
         name = "hackmd_create_note",
-        description = "Create a HackMD note in a personal or team workspace and return its metadata and patch_path (not the body). Folder placement is read back after POST; a compatibility PATCH runs only if the API dropped parentFolderId, resending the body so it is kept. An explicit title always wins; when omitted, the body supplies a title from YAML title:, then the first H1, then Untitled. Pass read_permission whenever access matters. Sent title (unless blank), tags, description, permalink, and permissions the created note does not show are listed in unconfirmed_fields (no other field is checked); fix them with hackmd_update_note, never by creating the note again.",
+        description = "Create a HackMD note in a personal or team workspace and return its metadata and patch_path (not the body). Folder placement is read back after POST; a compatibility PATCH runs only if the API dropped parentFolderId, resending the body so it is kept. An explicit title always wins; when omitted, the body supplies a title from YAML title:, then the first H1, then Untitled. Pass read_permission whenever access matters. Sent title (unless blank), tags, description, permalink, and permissions the created note does not show are listed in unconfirmed_fields (no other field is checked); fix them with hackmd_update_note, never by creating the note again. local_path (an absolute .md file; needs read_permission and a workspace root set in the server's own environment) replaces content and tracks the file; see tracking.",
         annotations(
             title = "Create HackMD Note",
             read_only_hint = false,
@@ -87,8 +87,17 @@ impl HackmdServer {
         Parameters(input): Parameters<CreateNoteInput>,
     ) -> rmcp::model::CallToolResult {
         reply::respond(
-            crate::note::crud::create_note(&self.client, input).await,
-            |output| format!("Created HackMD note {}", output.note.id),
+            crate::sync::adopt::create_note_from_file(&self.client, &self.files, input).await,
+            |output| {
+                let tracking = match &output.tracking {
+                    Some(crate::sync::adopt::Tracking::Tracked { .. }) => "; local file tracked",
+                    Some(crate::sync::adopt::Tracking::NotTracked { .. }) => {
+                        "; local file NOT tracked"
+                    }
+                    None => "",
+                };
+                format!("Created HackMD note {}{tracking}", output.created.note.id)
+            },
         )
     }
 

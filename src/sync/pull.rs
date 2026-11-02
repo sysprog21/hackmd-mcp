@@ -329,7 +329,7 @@ fn local_loss(
     if unchanged { Ok(()) } else { Err(refusal) }
 }
 
-fn is_markdown(path: &Path) -> bool {
+pub(crate) fn is_markdown(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))

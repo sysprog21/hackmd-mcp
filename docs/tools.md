@@ -133,6 +133,24 @@ remains unconfirmed. The PATCH is never sent a second time. Image uploads are
 the exception: nothing can look for an uploaded image, and a second upload
 only leaves an unused copy, so an unreadable reply there is `upstream`.
 
+## Publish a local file
+
+`hackmd_create_note` with `local_path` (an absolute `.md` file) in place of
+`content` reads the file on the server, so a large note never passes through
+the conversation. `read_permission` is required, because HackMD's default for an
+omitted one is unmeasured and may be more open than intended, and a file over
+the large-file warning size needs `confirm_large_file: true`.
+
+When the created note reads back with exactly that body, the file is tracked as
+`hackmd_pull_note` would track it and `tracking.status` is `tracked`. Otherwise
+it is `not_tracked` with a reason; the note still exists, so do not create it
+again, and check the remote body before adopting it with `hackmd_pull_note`.
+
+Like an image upload, this requires a workspace root set in the server's own
+environment (see [configuration](configuration.md#workspace-root)). Before any
+request, the server refuses a `local_path` whose file already has a sync record,
+whose path is not `.md`, or that comes with `content`.
+
 ## Pull, edit locally, push
 
 Sync turns a note into a Markdown file that any editor, script, or git
