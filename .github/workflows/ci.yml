@@ -159,7 +159,7 @@ jobs:
       - run: cargo build --all-features --locked
 
   audit:
-    uses: ./.github/workflows/security.yml
+    uses: $/.github/workflows/security.yml
 
   # Prebuilt binaries, one per platform the test matrix above runs on. A binary
   # for a platform whose suite never ran there is a promise nobody checked, so
