@@ -1,9 +1,11 @@
 name: Security
 
-# Advisories land without a code change, so this runs on a clock rather than
-# on pushes. ci.yml still audits every push and pull request, and gates the
-# release on it; this is the run that notices a new advisory between them.
+# The one definition of the RustSec audit. ci.yml calls it on every push and
+# pull request and gates the release on it; the clock below notices a new
+# advisory between those runs, since advisories land without a code change.
+# Ignore an advisory by ID in .cargo/audit.toml rather than drop --deny.
 on:
+  workflow_call:
   schedule:
     - cron: "17 6 * * *"
   workflow_dispatch:
@@ -22,5 +24,5 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-audit@0.22.2
-      # Same flags as ci.yml: unsound and yanked crates fail like vulnerabilities.
+      # Unsound and yanked crates fail like vulnerabilities.
       - run: cargo audit --deny warnings
