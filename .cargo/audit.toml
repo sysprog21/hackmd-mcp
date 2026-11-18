@@ -1,0 +1,5 @@
+[advisories]
+# chrono is unmaintained, but it is not ours to drop: rmcp and schemars (via
+# rmcp) depend on it unconditionally. Remove this entry once rmcp stops
+# requiring it. Every other warning still fails the audit.
+ignore = ["RUSTSEC-2026-0543"]

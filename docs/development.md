@@ -164,8 +164,10 @@ TTL alone never supplies content for conflict detection.
 | `build` | release binaries for each tested platform, Linux against glibc 2.17 |
 | `release` | on pushes to `main` only, after every job above passes, replaces the `latest` GitHub release |
 
-`.github/workflows/security.yml` runs the same `cargo audit` daily and on demand,
-because advisories land without a code change; Dependabot proposes the fix.
+`audit` is `.github/workflows/security.yml`, called by CI and also run daily and
+on demand, because advisories land without a code change; Dependabot proposes
+the fix. An advisory with no fix to take is ignored by ID, with the reason, in
+`.cargo/audit.toml`.
 
 The release scripts live in `.ci/`; their header comments explain the
 ordering that keeps a failed run from leaving no release behind.
